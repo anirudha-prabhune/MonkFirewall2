@@ -48,12 +48,14 @@ Both `host_permissions` and `content_scripts[0].matches` contain these exact ori
 
 ---
 
-## 4. Pairing the Extension
+## 4. Pairing and Verification
 
 1. Start and log in to the MonkTrades application in Chrome (via localhost or the deployed Cloud Run URL).
-2. When the user session is authenticated, MonkTrades renders a pairing element (`monktrades-extension-sync`) containing the user ID and cryptographic extension token.
-3. `content_monktrades.js` automatically pairs the extension and stores `userId`, `extensionToken`, and `serverUrl` in `chrome.storage.local`.
-4. The extension transitions to the **PAIRED** state.
+2. When the user session is authenticated, MonkTrades renders a hidden pairing element (`#monktrades-extension-sync`) containing `data-user-id` and asynchronously populating `data-extension-token`.
+3. `content_monktrades.js` uses a MutationObserver to detect the presence of the node and the arrival of the asynchronous token, automatically pairing the credentials into `chrome.storage.local`.
+4. **Verification Step**:
+   - Before opening Kite, click the extension icon in Chrome or inspect `chrome.storage.local` to confirm `pairingState` is `PAIRED` and `userId` is populated.
+   - Once confirmed `PAIRED`, the extension is ready to enforce authoritative firewall locks.
 
 ---
 
@@ -64,7 +66,7 @@ Both `host_permissions` and `content_scripts[0].matches` contain these exact ori
    - Navigation proceeds normally. Open tabs remain unrestricted.
 3. **LOCKED (Risk Limit Breached)**:
    - **New Navigation**: Intercepted by `webNavigation.onBeforeNavigate` and immediately redirected to `blocked.html`.
-   - **Existing Open Tabs**: Polled periodically by `chrome.alarms` service worker task and automatically redirected to `blocked.html`.
+   - **Existing Open Tabs**: Polled periodically by `chrome.alarms` service worker task (configured with `persistAcrossSessions: true`) and automatically redirected to `blocked.html`.
 4. **MonkTrades Protection**:
    - MonkTrades URLs are never blocked, allowing the trader to monitor risk status, view analytics, and adjust rules.
 5. **Fail-Closed Safeguards**:
@@ -74,7 +76,7 @@ Both `host_permissions` and `content_scripts[0].matches` contain these exact ori
 
 ## 6. Reloading After Manifest/Code Changes
 
-Whenever you modify any file in `extension/` (such as `manifest.json` or `background.js`):
+Whenever you modify any file in `extension/` (such as `manifest.json`, `content_monktrades.js`, or `background.js`):
 1. Navigate back to `chrome://extensions`.
 2. Find **MonkTrades Trading Firewall Extension**.
 3. Click the circular **Reload** icon on the extension card.

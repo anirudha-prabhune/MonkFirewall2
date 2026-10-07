@@ -2,15 +2,15 @@
 
 const ALARM_NAME = 'trading_firewall_poll';
 
-// 1. Setup periodic alarm using chrome.alarms (MV3 lifecycle safe)
-chrome.alarms.create(ALARM_NAME, { periodInMinutes: 0.5 });
+// 1. Setup periodic alarm using chrome.alarms (MV3 lifecycle safe with persistAcrossSessions)
+chrome.alarms.create(ALARM_NAME, { periodInMinutes: 0.5, persistAcrossSessions: true });
 
 chrome.runtime.onInstalled.addListener(() => {
-  chrome.alarms.create(ALARM_NAME, { periodInMinutes: 0.5 });
+  chrome.alarms.create(ALARM_NAME, { periodInMinutes: 0.5, persistAcrossSessions: true });
 });
 
 chrome.runtime.onStartup.addListener(() => {
-  chrome.alarms.create(ALARM_NAME, { periodInMinutes: 0.5 });
+  chrome.alarms.create(ALARM_NAME, { periodInMinutes: 0.5, persistAcrossSessions: true });
 });
 
 // Periodic alarm handler: inspect active/open tabs and enforce lockout

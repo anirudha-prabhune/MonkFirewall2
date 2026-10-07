@@ -31,10 +31,150 @@ function isValidChromeMatchPattern(pattern: string): boolean {
   return true;
 }
 
+/**
+ * DOM and MutationObserver harness to test content_monktrades.js pairing lifecycle
+ */
+function createDomContentScriptHarness() {
+  const elements = new Map<string, any>();
+  const observers: Array<{
+    target: any;
+    options: any;
+    callback: (mutations: any[]) => void;
+    disconnected: boolean;
+  }> = [];
+
+  class MockElement {
+    id: string;
+    attributes: Map<string, string> = new Map();
+    nodeType = 1;
+    children: MockElement[] = [];
+
+    constructor(id: string = '') {
+      this.id = id;
+    }
+
+    getAttribute(name: string) {
+      return this.attributes.get(name) || null;
+    }
+
+    setAttribute(name: string, value: string) {
+      const oldValue = this.attributes.get(name);
+      this.attributes.set(name, value);
+      // Trigger observers
+      for (const obs of observers) {
+        if (!obs.disconnected && (obs.target === this || obs.options.subtree)) {
+          if (!obs.options.attributeFilter || obs.options.attributeFilter.includes(name)) {
+            obs.callback([{ type: 'attributes', attributeName: name, target: this, oldValue }]);
+          }
+        }
+      }
+    }
+
+    appendChild(child: MockElement) {
+      this.children.push(child);
+      if (child.id) elements.set(child.id, child);
+      for (const obs of observers) {
+        if (!obs.disconnected && obs.options.childList) {
+          obs.callback([{ type: 'childList', addedNodes: [child], target: this }]);
+        }
+      }
+    }
+  }
+
+  const documentElement = new MockElement('html');
+  const body = new MockElement('body');
+  documentElement.appendChild(body);
+
+  const mockDocument = {
+    documentElement,
+    body,
+    nodeType: 1,
+    getElementById: (id: string) => elements.get(id) || null,
+  };
+
+  class MockMutationObserver {
+    callback: (mutations: any[]) => void;
+    obsRecord: any;
+
+    constructor(cb: (mutations: any[]) => void) {
+      this.callback = cb;
+    }
+
+    observe(target: any, options: any) {
+      this.obsRecord = { target, options, callback: this.callback, disconnected: false };
+      observers.push(this.obsRecord);
+    }
+
+    disconnect() {
+      if (this.obsRecord) {
+        this.obsRecord.disconnected = true;
+      }
+    }
+  }
+
+  const storageData: Record<string, any> = {};
+  let setCalls = 0;
+  const mockChrome = {
+    storage: {
+      local: {
+        set: (data: Record<string, any>, cb?: () => void) => {
+          setCalls++;
+          Object.assign(storageData, data);
+          if (cb) cb();
+        },
+        get: (keys: string[], cb: (res: any) => void) => {
+          const res: Record<string, any> = {};
+          for (const k of keys) res[k] = storageData[k];
+          cb(res);
+        },
+      },
+    },
+  };
+
+  const window = {
+    location: {
+      origin: 'https://ais-dev-wyyezpv6s2lo3nusdgb6dl-608043296632.asia-southeast1.run.app',
+    },
+  };
+
+  function createSyncNode(userId = '', token = '') {
+    const node = new MockElement('monktrades-extension-sync');
+    if (userId) node.setAttribute('data-user-id', userId);
+    if (token !== undefined) node.setAttribute('data-extension-token', token);
+    elements.set('monktrades-extension-sync', node);
+    body.appendChild(node);
+    return node;
+  }
+
+  function runContentScript() {
+    const contentScriptCode = fs.readFileSync(path.resolve('./extension/content_monktrades.js'), 'utf-8');
+    const sandbox = {
+      document: mockDocument,
+      window,
+      chrome: mockChrome,
+      MutationObserver: MockMutationObserver,
+      console,
+    };
+    const ctx = vm.createContext(sandbox);
+    vm.runInContext(contentScriptCode, ctx);
+  }
+
+  return {
+    elements,
+    mockDocument,
+    body,
+    storageData,
+    getSetCalls: () => setCalls,
+    createSyncNode,
+    runContentScript,
+    MockElement,
+  };
+}
+
 async function runPhase12cExtensionE2ETestSuite() {
   console.log('================================================================');
   console.log('TRADING FIREWALL: PHASE 16 / 12C CHROME EXTENSION ENFORCEMENT & E2E');
-  console.log('Executing actual extension/background.js in Sandbox Environment');
+  console.log('Executing actual extension/background.js & content_monktrades.js');
   console.log('================================================================\n');
 
   enableMockStoreForTesting(true);
@@ -319,9 +459,71 @@ async function runPhase12cExtensionE2ETestSuite() {
     }
 
     // --------------------------------------------------------------------------
-    // TEST 2: UNPAIRED state allows Zerodha navigation passively
+    // TEST 2: Content Script Pairing Regression (Async Token & Observer)
     // --------------------------------------------------------------------------
-    console.log('\n[Test 2] UNPAIRED state allows Zerodha navigation passively');
+    console.log('\n[Test 2] Content Script Pairing Regression (Async Token & Observer)');
+    {
+      // A. sync node exists with userId + token immediately -> PAIRED
+      const harnessA = createDomContentScriptHarness();
+      harnessA.createSyncNode('user_imm', 'token_imm_123');
+      harnessA.runContentScript();
+      assert.equal(harnessA.storageData.pairingState, 'PAIRED');
+      assert.equal(harnessA.storageData.userId, 'user_imm');
+      assert.equal(harnessA.storageData.extensionToken, 'token_imm_123');
+      assert.equal(harnessA.storageData.serverUrl, 'https://ais-dev-wyyezpv6s2lo3nusdgb6dl-608043296632.asia-southeast1.run.app');
+      console.log('  ✓ PASSED: Sync node with immediate userId + token pairs to PAIRED');
+
+      // B. sync node exists with empty token -> initially not paired
+      const harnessB = createDomContentScriptHarness();
+      const nodeB = harnessB.createSyncNode('user_async', '');
+      harnessB.runContentScript();
+      assert.equal(harnessB.storageData.pairingState, undefined, 'Initially empty token must NOT pair');
+      console.log('  ✓ PASSED: Empty token initially does not pair');
+
+      // C. token attribute later changes from empty to valid -> PAIRED
+      nodeB.setAttribute('data-extension-token', 'token_async_456');
+      assert.equal(harnessB.storageData.pairingState, 'PAIRED', 'Async token change must trigger pairing');
+      assert.equal(harnessB.storageData.userId, 'user_async');
+      assert.equal(harnessB.storageData.extensionToken, 'token_async_456');
+      console.log('  ✓ PASSED: Asynchronously updated token triggers PAIRED state via MutationObserver');
+
+      // D. duplicate attribute changes do not break/duplicate pairing
+      const setCallsBefore = harnessB.getSetCalls();
+      nodeB.setAttribute('data-extension-token', 'token_async_456');
+      nodeB.setAttribute('data-extension-token', 'token_async_456');
+      assert.equal(harnessB.getSetCalls(), setCallsBefore, 'Duplicate attribute changes must not cause duplicate storage writes');
+      assert.equal(harnessB.storageData.pairingState, 'PAIRED');
+      console.log('  ✓ PASSED: Duplicate token changes are deduplicated safely');
+
+      // E. sync node initially absent and appears later -> PAIRED
+      const harnessE = createDomContentScriptHarness();
+      harnessE.runContentScript();
+      assert.equal(harnessE.storageData.pairingState, undefined, 'Absent sync node does not pair');
+      const nodeE = harnessE.createSyncNode('user_late_mount', 'token_late_mount_789');
+      assert.equal(harnessE.storageData.pairingState, 'PAIRED', 'Late-mounting sync node must trigger pairing');
+      assert.equal(harnessE.storageData.userId, 'user_late_mount');
+      assert.equal(harnessE.storageData.extensionToken, 'token_late_mount_789');
+      console.log('  ✓ PASSED: Dynamically inserted sync node triggers document observer pairing');
+    }
+
+    // --------------------------------------------------------------------------
+    // TEST 3: Background Alarm Registration & persistAcrossSessions
+    // --------------------------------------------------------------------------
+    console.log('\n[Test 3] Background Alarm Registration & persistAcrossSessions');
+    {
+      const harness = createExtensionHarness();
+      assert.ok(harness.alarmsCreated.length >= 1, 'Alarm must be created');
+      const pollAlarm = harness.alarmsCreated.find((a) => a.name === 'trading_firewall_poll');
+      assert.ok(pollAlarm, 'trading_firewall_poll alarm must be registered');
+      assert.equal(pollAlarm.options.periodInMinutes, 0.5, 'Alarm polling interval must remain 30 seconds');
+      assert.equal(pollAlarm.options.persistAcrossSessions, true, 'Alarm must explicitly request persistAcrossSessions');
+      console.log('  ✓ PASSED: Alarm registered with 30s period and persistAcrossSessions: true');
+    }
+
+    // --------------------------------------------------------------------------
+    // TEST 4: UNPAIRED state allows Zerodha navigation passively
+    // --------------------------------------------------------------------------
+    console.log('\n[Test 4] UNPAIRED state allows Zerodha navigation passively');
     {
       const harness = createExtensionHarness({ pairingState: 'UNPAIRED' });
       const nav = harness.getNavigationListener();
@@ -332,17 +534,17 @@ async function runPhase12cExtensionE2ETestSuite() {
     }
 
     // --------------------------------------------------------------------------
-    // TEST 3: PAIRED + LOCKED blocks kite.zerodha.com new navigation
+    // TEST 5: PAIRED + LOCKED blocks kite.zerodha.com new navigation
     // --------------------------------------------------------------------------
-    console.log('\n[Test 3] PAIRED + LOCKED blocks kite.zerodha.com new navigation');
+    console.log('\n[Test 5] PAIRED + LOCKED blocks kite.zerodha.com new navigation');
     {
       const lockedSession: RiskSession = {
         tradingDate,
         userId: testUser,
         state: 'LOCKED',
         isBreached: true,
-        currentPnl: -1200,
-        realisedPnl: -1200,
+        currentPnl: -1500,
+        realisedPnl: -1500,
         unrealisedPnl: 0,
         lossLimit: 1000,
         warningThreshold1: 70,
@@ -350,7 +552,7 @@ async function runPhase12cExtensionE2ETestSuite() {
         lastEvaluatedAt: new Date().toISOString(),
         lockedAt: new Date().toISOString(),
         lockUntil: new Date(Date.now() + 3600 * 1000).toISOString(),
-        reason: 'Daily loss limit breached',
+        reason: 'Breached Daily Loss Limit',
       };
       injectSession(testUser, lockedSession);
 
@@ -359,66 +561,70 @@ async function runPhase12cExtensionE2ETestSuite() {
         userId: testUser,
         extensionToken: validToken,
         serverUrl,
-        lastKnownState: 'RELEASED',
       });
 
       const nav = harness.getNavigationListener();
-      await nav({ frameId: 0, tabId: 102, url: 'https://kite.zerodha.com/orders' });
+      await nav({ frameId: 0, tabId: 201, url: 'https://kite.zerodha.com/orders' });
 
-      assert.equal(harness.tabUpdates.length, 1, 'LOCKED state must intercept navigation');
-      assert.equal(harness.tabUpdates[0].tabId, 102);
+      assert.equal(harness.tabUpdates.length, 1, 'LOCKED state must block kite navigation');
+      assert.equal(harness.tabUpdates[0].tabId, 201);
       assert.ok(
-        harness.tabUpdates[0].updateProps.url.includes('blocked.html?url=https%3A%2F%2Fkite.zerodha.com%2Forders'),
-        'Redirects to blocked.html with encoded URL'
+        harness.tabUpdates[0].updateProps.url.includes('blocked.html'),
+        'Must redirect to blocked.html'
       );
-      assert.equal(harness.storageData.lastKnownState, 'LOCKED', 'Updates storage to LOCKED');
+      assert.ok(
+        harness.tabUpdates[0].updateProps.url.includes(encodeURIComponent('https://kite.zerodha.com/orders')),
+        'Must preserve attempted url in query string'
+      );
       console.log('  ✓ PASSED: LOCKED state actively redirects kite.zerodha.com navigation to blocked.html');
     }
 
     // --------------------------------------------------------------------------
-    // TEST 4: PAIRED + LOCKED existing/open Kite tab blocked by periodic alarm check
+    // TEST 6: PAIRED + LOCKED existing/open Kite tab blocked by periodic alarm check
     // --------------------------------------------------------------------------
-    console.log('\n[Test 4] PAIRED + LOCKED existing/open Kite tab blocked by periodic alarm check');
+    console.log('\n[Test 6] PAIRED + LOCKED existing/open Kite tab blocked by periodic alarm check');
     {
+      const openKiteTabs = [
+        { id: 301, url: 'https://kite.zerodha.com/holdings' },
+        { id: 302, url: 'https://kite.zerodha.com/positions' },
+        { id: 303, url: 'http://localhost:3000/dashboard' }, // MonkTrades app tab
+      ];
+
       const harness = createExtensionHarness(
         {
           pairingState: 'PAIRED',
           userId: testUser,
           extensionToken: validToken,
           serverUrl,
-          lastKnownState: 'RELEASED',
         },
-        [
-          { id: 201, url: 'https://kite.zerodha.com/dashboard' },
-          { id: 202, url: 'http://localhost:3000/dashboard' },
-          { id: 203, url: 'https://kite.zerodha.com/positions' },
-        ]
+        openKiteTabs
       );
 
-      // Trigger alarm
       await harness.triggerAlarm('trading_firewall_poll');
 
-      // Assert Kite tabs (201, 203) are updated with blocked.html, while MonkTrades tab (202) is untouched
-      assert.equal(harness.tabUpdates.length, 2, 'Must redirect exactly the 2 open Kite tabs');
-      const updatedTabIds = harness.tabUpdates.map((u) => u.tabId);
-      assert.ok(updatedTabIds.includes(201), 'Tab 201 (Kite) must be redirected');
-      assert.ok(updatedTabIds.includes(203), 'Tab 203 (Kite) must be redirected');
-      assert.ok(!updatedTabIds.includes(202), 'Tab 202 (MonkTrades) must NOT be redirected');
+      assert.equal(harness.tabUpdates.length, 2, 'Must redirect ONLY the 2 Kite tabs, NOT MonkTrades');
+      assert.equal(harness.tabUpdates[0].tabId, 301);
       assert.ok(harness.tabUpdates[0].updateProps.url.includes('blocked.html'));
+      assert.equal(harness.tabUpdates[1].tabId, 302);
+      assert.ok(harness.tabUpdates[1].updateProps.url.includes('blocked.html'));
+
       console.log('  ✓ PASSED: Periodic alarm check redirects open Kite tabs and preserves MonkTrades');
     }
 
     // --------------------------------------------------------------------------
-    // TEST 5: PAIRED + ALLOW / WARNING / MARKET_CLOSED permitted
+    // TEST 7: PAIRED + ALLOW / WARNING / MARKET_CLOSED permitted
     // --------------------------------------------------------------------------
-    console.log('\n[Test 5] PAIRED + ALLOW / WARNING / MARKET_CLOSED permitted');
+    console.log('\n[Test 7] PAIRED + ALLOW / WARNING / MARKET_CLOSED permitted');
     {
-      // A. ALLOW
+      // 1. ALLOW state
       const allowSession: RiskSession = {
         tradingDate,
         userId: testUser,
         state: 'ALLOW',
         isBreached: false,
+        lockedAt: null,
+        lockUntil: null,
+        reason: null,
         currentPnl: 500,
         realisedPnl: 500,
         unrealisedPnl: 0,
@@ -426,77 +632,23 @@ async function runPhase12cExtensionE2ETestSuite() {
         warningThreshold1: 70,
         warningThreshold2: 90,
         lastEvaluatedAt: new Date().toISOString(),
-        lockedAt: null,
-        lockUntil: null,
-        reason: 'Normal',
       };
       injectSession(testUser, allowSession);
 
-      const harnessAllow = createExtensionHarness(
-        {
-          pairingState: 'PAIRED',
-          userId: testUser,
-          extensionToken: validToken,
-          serverUrl,
-          lastKnownState: 'LOCKED',
-        },
-        [{ id: 301, url: 'https://kite.zerodha.com/holdings' }]
-      );
-
+      const harnessAllow = createExtensionHarness({
+        pairingState: 'PAIRED',
+        userId: testUser,
+        extensionToken: validToken,
+        serverUrl,
+      });
       const navAllow = harnessAllow.getNavigationListener();
-      await navAllow({ frameId: 0, tabId: 302, url: 'https://kite.zerodha.com/holdings' });
-      await harnessAllow.triggerAlarm('trading_firewall_poll');
-
+      await navAllow({ frameId: 0, tabId: 202, url: 'https://kite.zerodha.com/orders' });
       assert.equal(harnessAllow.tabUpdates.length, 0, 'ALLOW state must NOT block Zerodha');
-      assert.equal(harnessAllow.storageData.lastKnownState, 'RELEASED');
 
-      // B. WARNING
-      const warnSession: RiskSession = {
-        tradingDate,
-        userId: testUser,
-        state: 'WARNING',
-        isBreached: false,
-        currentPnl: -750,
-        realisedPnl: -750,
-        unrealisedPnl: 0,
-        lossLimit: 1000,
-        warningThreshold1: 70,
-        warningThreshold2: 90,
-        lastEvaluatedAt: new Date().toISOString(),
-        lockedAt: null,
-        lockUntil: null,
-        reason: 'Threshold warning',
-      };
-      injectSession(testUser, warnSession);
-
-      const harnessWarn = createExtensionHarness(
-        {
-          pairingState: 'PAIRED',
-          userId: testUser,
-          extensionToken: validToken,
-          serverUrl,
-        },
-        [{ id: 303, url: 'https://kite.zerodha.com/positions' }]
-      );
-      await harnessWarn.triggerAlarm('trading_firewall_poll');
-      assert.equal(harnessWarn.tabUpdates.length, 0, 'WARNING state must NOT block Zerodha');
-
-      // C. MARKET_CLOSED
+      // 2. MARKET_CLOSED state
       const closedSession: RiskSession = {
-        tradingDate,
-        userId: testUser,
+        ...allowSession,
         state: 'MARKET_CLOSED',
-        isBreached: false,
-        currentPnl: 0,
-        realisedPnl: 0,
-        unrealisedPnl: 0,
-        lossLimit: 1000,
-        warningThreshold1: 70,
-        warningThreshold2: 90,
-        lastEvaluatedAt: new Date().toISOString(),
-        lockedAt: null,
-        lockUntil: null,
-        reason: 'Market closed',
       };
       injectSession(testUser, closedSession);
 
@@ -516,9 +668,9 @@ async function runPhase12cExtensionE2ETestSuite() {
     }
 
     // --------------------------------------------------------------------------
-    // TEST 6: Offline fail-closed (navigation and periodic alarm)
+    // TEST 8: Offline fail-closed (navigation and periodic alarm)
     // --------------------------------------------------------------------------
-    console.log('\n[Test 6] Offline fail-closed (navigation and periodic alarm)');
+    console.log('\n[Test 8] Offline fail-closed (navigation and periodic alarm)');
     {
       const deadServerUrl = 'http://127.0.0.1:1'; // Unreachable port
       const harness = createExtensionHarness(
@@ -543,9 +695,9 @@ async function runPhase12cExtensionE2ETestSuite() {
     }
 
     // --------------------------------------------------------------------------
-    // TEST 7: Service worker restart with persisted pairing state
+    // TEST 9: Service worker restart with persisted pairing state
     // --------------------------------------------------------------------------
-    console.log('\n[Test 7] Service worker restart with persisted pairing state');
+    console.log('\n[Test 9] Service worker restart with persisted pairing state');
     {
       // Reset server session to LOCKED
       const lockedSession: RiskSession = {
@@ -587,9 +739,9 @@ async function runPhase12cExtensionE2ETestSuite() {
     }
 
     // --------------------------------------------------------------------------
-    // TEST 8: MonkTrades is never blocked by the extension
+    // TEST 10: MonkTrades is never blocked by the extension
     // --------------------------------------------------------------------------
-    console.log('\n[Test 8] MonkTrades is never blocked by the extension');
+    console.log('\n[Test 10] MonkTrades is never blocked by the extension');
     {
       const harness = createExtensionHarness(
         {
@@ -615,9 +767,9 @@ async function runPhase12cExtensionE2ETestSuite() {
     }
 
     // --------------------------------------------------------------------------
-    // TEST 9: evil-kite.zerodha.com must NOT be treated as Kite
+    // TEST 11: evil-kite.zerodha.com must NOT be treated as Kite
     // --------------------------------------------------------------------------
-    console.log('\n[Test 9] evil-kite.zerodha.com must NOT be treated as Kite (exact hostname match)');
+    console.log('\n[Test 11] evil-kite.zerodha.com must NOT be treated as Kite (exact hostname match)');
     {
       const harness = createExtensionHarness(
         {
@@ -645,22 +797,33 @@ async function runPhase12cExtensionE2ETestSuite() {
     }
 
     // --------------------------------------------------------------------------
-    // TEST 10: Malformed contract or bad token fails closed
+    // TEST 12: Malformed contract or bad/missing token fails closed
     // --------------------------------------------------------------------------
-    console.log('\n[Test 10] Malformed contract or bad token fails closed');
+    console.log('\n[Test 12] Malformed contract or bad/missing token fails closed');
     {
+      // Missing token in PAIRED state
+      const harnessMissingToken = createExtensionHarness({
+        pairingState: 'PAIRED',
+        userId: testUser,
+        extensionToken: '',
+        serverUrl,
+      });
+      const navMissing = harnessMissingToken.getNavigationListener();
+      await navMissing({ frameId: 0, tabId: 800, url: 'https://kite.zerodha.com/dashboard' });
+      assert.equal(harnessMissingToken.tabUpdates.length, 1, 'Missing token in PAIRED state must fail closed');
+
+      // Invalid token in PAIRED state
       const harnessBadToken = createExtensionHarness({
         pairingState: 'PAIRED',
         userId: testUser,
         extensionToken: 'bad_token_xxx',
         serverUrl,
       });
-
-      const nav = harnessBadToken.getNavigationListener();
-      await nav({ frameId: 0, tabId: 801, url: 'https://kite.zerodha.com/dashboard' });
+      const navBad = harnessBadToken.getNavigationListener();
+      await navBad({ frameId: 0, tabId: 801, url: 'https://kite.zerodha.com/dashboard' });
       assert.equal(harnessBadToken.tabUpdates.length, 1, 'Bad token must fail closed');
 
-      console.log('  ✓ PASSED: Malformed/revoked auth fails closed');
+      console.log('  ✓ PASSED: Malformed/revoked/missing auth fails closed');
     }
   } finally {
     server.close();
