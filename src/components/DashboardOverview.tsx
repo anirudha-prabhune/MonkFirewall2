@@ -645,7 +645,7 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
                     </div>
  
                      <div>
-                      <div className="text-5xl sm:text-6xl font-black font-mono tracking-wider">
+                      <div className="text-5xl font-black font-mono tracking-wider">
                         {displayState === 'MARKET_CLOSED' ? 'CLOSED' : displayState}
                       </div>
                       <div className="text-xs font-semibold mt-1">
