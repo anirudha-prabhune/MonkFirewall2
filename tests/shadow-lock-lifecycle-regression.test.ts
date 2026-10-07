@@ -1,12 +1,15 @@
 import { strict as assert } from 'assert';
+import express from 'express';
 import { apiRouter } from '../server/api';
+import { BrokerService } from '../server/brokers/service';
 import { ShadowRiskService } from '../server/risk/shadowRiskService';
 import { ServerRiskStore } from '../server/risk/store';
+import { getTradingDateKolkata } from '../server/risk/engine';
 import { setLiveRiskStateRecordingEnabled, resetRecordingStates } from '../server/risk/liveRiskRecorder';
 import { EnforcementService } from '../server/enforcement/service';
 import { RawBrokerPosition, BrokerInstrument } from '../server/brokers/types';
 import { RiskConfig } from '../src/types/risk';
-import { enableMockStoreForTesting, setAdminFirestoreForTesting } from '../server/brokers/zerodha/sessionStore';
+import { enableMockStoreForTesting, setAdminFirestoreForTesting, ZerodhaSessionStore } from '../server/brokers/zerodha/sessionStore';
 
 const MOCK_INSTRUMENT_MAP = new Map<number, BrokerInstrument>([
   [
@@ -87,6 +90,9 @@ async function runShadowLockLifecycleTests() {
   setAdminFirestoreForTesting(null);
   enableMockStoreForTesting(true);
   resetRecordingStates();
+
+  process.env.ZERODHA_API_KEY = 'test_api_key_shadow_suite';
+  process.env.ZERODHA_API_SECRET = 'test_api_secret_shadow_suite_32b';
 
   const testUser = 'user_shadow_lock_lifecycle_test';
   const aliceUser = 'user_shadow_alice';
@@ -295,59 +301,146 @@ async function runShadowLockLifecycleTests() {
   console.log('  ✓ PASSED: Pure read-only shadow operation with zero persistence verified');
 
   // --------------------------------------------------------------------------
-  // TEST 8: Actual GET /api/risk polling path at t0, t0+3s, t0+6s, t0+30s
+  // TEST 8: Actual Express GET /api/risk route-level polling path
   // --------------------------------------------------------------------------
-  console.log('\n[Test 8] GET /api/risk polling path at t0, t0+3s, t0+6s, t0+30s');
-  const pollingUser = 'user_api_risk_polling';
-  ShadowRiskService.resetShadowState(pollingUser);
-  await ServerRiskStore.saveConfig(pollingUser, testConfig);
+  console.log('\n[Test 8] Express GET /api/risk route-level polling path (t0, t0+3s, t0+6s, t0+30s)');
+  const routeUser = 'user_express_route_risk_polling';
+  ShadowRiskService.resetShadowState(routeUser);
+  await ServerRiskStore.saveConfig(routeUser, testConfig);
+  await ZerodhaSessionStore.saveSession(routeUser, 'mock_access_token_route_test');
 
-  const tPoll0 = new Date('2026-10-06T10:00:00.000Z');
-  const resPoll0 = await ShadowRiskService.evaluateLiveShadow(pollingUser, {
-    injectedPositions: createLossPosition(6000),
-    injectedInstrumentMap: MOCK_INSTRUMENT_MAP,
-    configOverride: testConfig,
-    evaluationTime: tPoll0,
+  // Express application with apiRouter mounted at /api
+  const app = express();
+  app.use(express.json());
+  app.use('/api', apiRouter);
+
+  async function invokeExpressRoute(userId: string) {
+    let capturedCode = 200;
+    let capturedData: any = null;
+    const req: any = {
+      method: 'GET',
+      url: '/api/risk',
+      originalUrl: '/api/risk',
+      baseUrl: '/api',
+      path: '/risk',
+      userId,
+      headers: { host: 'localhost', accept: 'application/json' },
+      query: {},
+      params: {},
+      body: {},
+    };
+    const res: any = {
+      statusCode: 200,
+      status: (code: number) => {
+        capturedCode = code;
+        res.statusCode = code;
+        return res;
+      },
+      json: (data: any) => {
+        capturedData = data;
+        return res;
+      },
+      setHeader: () => res,
+      end: () => res,
+    };
+    await new Promise<void>((resolve, reject) => {
+      app(req, res, (err: any) => {
+        if (err) reject(err);
+        else resolve();
+      });
+    });
+    return { code: capturedCode, data: capturedData };
+  }
+
+  // Configure liveAdapter fetch handler to supply live broker positions to GET /api/risk
+  const liveAdapter = BrokerService.getLiveAdapter();
+  let currentLossAmount = 6000;
+
+  liveAdapter.setFetchHandler(async (url: string) => {
+    if (url.includes('/portfolio/positions')) {
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: (h: string) => h === 'content-type' ? 'application/json' : '' },
+        json: async () => ({
+          status: 'success',
+          data: { net: createLossPosition(currentLossAmount), day: [] },
+        }),
+      };
+    }
+    if (url.includes('/instruments')) {
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: (h: string) => h === 'content-type' ? 'application/json' : '' },
+        json: async () => [
+          {
+            instrument_token: 10418946,
+            tradingsymbol: 'NIFTY26O0622550CE',
+            name: 'NIFTY',
+            last_price: 74.15,
+            expiry: '2026-10-06',
+            strike: 22550,
+            tick_size: 0.05,
+            lot_size: 50,
+            instrument_type: 'CE',
+            segment: 'NFO-OPT',
+            exchange: 'NFO',
+          },
+        ],
+      };
+    }
+    return {
+      ok: true,
+      status: 200,
+      headers: { get: (h: string) => h === 'content-type' ? 'application/json' : '' },
+      json: async () => ({
+        status: 'success',
+        data: {
+          profile: { user_id: routeUser },
+        },
+      }),
+    };
   });
 
-  const pollLockedAt = resPoll0.lockedAt!;
-  const pollLockUntil = resPoll0.lockUntil!;
+  try {
+    // Poll 0: Initial breach via GET /api/risk route
+    const resRoute0 = await invokeExpressRoute(routeUser);
+    assert.equal(resRoute0.code, 200, 'GET /api/risk returns 200');
+    assert.equal(resRoute0.data.state, 'LOCKED', 'GET /api/risk returns LOCKED state');
+    assert.ok(resRoute0.data.lockedAt !== null, 'lockedAt is non-null');
+    assert.ok(resRoute0.data.lockUntil !== null, 'lockUntil is non-null');
 
-  // Poll 1: t0+3s
-  const resPoll3s = await ShadowRiskService.evaluateLiveShadow(pollingUser, {
-    injectedPositions: createLossPosition(6000),
-    injectedInstrumentMap: MOCK_INSTRUMENT_MAP,
-    configOverride: testConfig,
-    evaluationTime: new Date(tPoll0.getTime() + 3000),
-  });
-  assert.equal(resPoll3s.lockedAt, pollLockedAt, 'Poll at t0+3s preserves exact lockedAt');
-  assert.equal(resPoll3s.lockUntil, pollLockUntil, 'Poll at t0+3s preserves exact lockUntil');
+    const routeLockedAt = resRoute0.data.lockedAt;
+    const routeLockUntil = resRoute0.data.lockUntil;
 
-  // Poll 2: t0+6s
-  const resPoll6s = await ShadowRiskService.evaluateLiveShadow(pollingUser, {
-    injectedPositions: createLossPosition(6500),
-    injectedInstrumentMap: MOCK_INSTRUMENT_MAP,
-    configOverride: testConfig,
-    evaluationTime: new Date(tPoll0.getTime() + 6000),
-  });
-  assert.equal(resPoll6s.lockedAt, pollLockedAt, 'Poll at t0+6s preserves exact lockedAt');
-  assert.equal(resPoll6s.lockUntil, pollLockUntil, 'Poll at t0+6s preserves exact lockUntil');
+    // Poll 1: t0 + 3s via GET /api/risk route
+    const resRoute3s = await invokeExpressRoute(routeUser);
+    assert.equal(resRoute3s.data.lockedAt, routeLockedAt, 'Poll at t0+3s returns byte-for-byte identical lockedAt');
+    assert.equal(resRoute3s.data.lockUntil, routeLockUntil, 'Poll at t0+3s returns byte-for-byte identical lockUntil');
 
-  // Poll 3: t0+30s
-  const resPoll30s = await ShadowRiskService.evaluateLiveShadow(pollingUser, {
-    injectedPositions: createLossPosition(7000),
-    injectedInstrumentMap: MOCK_INSTRUMENT_MAP,
-    configOverride: testConfig,
-    evaluationTime: new Date(tPoll0.getTime() + 30000),
-  });
-  assert.equal(resPoll30s.lockedAt, pollLockedAt, 'Poll at t0+30s preserves exact lockedAt');
-  assert.equal(resPoll30s.lockUntil, pollLockUntil, 'Poll at t0+30s preserves exact lockUntil');
-  console.log('  ✓ PASSED: GET /api/risk path maintains strictly identical lockedAt and lockUntil on every poll');
+    // Poll 2: t0 + 6s via GET /api/risk route with worsening loss (₹8,000)
+    currentLossAmount = 8000;
+    const resRoute6s = await invokeExpressRoute(routeUser);
+    assert.equal(resRoute6s.data.lockedAt, routeLockedAt, 'Poll at t0+6s preserves byte-for-byte identical lockedAt');
+    assert.equal(resRoute6s.data.lockUntil, routeLockUntil, 'Poll at t0+6s preserves byte-for-byte identical lockUntil');
+    assert.equal(resRoute6s.data.lossAmount, 8000, 'lossAmount updated to current ₹8,000');
+
+    // Poll 3: t0 + 30s via GET /api/risk route with recovering loss (₹2,500)
+    currentLossAmount = 2500;
+    const resRoute30s = await invokeExpressRoute(routeUser);
+    assert.equal(resRoute30s.data.lockedAt, routeLockedAt, 'Poll at t0+30s preserves byte-for-byte identical lockedAt');
+    assert.equal(resRoute30s.data.lockUntil, routeLockUntil, 'Poll at t0+30s preserves byte-for-byte identical lockUntil');
+    assert.equal(resRoute30s.data.lossAmount, 2500, 'lossAmount updated to current ₹2,500');
+    console.log('  ✓ PASSED: Actual Express GET /api/risk route produces byte-for-byte identical lock timestamps');
+  } finally {
+    liveAdapter.setFetchHandler(undefined);
+  }
 
   // --------------------------------------------------------------------------
-  // TEST 9: Simulated fresh container/process restart boundary
+  // TEST 9: Cloud Run instance / process restart boundary in Shadow Mode
   // --------------------------------------------------------------------------
-  console.log('\n[Test 9] Fresh container restart behavior in Shadow Mode (unpersisted by design)');
+  console.log('\n[Test 9] Cloud Run process restart boundary in Shadow Mode (unpersisted by design)');
   const freshUser = 'user_fresh_container_test';
   ShadowRiskService.resetShadowState(freshUser);
   await ServerRiskStore.saveConfig(freshUser, testConfig);
@@ -380,13 +473,99 @@ async function runShadowLockLifecycleTests() {
   assert.equal(resFresh10s.expectedState, 'LOCKED');
   assert.equal(resFresh10s.lockedAt, tFresh10s.toISOString());
 
-  // Verify that zero unauthorized Firestore RiskSession writes occurred
+  // Verify zero unauthorized Firestore RiskSession writes occurred
   const storedSessionFresh = await ServerRiskStore.getSession(freshUser);
   assert.equal(storedSessionFresh.state, 'ALLOW', 'ServerRiskStore remains ALLOW (zero unauthorized persistence)');
   console.log('  ✓ PASSED: Fresh container restart verified; zero database persistence in Shadow Mode');
 
+  // --------------------------------------------------------------------------
+  // TEST 10: Authoritative Mode (liveRiskStateRecordingEnabled = true) Lock Stability
+  // --------------------------------------------------------------------------
+  console.log('\n[Test 10] Authoritative Mode lock stability across polling and container restarts');
+  const authUser = 'user_authoritative_mode_restart_test';
+
+  // Provision mock Firestore for Authoritative Mode persistence
+  const mockFirestoreDocs = new Map<string, any>();
+  const mockAdminDb: any = {
+    doc: (path: string) => ({
+      get: async () => ({
+        exists: mockFirestoreDocs.has(path),
+        data: () => mockFirestoreDocs.get(path),
+      }),
+      set: async (data: any) => {
+        mockFirestoreDocs.set(path, data);
+      },
+    }),
+    runTransaction: async (cb: any) => {
+      const transaction: any = {
+        get: async (ref: any) => {
+          const p = typeof ref === 'string' ? ref : ref.path || 'users/' + authUser;
+          return {
+            exists: mockFirestoreDocs.has(p),
+            data: () => mockFirestoreDocs.get(p),
+          };
+        },
+        set: (ref: any, data: any) => {
+          const p = typeof ref === 'string' ? ref : ref.path || 'users/' + authUser;
+          mockFirestoreDocs.set(p, data);
+        },
+      };
+      return cb(transaction);
+    },
+  };
+
+  setAdminFirestoreForTesting(mockAdminDb);
+
+  try {
+    await setLiveRiskStateRecordingEnabled(true, authUser);
+    await ServerRiskStore.saveConfig(authUser, testConfig);
+
+    // Trigger authoritative breach
+    const tAuth0 = new Date();
+    const authTradingDate = getTradingDateKolkata(tAuth0);
+    const authPnlResult = {
+      tradingDate: authTradingDate,
+      realisedPnl: -6000,
+      unrealisedPnl: 0,
+      totalPnl: -6000,
+      grossTradingPnl: -6000,
+      dailyRealisedPnl: -6000,
+      dailyUnrealisedPnl: 0,
+      includedRealisedPnl: -6000,
+      includedUnrealisedPnl: 0,
+      fnoPositionCount: 1,
+      totalPositionCount: 1,
+      positions: [],
+      source: 'ZERODHA_LIVE' as const,
+      calculatedAt: tAuth0.toISOString(),
+    };
+
+    const authEvalResult = await ServerRiskStore.evaluatePnlResult(authUser, authPnlResult, tAuth0);
+    assert.equal(authEvalResult.state, 'LOCKED');
+    const authLockedAt = authEvalResult.lockedAt!;
+    const authLockUntil = authEvalResult.lockUntil!;
+
+    // Poll GET /api/risk in Authoritative Mode via Express app
+    const resAuthPoll1 = await invokeExpressRoute(authUser);
+    assert.equal(resAuthPoll1.data.state, 'LOCKED');
+    assert.equal(resAuthPoll1.data.lockedAt, authLockedAt, 'Authoritative GET /api/risk returns exact lockedAt');
+    assert.equal(resAuthPoll1.data.lockUntil, authLockUntil, 'Authoritative GET /api/risk returns exact lockUntil');
+
+    // Simulate Cloud Run container/process restart (clear in-memory store)
+    ServerRiskStore.reset();
+
+    // Poll GET /api/risk again on fresh container at tAuth0 + 60s
+    const resAuthPollRestart = await invokeExpressRoute(authUser);
+    assert.equal(resAuthPollRestart.data.state, 'LOCKED');
+    assert.equal(resAuthPollRestart.data.lockedAt, authLockedAt, 'Authoritative mode preserves lockedAt across process restart');
+    assert.equal(resAuthPollRestart.data.lockUntil, authLockUntil, 'Authoritative mode preserves lockUntil across process restart');
+    console.log('  ✓ PASSED: Authoritative Mode preserves exact lock timestamps across process/container restarts');
+  } finally {
+    setAdminFirestoreForTesting(null);
+  }
+
   console.log('\n================================================================');
-  console.log('ALL SHADOW LOCK LIFECYCLE REGRESSION TESTS PASSED (9/9)');
+  console.log('ALL SHADOW LOCK LIFECYCLE REGRESSION TESTS PASSED (10/10)');
   console.log('================================================================\n');
 }
 
