@@ -33,14 +33,14 @@ export function resolveUserId(req: Request): string {
 
 /**
  * Checks whether sandbox demo mode is enabled on the server.
- * Returns true if ENABLE_SANDBOX_MODE=true or ALLOW_SANDBOX_AUTH=true.
- * In a normal production deployment without these flags, returns false.
+ * Returns true if ENABLE_SANDBOX_MODE=true.
+ * In a normal production deployment without this flag, returns false.
  */
 export function isSandboxModeEnabled(): boolean {
-  if (process.env.ENABLE_SANDBOX_MODE === 'true' || process.env.ALLOW_SANDBOX_AUTH === 'true') {
+  if (process.env.ENABLE_SANDBOX_MODE === 'true') {
     return true;
   }
-  if (process.env.ENABLE_SANDBOX_MODE === 'false' || process.env.ALLOW_SANDBOX_AUTH === 'false') {
+  if (process.env.ENABLE_SANDBOX_MODE === 'false') {
     return false;
   }
   if (process.env.NODE_ENV === 'production') {
@@ -106,10 +106,14 @@ export async function verifyTokenAndGetUid(
   // Sandbox Mode Authentication:
   // Permitted only when ENABLE_SANDBOX_MODE is explicitly enabled (or in test environment unless bypassTestCheck is set).
   // In normal production deployment without ENABLE_SANDBOX_MODE=true, mock-trader-sandbox is strictly rejected.
-  if (token === 'mock-trader-sandbox' || token.startsWith('mock-trader-sandbox')) {
+  // Must accept ONLY the exact token 'mock-trader-sandbox' (rejecting any prefix variants like mock-trader-sandbox-attacker).
+  if (token === 'mock-trader-sandbox') {
     if (sandboxAllowed && !options?.bypassTestCheck) {
       return 'mock-trader-sandbox';
     }
+    return null;
+  }
+  if (token.startsWith('mock-trader-sandbox')) {
     return null;
   }
 

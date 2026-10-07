@@ -78,12 +78,13 @@ async function runSandboxAuthTestSuite() {
 
   try {
     // --------------------------------------------------------------------------
-    // TEST A: Sandbox-enabled deployment + mock-trader-sandbox -> authenticated
+    // TEST A: Exact sandbox token accepted when ENABLE_SANDBOX_MODE=true
     // --------------------------------------------------------------------------
-    console.log('[Test A] Sandbox-enabled deployment + mock-trader-sandbox -> authenticated');
+    console.log('[Test A] Exact sandbox token accepted when enabled (ENABLE_SANDBOX_MODE=true)');
     {
       process.env.NODE_ENV = 'production';
       process.env.ENABLE_SANDBOX_MODE = 'true';
+      delete (process.env as any).ALLOW_SANDBOX_AUTH;
 
       assert.equal(isSandboxModeEnabled(), true, 'isSandboxModeEnabled() returns true when ENABLE_SANDBOX_MODE=true');
 
@@ -100,21 +101,61 @@ async function runSandboxAuthTestSuite() {
 
       assert.equal(res.code, 200, 'GET /api/risk/config returns 200 for authenticated sandbox user');
       assert.ok(res.data.dailyLossLimit !== undefined, 'Returned risk config for sandbox user');
-      console.log('  ✓ PASSED: Sandbox identity authenticated successfully in sandbox-enabled deployment');
+      console.log('  ✓ PASSED: Exact mock-trader-sandbox authenticated successfully when ENABLE_SANDBOX_MODE=true');
     }
 
     // --------------------------------------------------------------------------
-    // TEST B: Sandbox disabled -> mock-trader-sandbox -> 401
+    // TEST B: Sandbox token prefix variants strictly rejected when enabled
     // --------------------------------------------------------------------------
-    console.log('\n[Test B] Sandbox disabled (ENABLE_SANDBOX_MODE=false) -> mock-trader-sandbox -> 401');
+    console.log('\n[Test B] Sandbox token prefix variants rejected even when ENABLE_SANDBOX_MODE=true');
     {
       process.env.NODE_ENV = 'production';
-      process.env.ENABLE_SANDBOX_MODE = 'false';
+      process.env.ENABLE_SANDBOX_MODE = 'true';
 
-      assert.equal(isSandboxModeEnabled(), false, 'isSandboxModeEnabled() returns false when ENABLE_SANDBOX_MODE=false');
+      const attackerUid = await verifyTokenAndGetUid('mock-trader-sandbox-attacker');
+      assert.equal(attackerUid, null, 'mock-trader-sandbox-attacker is strictly rejected');
+
+      const extensionUid = await verifyTokenAndGetUid('mock-trader-sandbox-extension');
+      assert.equal(extensionUid, null, 'mock-trader-sandbox-extension is strictly rejected');
+
+      const numericUid = await verifyTokenAndGetUid('mock-trader-sandbox123');
+      assert.equal(numericUid, null, 'mock-trader-sandbox123 is strictly rejected');
+
+      const attackerRes = await invokeExpress(app, {
+        method: 'GET',
+        url: '/api/risk/config',
+        headers: {
+          authorization: 'Bearer mock-trader-sandbox-attacker',
+        },
+      });
+      assert.equal(attackerRes.code, 401, 'Prefix variant returns 401 UNAUTHENTICATED');
+      assert.equal(attackerRes.data.error, 'UNAUTHENTICATED');
+
+      const extensionRes = await invokeExpress(app, {
+        method: 'GET',
+        url: '/api/risk/config',
+        headers: {
+          authorization: 'Bearer mock-trader-sandbox-extension',
+        },
+      });
+      assert.equal(extensionRes.code, 401, 'Extension prefix variant returns 401 UNAUTHENTICATED');
+
+      console.log('  ✓ PASSED: All mock-trader-sandbox prefix variants strictly rejected');
+    }
+
+    // --------------------------------------------------------------------------
+    // TEST C: ALLOW_SANDBOX_AUTH alone cannot enable sandbox authentication
+    // --------------------------------------------------------------------------
+    console.log('\n[Test C] ALLOW_SANDBOX_AUTH alone cannot enable sandbox authentication in production');
+    {
+      process.env.NODE_ENV = 'production';
+      delete (process.env as any).ENABLE_SANDBOX_MODE;
+      process.env.ALLOW_SANDBOX_AUTH = 'true';
+
+      assert.equal(isSandboxModeEnabled(), false, 'isSandboxModeEnabled() returns false when only ALLOW_SANDBOX_AUTH=true');
 
       const uid = await verifyTokenAndGetUid('mock-trader-sandbox');
-      assert.equal(uid, null, 'verifyTokenAndGetUid returns null when sandbox is disabled');
+      assert.equal(uid, null, 'verifyTokenAndGetUid returns null when only ALLOW_SANDBOX_AUTH is present');
 
       const res = await invokeExpress(app, {
         method: 'GET',
@@ -124,15 +165,22 @@ async function runSandboxAuthTestSuite() {
         },
       });
 
-      assert.equal(res.code, 401, 'GET /api/risk/config returns 401 when sandbox is disabled');
-      assert.equal(res.data.error, 'UNAUTHENTICATED', 'Returns UNAUTHENTICATED error');
-      console.log('  ✓ PASSED: mock-trader-sandbox strictly rejected with 401 when sandbox is disabled');
+      assert.equal(res.code, 401, 'GET /api/risk/config returns 401 with ALLOW_SANDBOX_AUTH alone');
+      assert.equal(res.data.error, 'UNAUTHENTICATED');
+
+      // Also verify when ENABLE_SANDBOX_MODE=false and ALLOW_SANDBOX_AUTH=true
+      process.env.ENABLE_SANDBOX_MODE = 'false';
+      assert.equal(isSandboxModeEnabled(), false, 'isSandboxModeEnabled() returns false with ENABLE_SANDBOX_MODE=false');
+      const uidFalse = await verifyTokenAndGetUid('mock-trader-sandbox');
+      assert.equal(uidFalse, null, 'verifyTokenAndGetUid returns null with ENABLE_SANDBOX_MODE=false');
+
+      console.log('  ✓ PASSED: Single capability flag enforced; legacy/alternate flag ignored');
     }
 
     // --------------------------------------------------------------------------
-    // TEST C: Production normal deployment (no sandbox flag) -> mock-trader-sandbox -> 401
+    // TEST D: Production normal deployment (no sandbox flag) -> mock-trader-sandbox -> 401
     // --------------------------------------------------------------------------
-    console.log('\n[Test C] Production normal deployment (no sandbox flag) -> mock-trader-sandbox -> 401');
+    console.log('\n[Test D] Production normal deployment (no sandbox flag) -> mock-trader-sandbox -> 401');
     {
       process.env.NODE_ENV = 'production';
       delete (process.env as any).ENABLE_SANDBOX_MODE;
