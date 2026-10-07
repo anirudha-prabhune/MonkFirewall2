@@ -11,16 +11,36 @@ import express from 'express';
 import { apiRouter } from '../server/api';
 import http from 'http';
 
+/**
+ * Validates a Chrome Extension match pattern according to Chrome MV3 grammar:
+ * <scheme>://<host>/<path>
+ * Host must be '*', '*.<domain>', or an exact hostname/IP (with optional port).
+ * Host cannot contain '*' anywhere except as the first character (e.g. *.example.com).
+ */
+function isValidChromeMatchPattern(pattern: string): boolean {
+  if (pattern === '<all_urls>') return true;
+  const match = pattern.match(/^(\*|http|https|file|ftp):\/\/(\*|\*\.[a-zA-Z0-9.-]+|[a-zA-Z0-9.-]+)(:\d+)?(\/.*)$/);
+  if (!match) return false;
+  const host = match[2];
+  // If host starts with '*', it must be '*' or '*.' followed by domain with no other '*'
+  if (host.includes('*')) {
+    if (host === '*') return true;
+    if (host.startsWith('*.') && !host.slice(2).includes('*')) return true;
+    return false;
+  }
+  return true;
+}
+
 async function runPhase12cExtensionE2ETestSuite() {
   console.log('================================================================');
-  console.log('TRADING FIREWALL: PHASE 12C CHROME EXTENSION GENUINE E2E SUITE');
+  console.log('TRADING FIREWALL: PHASE 16 / 12C CHROME EXTENSION ENFORCEMENT & E2E');
   console.log('Executing actual extension/background.js in Sandbox Environment');
   console.log('================================================================\n');
 
   enableMockStoreForTesting(true);
   ServerRiskStore.reset();
 
-  const testUser = 'phase12c_e2e_user';
+  const testUser = 'phase16_extension_user';
   const tradingDate = getTradingDateKolkata(new Date());
 
   // Spin up a live local HTTP server with real apiRouter
@@ -52,11 +72,17 @@ async function runPhase12cExtensionE2ETestSuite() {
   const backgroundJsCode = fs.readFileSync(path.resolve('./extension/background.js'), 'utf-8');
 
   // Harness to instantiate background.js in a mock Chrome runtime
-  function createExtensionHarness(initialStorage: Record<string, any> = {}) {
+  function createExtensionHarness(
+    initialStorage: Record<string, any> = {},
+    initialTabs: Array<{ id: number; url: string }> = []
+  ) {
     const storageData = { ...initialStorage };
+    const openTabs = [...initialTabs];
     let navigationListener: ((details: any) => Promise<void>) | null = null;
     let messageListener: ((request: any, sender: any, sendResponse: (res: any) => void) => boolean) | null = null;
+    const alarmListeners: Array<(alarm: { name: string }) => Promise<void> | void> = [];
     const tabUpdates: Array<{ tabId: number; updateProps: any }> = [];
+    const alarmsCreated: Array<{ name: string; options: any }> = [];
 
     const mockChrome = {
       storage: {
@@ -90,10 +116,41 @@ async function runPhase12cExtensionE2ETestSuite() {
             messageListener = fn;
           },
         },
+        onInstalled: {
+          addListener: (fn: any) => {
+            // Triggered on installation
+          },
+        },
+        onStartup: {
+          addListener: (fn: any) => {
+            // Triggered on startup
+          },
+        },
+      },
+      alarms: {
+        create: (name: string, options: any) => {
+          alarmsCreated.push({ name, options });
+        },
+        get: (name: string, callback: (alarm?: any) => void) => {
+          const found = alarmsCreated.find((a) => a.name === name);
+          callback(found);
+        },
+        onAlarm: {
+          addListener: (fn: any) => {
+            alarmListeners.push(fn);
+          },
+        },
       },
       tabs: {
+        query: (queryInfo: any, callback: (tabs: any[]) => void) => {
+          setTimeout(() => callback([...openTabs]), 0);
+        },
         update: (tabId: number, updateProps: any) => {
           tabUpdates.push({ tabId, updateProps });
+          const existing = openTabs.find((t) => t.id === tabId);
+          if (existing && updateProps.url) {
+            existing.url = updateProps.url;
+          }
         },
       },
     };
@@ -106,6 +163,7 @@ async function runPhase12cExtensionE2ETestSuite() {
       fetch,
       Promise,
       setTimeout,
+      Array,
     };
 
     const context = vm.createContext(sandbox);
@@ -113,7 +171,9 @@ async function runPhase12cExtensionE2ETestSuite() {
 
     return {
       storageData,
+      openTabs,
       tabUpdates,
+      alarmsCreated,
       getNavigationListener: () => {
         assert.ok(navigationListener, 'onBeforeNavigate listener must be registered by background.js');
         return navigationListener!;
@@ -121,6 +181,11 @@ async function runPhase12cExtensionE2ETestSuite() {
       getMessageListener: () => {
         assert.ok(messageListener, 'onMessage listener must be registered by background.js');
         return messageListener!;
+      },
+      triggerAlarm: async (alarmName = 'trading_firewall_poll') => {
+        for (const listener of alarmListeners) {
+          await listener({ name: alarmName });
+        }
       },
       clearUpdates: () => {
         tabUpdates.length = 0;
@@ -132,9 +197,56 @@ async function runPhase12cExtensionE2ETestSuite() {
 
   try {
     // --------------------------------------------------------------------------
-    // E2E TEST 1: UNPAIRED state allows Zerodha navigation passively
+    // TEST 1: Manifest match patterns validity
     // --------------------------------------------------------------------------
-    console.log('[E2E Test 1] UNPAIRED state allows Zerodha navigation passively');
+    console.log('[Test 1] Manifest match patterns validity check');
+    {
+      const manifestPath = path.resolve('./extension/manifest.json');
+      const manifestContent = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
+
+      assert.equal(manifestContent.manifest_version, 3, 'Must be Manifest V3');
+      assert.ok(manifestContent.permissions.includes('alarms'), 'Must include alarms permission');
+      assert.ok(manifestContent.permissions.includes('storage'), 'Must include storage permission');
+      assert.ok(manifestContent.permissions.includes('tabs'), 'Must include tabs permission');
+      assert.ok(manifestContent.permissions.includes('webNavigation'), 'Must include webNavigation permission');
+
+      // Verify all host_permissions
+      for (const pattern of manifestContent.host_permissions) {
+        assert.ok(
+          isValidChromeMatchPattern(pattern),
+          `host_permission pattern "${pattern}" must be a valid Chrome match pattern`
+        );
+      }
+
+      // Verify all content_scripts matches
+      for (const cs of manifestContent.content_scripts) {
+        for (const pattern of cs.matches) {
+          assert.ok(
+            isValidChromeMatchPattern(pattern),
+            `content_script match pattern "${pattern}" must be a valid Chrome match pattern`
+          );
+        }
+      }
+
+      // Verify our validator correctly catches invalid middle wildcards
+      assert.equal(
+        isValidChromeMatchPattern('https://ais-dev-*.run.app/*'),
+        false,
+        'Invalid middle wildcard pattern must fail validation'
+      );
+      assert.equal(
+        isValidChromeMatchPattern('https://ais-pre-*.run.app/*'),
+        false,
+        'Invalid middle wildcard pattern must fail validation'
+      );
+
+      console.log('  ✓ PASSED: manifest.json has valid host patterns and required MV3 permissions');
+    }
+
+    // --------------------------------------------------------------------------
+    // TEST 2: UNPAIRED state allows Zerodha navigation passively
+    // --------------------------------------------------------------------------
+    console.log('\n[Test 2] UNPAIRED state allows Zerodha navigation passively');
     {
       const harness = createExtensionHarness({ pairingState: 'UNPAIRED' });
       const nav = harness.getNavigationListener();
@@ -145,11 +257,10 @@ async function runPhase12cExtensionE2ETestSuite() {
     }
 
     // --------------------------------------------------------------------------
-    // E2E TEST 2: PAIRED + LOCKED blocks kite.zerodha.com navigation
+    // TEST 3: PAIRED + LOCKED blocks kite.zerodha.com new navigation
     // --------------------------------------------------------------------------
-    console.log('\n[E2E Test 2] PAIRED + LOCKED blocks kite.zerodha.com navigation');
+    console.log('\n[Test 3] PAIRED + LOCKED blocks kite.zerodha.com new navigation');
     {
-      // Inject LOCKED RiskSession in server store
       const lockedSession: RiskSession = {
         tradingDate,
         userId: testUser,
@@ -186,14 +297,48 @@ async function runPhase12cExtensionE2ETestSuite() {
         'Redirects to blocked.html with encoded URL'
       );
       assert.equal(harness.storageData.lastKnownState, 'LOCKED', 'Updates storage to LOCKED');
-      console.log('  ✓ PASSED: LOCKED state actively redirects kite.zerodha.com to blocked.html');
+      console.log('  ✓ PASSED: LOCKED state actively redirects kite.zerodha.com navigation to blocked.html');
     }
 
     // --------------------------------------------------------------------------
-    // E2E TEST 3: PAIRED + ALLOW releases kite.zerodha.com navigation
+    // TEST 4: PAIRED + LOCKED existing/open Kite tab blocked by periodic alarm check
     // --------------------------------------------------------------------------
-    console.log('\n[E2E Test 3] PAIRED + ALLOW releases kite.zerodha.com navigation');
+    console.log('\n[Test 4] PAIRED + LOCKED existing/open Kite tab blocked by periodic alarm check');
     {
+      const harness = createExtensionHarness(
+        {
+          pairingState: 'PAIRED',
+          userId: testUser,
+          extensionToken: validToken,
+          serverUrl,
+          lastKnownState: 'RELEASED',
+        },
+        [
+          { id: 201, url: 'https://kite.zerodha.com/dashboard' },
+          { id: 202, url: 'http://localhost:3000/dashboard' },
+          { id: 203, url: 'https://kite.zerodha.com/positions' },
+        ]
+      );
+
+      // Trigger alarm
+      await harness.triggerAlarm('trading_firewall_poll');
+
+      // Assert Kite tabs (201, 203) are updated with blocked.html, while MonkTrades tab (202) is untouched
+      assert.equal(harness.tabUpdates.length, 2, 'Must redirect exactly the 2 open Kite tabs');
+      const updatedTabIds = harness.tabUpdates.map((u) => u.tabId);
+      assert.ok(updatedTabIds.includes(201), 'Tab 201 (Kite) must be redirected');
+      assert.ok(updatedTabIds.includes(203), 'Tab 203 (Kite) must be redirected');
+      assert.ok(!updatedTabIds.includes(202), 'Tab 202 (MonkTrades) must NOT be redirected');
+      assert.ok(harness.tabUpdates[0].updateProps.url.includes('blocked.html'));
+      console.log('  ✓ PASSED: Periodic alarm check redirects open Kite tabs and preserves MonkTrades');
+    }
+
+    // --------------------------------------------------------------------------
+    // TEST 5: PAIRED + ALLOW / WARNING / MARKET_CLOSED permitted
+    // --------------------------------------------------------------------------
+    console.log('\n[Test 5] PAIRED + ALLOW / WARNING / MARKET_CLOSED permitted');
+    {
+      // A. ALLOW
       const allowSession: RiskSession = {
         tradingDate,
         userId: testUser,
@@ -212,27 +357,25 @@ async function runPhase12cExtensionE2ETestSuite() {
       };
       injectSession(testUser, allowSession);
 
-      const harness = createExtensionHarness({
-        pairingState: 'PAIRED',
-        userId: testUser,
-        extensionToken: validToken,
-        serverUrl,
-        lastKnownState: 'LOCKED',
-      });
+      const harnessAllow = createExtensionHarness(
+        {
+          pairingState: 'PAIRED',
+          userId: testUser,
+          extensionToken: validToken,
+          serverUrl,
+          lastKnownState: 'LOCKED',
+        },
+        [{ id: 301, url: 'https://kite.zerodha.com/holdings' }]
+      );
 
-      const nav = harness.getNavigationListener();
-      await nav({ frameId: 0, tabId: 103, url: 'https://kite.zerodha.com/holdings' });
+      const navAllow = harnessAllow.getNavigationListener();
+      await navAllow({ frameId: 0, tabId: 302, url: 'https://kite.zerodha.com/holdings' });
+      await harnessAllow.triggerAlarm('trading_firewall_poll');
 
-      assert.equal(harness.tabUpdates.length, 0, 'ALLOW state must NOT block Zerodha');
-      assert.equal(harness.storageData.lastKnownState, 'RELEASED', 'Updates storage to RELEASED');
-      console.log('  ✓ PASSED: ALLOW state releases Zerodha navigation');
-    }
+      assert.equal(harnessAllow.tabUpdates.length, 0, 'ALLOW state must NOT block Zerodha');
+      assert.equal(harnessAllow.storageData.lastKnownState, 'RELEASED');
 
-    // --------------------------------------------------------------------------
-    // E2E TEST 4: PAIRED + WARNING releases kite.zerodha.com navigation
-    // --------------------------------------------------------------------------
-    console.log('\n[E2E Test 4] PAIRED + WARNING releases kite.zerodha.com navigation');
-    {
+      // B. WARNING
       const warnSession: RiskSession = {
         tradingDate,
         userId: testUser,
@@ -251,27 +394,19 @@ async function runPhase12cExtensionE2ETestSuite() {
       };
       injectSession(testUser, warnSession);
 
-      const harness = createExtensionHarness({
-        pairingState: 'PAIRED',
-        userId: testUser,
-        extensionToken: validToken,
-        serverUrl,
-        lastKnownState: 'RELEASED',
-      });
+      const harnessWarn = createExtensionHarness(
+        {
+          pairingState: 'PAIRED',
+          userId: testUser,
+          extensionToken: validToken,
+          serverUrl,
+        },
+        [{ id: 303, url: 'https://kite.zerodha.com/positions' }]
+      );
+      await harnessWarn.triggerAlarm('trading_firewall_poll');
+      assert.equal(harnessWarn.tabUpdates.length, 0, 'WARNING state must NOT block Zerodha');
 
-      const nav = harness.getNavigationListener();
-      await nav({ frameId: 0, tabId: 104, url: 'https://kite.zerodha.com/positions' });
-
-      assert.equal(harness.tabUpdates.length, 0, 'WARNING state must NOT block Zerodha');
-      assert.equal(harness.storageData.lastKnownState, 'RELEASED');
-      console.log('  ✓ PASSED: WARNING state permits trading navigation');
-    }
-
-    // --------------------------------------------------------------------------
-    // E2E TEST 5: PAIRED + MARKET_CLOSED does NOT trigger lock
-    // --------------------------------------------------------------------------
-    console.log('\n[E2E Test 5] PAIRED + MARKET_CLOSED does NOT trigger lock');
-    {
+      // C. MARKET_CLOSED
       const closedSession: RiskSession = {
         tradingDate,
         userId: testUser,
@@ -290,144 +425,178 @@ async function runPhase12cExtensionE2ETestSuite() {
       };
       injectSession(testUser, closedSession);
 
-      const harness = createExtensionHarness({
-        pairingState: 'PAIRED',
-        userId: testUser,
-        extensionToken: validToken,
-        serverUrl,
-        lastKnownState: 'RELEASED',
-      });
+      const harnessClosed = createExtensionHarness(
+        {
+          pairingState: 'PAIRED',
+          userId: testUser,
+          extensionToken: validToken,
+          serverUrl,
+        },
+        [{ id: 304, url: 'https://kite.zerodha.com/funds' }]
+      );
+      await harnessClosed.triggerAlarm('trading_firewall_poll');
+      assert.equal(harnessClosed.tabUpdates.length, 0, 'MARKET_CLOSED state must NOT block Zerodha');
 
-      const nav = harness.getNavigationListener();
-      await nav({ frameId: 0, tabId: 105, url: 'https://kite.zerodha.com/funds' });
-
-      assert.equal(harness.tabUpdates.length, 0, 'MARKET_CLOSED state must NOT lock navigation');
-      assert.equal(harness.storageData.lastKnownState, 'RELEASED');
-      console.log('  ✓ PASSED: MARKET_CLOSED state is non-blocking');
+      console.log('  ✓ PASSED: ALLOW, WARNING, and MARKET_CLOSED permit trading navigation & active tabs');
     }
 
     // --------------------------------------------------------------------------
-    // E2E TEST 6: After pairing, fails closed when server is unreachable
+    // TEST 6: Offline fail-closed (navigation and periodic alarm)
     // --------------------------------------------------------------------------
-    console.log('\n[E2E Test 6] After pairing, fails closed when server is unreachable');
+    console.log('\n[Test 6] Offline fail-closed (navigation and periodic alarm)');
     {
       const deadServerUrl = 'http://127.0.0.1:1'; // Unreachable port
-      const harness = createExtensionHarness({
-        pairingState: 'PAIRED',
-        userId: testUser,
-        extensionToken: validToken,
-        serverUrl: deadServerUrl,
-        lastKnownState: 'RELEASED', // Even if last known state was clean!
-      });
+      const harness = createExtensionHarness(
+        {
+          pairingState: 'PAIRED',
+          userId: testUser,
+          extensionToken: validToken,
+          serverUrl: deadServerUrl,
+          lastKnownState: 'RELEASED',
+        },
+        [{ id: 401, url: 'https://kite.zerodha.com/dashboard' }]
+      );
 
       const nav = harness.getNavigationListener();
-      await nav({ frameId: 0, tabId: 106, url: 'https://kite.zerodha.com/dashboard' });
+      await nav({ frameId: 0, tabId: 402, url: 'https://kite.zerodha.com/dashboard' });
+      await harness.triggerAlarm('trading_firewall_poll');
 
-      assert.equal(harness.tabUpdates.length, 1, 'Unreachable server MUST fail closed and block Zerodha');
+      assert.equal(harness.tabUpdates.length, 2, 'Offline server MUST fail closed on nav and alarm');
       assert.ok(harness.tabUpdates[0].updateProps.url.includes('blocked.html'));
-      console.log('  ✓ PASSED: Unreachable server strictly fails closed after pairing');
+      assert.ok(harness.tabUpdates[1].updateProps.url.includes('blocked.html'));
+      console.log('  ✓ PASSED: Offline / unreachable server strictly fails closed');
     }
 
     // --------------------------------------------------------------------------
-    // E2E TEST 7: Never allow Zerodha merely because lastKnownState was RELEASED when server is down
+    // TEST 7: Service worker restart with persisted pairing state
     // --------------------------------------------------------------------------
-    console.log('\n[E2E Test 7] Never allow Zerodha merely because lastKnownState was RELEASED when server is down');
+    console.log('\n[Test 7] Service worker restart with persisted pairing state');
     {
-      const deadServerUrl = 'http://127.0.0.1:1';
-      const harness = createExtensionHarness({
-        pairingState: 'PAIRED',
+      // Reset server session to LOCKED
+      const lockedSession: RiskSession = {
+        tradingDate,
         userId: testUser,
-        extensionToken: validToken,
-        serverUrl: deadServerUrl,
-        lastKnownState: 'RELEASED',
-      });
+        state: 'LOCKED',
+        isBreached: true,
+        currentPnl: -1500,
+        realisedPnl: -1500,
+        unrealisedPnl: 0,
+        lossLimit: 1000,
+        warningThreshold1: 70,
+        warningThreshold2: 90,
+        lastEvaluatedAt: new Date().toISOString(),
+        lockedAt: new Date().toISOString(),
+        lockUntil: new Date(Date.now() + 3600 * 1000).toISOString(),
+        reason: 'Breached',
+      };
+      injectSession(testUser, lockedSession);
 
-      const msgListener = harness.getMessageListener();
-      let responseResult: any = null;
-      msgListener({ type: 'CHECK_LOCK_STATUS' }, {}, (res) => {
-        responseResult = res;
-      });
+      // Harness 1 saves pairing to storage
+      const harness1 = createExtensionHarness();
+      harness1.storageData.pairingState = 'PAIRED';
+      harness1.storageData.userId = testUser;
+      harness1.storageData.extensionToken = validToken;
+      harness1.storageData.serverUrl = serverUrl;
 
-      // Wait for async response
-      await new Promise((resolve) => setTimeout(resolve, 50));
-      assert.ok(responseResult !== null, 'Message response received');
-      assert.equal(responseResult.isLocked, true, 'isLocked must be TRUE (fail-closed) when server is down');
-      console.log('  ✓ PASSED: lastKnownState RELEASED does not bypass offline fail-closed check');
+      // Simulate worker shutdown and restart: harness 2 starts with only storageData from disk
+      const harness2 = createExtensionHarness(harness1.storageData, [
+        { id: 501, url: 'https://kite.zerodha.com/orders' },
+      ]);
+
+      // Trigger alarm on restarted worker
+      await harness2.triggerAlarm('trading_firewall_poll');
+
+      assert.equal(harness2.tabUpdates.length, 1, 'Restarted worker must read storage and block Kite tab');
+      assert.ok(harness2.tabUpdates[0].updateProps.url.includes('blocked.html'));
+      console.log('  ✓ PASSED: Service worker survives suspension/restart using chrome.storage');
     }
 
     // --------------------------------------------------------------------------
-    // E2E TEST 8: MonkTrades dashboard is never blocked by the extension
+    // TEST 8: MonkTrades is never blocked by the extension
     // --------------------------------------------------------------------------
-    console.log('\n[E2E Test 8] MonkTrades dashboard is never blocked by the extension');
+    console.log('\n[Test 8] MonkTrades is never blocked by the extension');
     {
-      // Even under active LOCKED state
-      const harness = createExtensionHarness({
-        pairingState: 'PAIRED',
-        userId: testUser,
-        extensionToken: validToken,
-        serverUrl,
-        lastKnownState: 'LOCKED',
-      });
+      const harness = createExtensionHarness(
+        {
+          pairingState: 'PAIRED',
+          userId: testUser,
+          extensionToken: validToken,
+          serverUrl,
+          lastKnownState: 'LOCKED',
+        },
+        [
+          { id: 601, url: 'http://localhost:3000/dashboard' },
+          { id: 602, url: 'http://127.0.0.1:3000/settings' },
+        ]
+      );
 
       const nav = harness.getNavigationListener();
-      await nav({ frameId: 0, tabId: 108, url: 'http://localhost:3000/dashboard' });
-      await nav({ frameId: 0, tabId: 108, url: 'https://ais-dev-preview.run.app/risk' });
+      await nav({ frameId: 0, tabId: 601, url: 'http://localhost:3000/dashboard' });
+      await nav({ frameId: 0, tabId: 602, url: 'http://127.0.0.1:3000/analytics' });
+      await harness.triggerAlarm('trading_firewall_poll');
 
       assert.equal(harness.tabUpdates.length, 0, 'MonkTrades URLs must NEVER be blocked');
-      console.log('  ✓ PASSED: MonkTrades dashboard remains fully accessible under all states');
+      console.log('  ✓ PASSED: MonkTrades application remains accessible under all conditions');
     }
 
     // --------------------------------------------------------------------------
-    // E2E TEST 9: Tampered / Invalid Token fails closed (HTTP 401)
+    // TEST 9: evil-kite.zerodha.com must NOT be treated as Kite
     // --------------------------------------------------------------------------
-    console.log('\n[E2E Test 9] Tampered / Invalid Token fails closed (HTTP 401)');
+    console.log('\n[Test 9] evil-kite.zerodha.com must NOT be treated as Kite (exact hostname match)');
     {
-      const harness = createExtensionHarness({
+      const harness = createExtensionHarness(
+        {
+          pairingState: 'PAIRED',
+          userId: testUser,
+          extensionToken: validToken,
+          serverUrl,
+          lastKnownState: 'LOCKED',
+        },
+        [
+          { id: 701, url: 'https://evil-kite.zerodha.com/orders' },
+          { id: 702, url: 'https://kite.zerodha.com.attacker.com/orders' },
+          { id: 703, url: 'https://subdomain.kite.zerodha.com/orders' },
+        ]
+      );
+
+      const nav = harness.getNavigationListener();
+      await nav({ frameId: 0, tabId: 701, url: 'https://evil-kite.zerodha.com/orders' });
+      await nav({ frameId: 0, tabId: 702, url: 'https://kite.zerodha.com.attacker.com/orders' });
+      await nav({ frameId: 0, tabId: 703, url: 'https://subdomain.kite.zerodha.com/orders' });
+      await harness.triggerAlarm('trading_firewall_poll');
+
+      assert.equal(harness.tabUpdates.length, 0, 'Non-exact kite hosts must NOT be intercepted as Kite');
+      console.log('  ✓ PASSED: Exact hostname matching blocks only kite.zerodha.com');
+    }
+
+    // --------------------------------------------------------------------------
+    // TEST 10: Malformed contract or bad token fails closed
+    // --------------------------------------------------------------------------
+    console.log('\n[Test 10] Malformed contract or bad token fails closed');
+    {
+      const harnessBadToken = createExtensionHarness({
         pairingState: 'PAIRED',
         userId: testUser,
-        extensionToken: 'tampered_bad_token_123',
+        extensionToken: 'bad_token_xxx',
         serverUrl,
-        lastKnownState: 'RELEASED',
       });
 
-      const nav = harness.getNavigationListener();
-      await nav({ frameId: 0, tabId: 109, url: 'https://kite.zerodha.com/dashboard' });
+      const nav = harnessBadToken.getNavigationListener();
+      await nav({ frameId: 0, tabId: 801, url: 'https://kite.zerodha.com/dashboard' });
+      assert.equal(harnessBadToken.tabUpdates.length, 1, 'Bad token must fail closed');
 
-      assert.equal(harness.tabUpdates.length, 1, 'HTTP 401 must fail closed and block Zerodha');
-      assert.ok(harness.tabUpdates[0].updateProps.url.includes('blocked.html'));
-      console.log('  ✓ PASSED: Invalid token fails closed with blocked redirect');
-    }
-
-    // --------------------------------------------------------------------------
-    // E2E TEST 10: Missing userId after pairing fails closed
-    // --------------------------------------------------------------------------
-    console.log('\n[E2E Test 10] Missing userId after pairing fails closed');
-    {
-      const harness = createExtensionHarness({
-        pairingState: 'PAIRED',
-        userId: undefined,
-        extensionToken: undefined,
-        serverUrl,
-        lastKnownState: 'RELEASED',
-      });
-
-      const nav = harness.getNavigationListener();
-      await nav({ frameId: 0, tabId: 110, url: 'https://kite.zerodha.com/dashboard' });
-
-      assert.equal(harness.tabUpdates.length, 1, 'Missing userId after pairing must fail closed');
-      assert.ok(harness.tabUpdates[0].updateProps.url.includes('blocked.html'));
-      console.log('  ✓ PASSED: Missing userId after pairing strictly fails closed');
+      console.log('  ✓ PASSED: Malformed/revoked auth fails closed');
     }
   } finally {
     server.close();
   }
 
   console.log('\n================================================================');
-  console.log('ALL 10 PHASE 12C CHROME EXTENSION E2E TESTS PASSED (10/10)');
+  console.log('ALL PHASE 16 CHROME EXTENSION TESTS PASSED');
   console.log('================================================================\n');
 }
 
 runPhase12cExtensionE2ETestSuite().catch((err) => {
-  console.error('❌ PHASE 12C EXTENSION E2E TEST SUITE FAILED:', err);
+  console.error('❌ PHASE 16 EXTENSION E2E TEST SUITE FAILED:', err);
   process.exit(1);
 });

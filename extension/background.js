@@ -1,85 +1,147 @@
 // MonkTrades Chrome Extension Background Service Worker (Manifest V3)
 
-const ExtensionState = {
-  UNPAIRED: 'UNPAIRED',
-  PAIRED: 'PAIRED',
-  LOCKED: 'LOCKED',
-  RELEASED: 'RELEASED'
-};
+const ALARM_NAME = 'trading_firewall_poll';
 
-// Listen to webNavigation onBeforeNavigate to intercept and block trade screens
-chrome.webNavigation.onBeforeNavigate.addListener(async (details) => {
-  if (details.frameId !== 0) return;
-  const url = new URL(details.url);
-  if (!url.hostname.includes('kite.zerodha.com')) return;
+// 1. Setup periodic alarm using chrome.alarms (MV3 lifecycle safe)
+chrome.alarms.create(ALARM_NAME, { periodInMinutes: 0.5 });
 
-  const isLocked = await checkTradingFirewallStatus();
-  if (isLocked) {
-    const blockedUrl = chrome.runtime.getURL('blocked.html') + '?url=' + encodeURIComponent(details.url);
-    chrome.tabs.update(details.tabId, { url: blockedUrl });
+chrome.runtime.onInstalled.addListener(() => {
+  chrome.alarms.create(ALARM_NAME, { periodInMinutes: 0.5 });
+});
+
+chrome.runtime.onStartup.addListener(() => {
+  chrome.alarms.create(ALARM_NAME, { periodInMinutes: 0.5 });
+});
+
+// Periodic alarm handler: inspect active/open tabs and enforce lockout
+chrome.alarms.onAlarm.addListener(async (alarm) => {
+  if (alarm && alarm.name === ALARM_NAME) {
+    await checkAndEnforceActiveTabs();
   }
 });
 
-// Helper to query the authoritative risk enforcement contract
+// 2. Intercept new navigations via webNavigation.onBeforeNavigate
+chrome.webNavigation.onBeforeNavigate.addListener(async (details) => {
+  if (details.frameId !== 0) return;
+  try {
+    const url = new URL(details.url);
+    // Exact host matching: must match kite.zerodha.com exactly
+    if (url.hostname !== 'kite.zerodha.com') return;
+
+    const isLocked = await checkTradingFirewallStatus();
+    if (isLocked) {
+      const blockedUrl = chrome.runtime.getURL('blocked.html') + '?url=' + encodeURIComponent(details.url);
+      chrome.tabs.update(details.tabId, { url: blockedUrl });
+    }
+  } catch (err) {
+    // Ignore invalid URLs
+  }
+});
+
+// 3. Check and enforce lockout across all existing open tabs
+async function checkAndEnforceActiveTabs() {
+  const isLocked = await checkTradingFirewallStatus();
+  if (isLocked) {
+    await redirectActiveKiteTabs();
+  }
+}
+
+async function redirectActiveKiteTabs() {
+  return new Promise((resolve) => {
+    chrome.tabs.query({}, (tabs) => {
+      if (!tabs || !Array.isArray(tabs)) {
+        resolve();
+        return;
+      }
+      for (const tab of tabs) {
+        if (!tab.url || typeof tab.id !== 'number') continue;
+        try {
+          const url = new URL(tab.url);
+          // Exact host matching: must match kite.zerodha.com exactly
+          if (url.hostname === 'kite.zerodha.com') {
+            const blockedUrl = chrome.runtime.getURL('blocked.html') + '?url=' + encodeURIComponent(tab.url);
+            chrome.tabs.update(tab.id, { url: blockedUrl });
+          }
+        } catch (e) {
+          // Ignore invalid URLs
+        }
+      }
+      resolve();
+    });
+  });
+}
+
+// 4. Authoritative risk contract evaluation with strict fail-closed guarantees
 async function checkTradingFirewallStatus() {
   return new Promise((resolve) => {
-    chrome.storage.local.get(['userId', 'extensionToken', 'serverUrl', 'pairingState', 'lastKnownState'], async (data) => {
-      const { userId, extensionToken, serverUrl, pairingState, lastKnownState } = data;
+    chrome.storage.local.get(['userId', 'extensionToken', 'serverUrl', 'pairingState'], async (data) => {
+      const { userId, extensionToken, serverUrl, pairingState } = data || {};
 
-      // 1. UNPAIRED State: If the extension has never been paired, allow passive default access
+      // UNPAIRED State: If extension is not paired, permit passive default access
       if (pairingState !== 'PAIRED') {
-        console.log('[MonkTrades Extension] UNPAIRED State. Access permitted passively.');
         resolve(false);
         return;
       }
 
-      // 2. PAIRED State check: Once the browser extension is explicitly paired, missing/invalid MonkTrades session/credentials
-      // must NOT silently allow Zerodha. Fail-closed safeguard is strictly applied.
-      if (!userId || !serverUrl) {
-        console.warn('[MonkTrades Extension] PAIRED State but missing userId or serverUrl. Fail-closed applied.');
+      // PAIRED State: Missing credentials / tokens must fail-closed
+      if (!userId || !serverUrl || !extensionToken) {
+        chrome.storage.local.set({ lastKnownState: 'LOCKED' });
         resolve(true);
         return;
       }
 
-      // 3. PAIRED State Query: Query the backend using the cryptographic signature token.
+      // PAIRED State: Query the backend risk enforcement contract
       try {
         const response = await fetch(`${serverUrl}/api/enforcement/broker`, {
           method: 'GET',
           headers: {
             'Content-Type': 'application/json',
             'x-user-id': userId,
-            'x-extension-token': extensionToken || ''
+            'x-extension-token': extensionToken
           }
         });
 
-        if (response.status === 401) {
-          // Authentication failure or token invalidation -> Fail closed
-          console.warn('[MonkTrades Extension] Authentication rejected by server (401). Fail-closed applied.');
+        if (response.status === 401 || response.status === 403) {
+          // Authentication failure or token revocation -> Fail closed
           chrome.storage.local.set({ lastKnownState: 'LOCKED' });
           resolve(true);
           return;
         }
 
         if (!response.ok) {
-          console.warn('[MonkTrades Extension] Server returned non-200 status. Fail-closed applied.');
+          // Non-200 server response -> Fail closed
+          chrome.storage.local.set({ lastKnownState: 'LOCKED' });
           resolve(true);
           return;
         }
 
-        const contract = await response.json();
-        
-        // Authoritative state check:
-        // LOCKED: blocks kite.zerodha.com navigation
-        // ALLOW / WARNING: releases navigation
-        // MARKET_CLOSED: non-blocking inactive state (does NOT lock)
+        let contract;
+        try {
+          contract = await response.json();
+        } catch (jsonErr) {
+          // Malformed JSON -> Fail closed
+          chrome.storage.local.set({ lastKnownState: 'LOCKED' });
+          resolve(true);
+          return;
+        }
+
+        if (!contract || typeof contract !== 'object') {
+          // Malformed contract -> Fail closed
+          chrome.storage.local.set({ lastKnownState: 'LOCKED' });
+          resolve(true);
+          return;
+        }
+
+        // Authoritative state evaluation:
+        // LOCKED: blocks kite.zerodha.com
+        // READY / ACTIVE: enforcement active -> blocks kite.zerodha.com
+        // ALLOW / WARNING / MARKET_CLOSED: does not lock
         const isLocked = Boolean(
-          contract && (
-            contract.riskState === 'LOCKED' ||
-            contract.enforcementStatus === 'READY' ||
-            contract.enforcementStatus === 'ACTIVE'
-          )
+          contract.riskState === 'LOCKED' ||
+          contract.enforcementStatus === 'READY' ||
+          contract.enforcementStatus === 'ACTIVE'
         );
-        
+
         if (isLocked) {
           chrome.storage.local.set({ lastKnownState: 'LOCKED' });
           resolve(true);
@@ -88,18 +150,17 @@ async function checkTradingFirewallStatus() {
           resolve(false);
         }
       } catch (err) {
-        console.error('[MonkTrades Extension] Server unreachable or network error. Fail-closed applied.', err);
-        // Requirement 1 & 2: After pairing, extension access MUST fail closed when the server cannot be reached.
-        // Never allow Zerodha access merely because lastKnownState was RELEASED when the authoritative server state is unavailable.
+        // Network error / server unreachable / offline -> Fail closed
+        chrome.storage.local.set({ lastKnownState: 'LOCKED' });
         resolve(true);
       }
     });
   });
 }
 
-// Receive messages from content scripts to evaluate lock on demand
+// 5. Message handler for content scripts or popup queries
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-  if (request.type === 'CHECK_LOCK_STATUS') {
+  if (request && request.type === 'CHECK_LOCK_STATUS') {
     checkTradingFirewallStatus().then((isLocked) => {
       sendResponse({ isLocked });
     });
