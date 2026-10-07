@@ -26,26 +26,31 @@ The extension source files reside in the `/extension` directory:
 
 ---
 
-## 3. Exact MonkTrades Origin Requirement
+## 3. Exact MonkTrades Origin Configuration
 
-Chrome Manifest V3 strictly validates URL match patterns. Middle wildcards (such as `https://ais-dev-*.run.app/*`) are disallowed by Chrome's match pattern specification.
+Chrome Manifest V3 strictly validates URL match patterns. Middle wildcards (such as `https://ais-dev-*.run.app/*`) and broad wildcards (such as `https://*.run.app/*`) are disallowed or rejected by Chrome's match pattern specification.
 
-- **Localhost Development**: By default, `manifest.json` includes `http://localhost:3000/*`, `http://127.0.0.1:3000/*`, and `http://localhost/*`.
-- **Deployed Environments (Cloud Run / Custom Domain)**: If you host MonkTrades on a specific Cloud Run URL or custom domain (e.g. `https://my-monktrades-app.a.run.app`), add the exact origin to `host_permissions` and `content_scripts.matches` in `manifest.json`:
-  ```json
-  "host_permissions": [
-    "https://kite.zerodha.com/*",
-    "https://*.zerodha.com/*",
-    "http://localhost:3000/*",
-    "https://my-monktrades-app.a.run.app/*"
-  ]
-  ```
+The extension manifest is pre-configured with the exact established origins for this application:
+
+- **Localhost Development Origins**:
+  - `http://localhost:3000/*`
+  - `http://127.0.0.1:3000/*`
+  - `http://localhost/*`
+
+- **Deployed Cloud Run MonkTrades Origins**:
+  - `https://ais-dev-wyyezpv6s2lo3nusdgb6dl-608043296632.asia-southeast1.run.app/*`
+  - `https://ais-pre-wyyezpv6s2lo3nusdgb6dl-608043296632.asia-southeast1.run.app/*`
+
+- **Broker Host Permissions**:
+  - `https://kite.zerodha.com/*` (minimized to exact Kite domain)
+
+Both `host_permissions` and `content_scripts[0].matches` contain these exact origins so `content_monktrades.js` automatically pairs when navigating to either the local dev server or the deployed Cloud Run instance.
 
 ---
 
 ## 4. Pairing the Extension
 
-1. Start and log in to the MonkTrades application in Chrome.
+1. Start and log in to the MonkTrades application in Chrome (via localhost or the deployed Cloud Run URL).
 2. When the user session is authenticated, MonkTrades renders a pairing element (`monktrades-extension-sync`) containing the user ID and cryptographic extension token.
 3. `content_monktrades.js` automatically pairs the extension and stores `userId`, `extensionToken`, and `serverUrl` in `chrome.storage.local`.
 4. The extension transitions to the **PAIRED** state.
@@ -67,7 +72,7 @@ Chrome Manifest V3 strictly validates URL match patterns. Middle wildcards (such
 
 ---
 
-## 6. Reloading After Code Changes
+## 6. Reloading After Manifest/Code Changes
 
 Whenever you modify any file in `extension/` (such as `manifest.json` or `background.js`):
 1. Navigate back to `chrome://extensions`.

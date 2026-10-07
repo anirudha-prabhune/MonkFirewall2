@@ -197,28 +197,103 @@ async function runPhase12cExtensionE2ETestSuite() {
 
   try {
     // --------------------------------------------------------------------------
-    // TEST 1: Manifest match patterns validity
+    // TEST 1: Manifest match patterns validity & Deployment Configuration
     // --------------------------------------------------------------------------
-    console.log('[Test 1] Manifest match patterns validity check');
+    console.log('[Test 1] Manifest match patterns validity check & deployment configuration');
     {
       const manifestPath = path.resolve('./extension/manifest.json');
       const manifestContent = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
 
+      const exactDevOrigin = 'https://ais-dev-wyyezpv6s2lo3nusdgb6dl-608043296632.asia-southeast1.run.app/*';
+      const exactPreOrigin = 'https://ais-pre-wyyezpv6s2lo3nusdgb6dl-608043296632.asia-southeast1.run.app/*';
+      const exactKiteOrigin = 'https://kite.zerodha.com/*';
+
+      // 1. Manifest V3
       assert.equal(manifestContent.manifest_version, 3, 'Must be Manifest V3');
+
+      // 2. Required permissions
       assert.ok(manifestContent.permissions.includes('alarms'), 'Must include alarms permission');
       assert.ok(manifestContent.permissions.includes('storage'), 'Must include storage permission');
       assert.ok(manifestContent.permissions.includes('tabs'), 'Must include tabs permission');
       assert.ok(manifestContent.permissions.includes('webNavigation'), 'Must include webNavigation permission');
 
-      // Verify all host_permissions
+      // 3. Exact Kite origin exists and no broad *.zerodha.com wildcard in host_permissions
+      assert.ok(
+        manifestContent.host_permissions.includes(exactKiteOrigin),
+        `host_permissions must include exact Kite origin: ${exactKiteOrigin}`
+      );
+      assert.ok(
+        !manifestContent.host_permissions.includes('https://*.zerodha.com/*'),
+        'host_permissions should avoid broad *.zerodha.com wildcard'
+      );
+
+      // 4. Exact deployed MonkTrades origins exist in host_permissions
+      assert.ok(
+        manifestContent.host_permissions.includes(exactDevOrigin),
+        `host_permissions must include exact deployed Dev origin: ${exactDevOrigin}`
+      );
+      assert.ok(
+        manifestContent.host_permissions.includes(exactPreOrigin),
+        `host_permissions must include exact deployed Shared/Preview origin: ${exactPreOrigin}`
+      );
+
+      // 5. Exact deployed MonkTrades origins exist in content_scripts[0].matches
+      const monktradesContentScript = manifestContent.content_scripts.find((cs: any) =>
+        cs.js && cs.js.includes('content_monktrades.js')
+      );
+      assert.ok(monktradesContentScript, 'content_monktrades.js script entry must exist');
+      assert.ok(
+        monktradesContentScript.matches.includes(exactDevOrigin),
+        `content_monktrades.js matches must include exact deployed Dev origin: ${exactDevOrigin}`
+      );
+      assert.ok(
+        monktradesContentScript.matches.includes(exactPreOrigin),
+        `content_monktrades.js matches must include exact deployed Shared/Preview origin: ${exactPreOrigin}`
+      );
+
+      // 6. Localhost origins supported
+      assert.ok(manifestContent.host_permissions.includes('http://localhost:3000/*'), 'host_permissions must support localhost:3000');
+      assert.ok(monktradesContentScript.matches.includes('http://localhost:3000/*'), 'content_scripts must support localhost:3000');
+
+      // 7. No middle-wildcard run.app pattern exists
+      for (const pattern of manifestContent.host_permissions) {
+        assert.ok(
+          !pattern.includes('ais-dev-*.run.app') && !pattern.includes('ais-pre-*.run.app'),
+          `host_permission "${pattern}" must not contain middle wildcards`
+        );
+      }
+      for (const cs of manifestContent.content_scripts) {
+        for (const pattern of cs.matches) {
+          assert.ok(
+            !pattern.includes('ais-dev-*.run.app') && !pattern.includes('ais-pre-*.run.app'),
+            `content_script match "${pattern}" must not contain middle wildcards`
+          );
+        }
+      }
+
+      // 8. No broad *.run.app permission exists
+      for (const pattern of manifestContent.host_permissions) {
+        assert.ok(
+          !pattern.includes('*.run.app') && pattern !== 'https://*.run.app/*',
+          `host_permission "${pattern}" must not use broad *.run.app wildcard`
+        );
+      }
+      for (const cs of manifestContent.content_scripts) {
+        for (const pattern of cs.matches) {
+          assert.ok(
+            !pattern.includes('*.run.app') && pattern !== 'https://*.run.app/*',
+            `content_script match "${pattern}" must not use broad *.run.app wildcard`
+          );
+        }
+      }
+
+      // 9. Verify all host_permissions and content_scripts match valid Chrome syntax
       for (const pattern of manifestContent.host_permissions) {
         assert.ok(
           isValidChromeMatchPattern(pattern),
           `host_permission pattern "${pattern}" must be a valid Chrome match pattern`
         );
       }
-
-      // Verify all content_scripts matches
       for (const cs of manifestContent.content_scripts) {
         for (const pattern of cs.matches) {
           assert.ok(
@@ -240,7 +315,7 @@ async function runPhase12cExtensionE2ETestSuite() {
         'Invalid middle wildcard pattern must fail validation'
       );
 
-      console.log('  ✓ PASSED: manifest.json has valid host patterns and required MV3 permissions');
+      console.log('  ✓ PASSED: manifest.json has exact deployed origins, valid host patterns, and required MV3 configuration');
     }
 
     // --------------------------------------------------------------------------

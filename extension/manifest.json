@@ -11,10 +11,11 @@
   ],
   "host_permissions": [
     "https://kite.zerodha.com/*",
-    "https://*.zerodha.com/*",
     "http://localhost:3000/*",
     "http://127.0.0.1:3000/*",
-    "http://localhost/*"
+    "http://localhost/*",
+    "https://ais-dev-wyyezpv6s2lo3nusdgb6dl-608043296632.asia-southeast1.run.app/*",
+    "https://ais-pre-wyyezpv6s2lo3nusdgb6dl-608043296632.asia-southeast1.run.app/*"
   ],
   "background": {
     "service_worker": "background.js"
@@ -24,7 +25,9 @@
       "matches": [
         "http://localhost:3000/*",
         "http://127.0.0.1:3000/*",
-        "http://localhost/*"
+        "http://localhost/*",
+        "https://ais-dev-wyyezpv6s2lo3nusdgb6dl-608043296632.asia-southeast1.run.app/*",
+        "https://ais-pre-wyyezpv6s2lo3nusdgb6dl-608043296632.asia-southeast1.run.app/*"
       ],
       "js": ["content_monktrades.js"],
       "run_at": "document_end"
@@ -41,4 +44,3 @@
     "default_popup": "popup.html"
   }
 }
-
