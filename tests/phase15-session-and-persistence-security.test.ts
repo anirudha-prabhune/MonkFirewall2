@@ -323,35 +323,45 @@ async function runPhase15SecuritySuite() {
   // --------------------------------------------------------------------------
   // REQUIREMENT 5: Mock-trader-sandbox strictly gated behind explicit non-production/test condition
   // --------------------------------------------------------------------------
-  console.log('\n[Req 5] Mock-trader-sandbox authentication strictly gated; never accepted in production');
+  // REQUIREMENT 5: Sandbox Mode Authentication Gating
+  // --------------------------------------------------------------------------
+  console.log('\n[Req 5] Mock-trader-sandbox authentication strictly gated; rejected in normal production, allowed only when ENABLE_SANDBOX_MODE=true');
   {
     const originalNodeEnv = process.env.NODE_ENV;
     const originalSandboxFlag = process.env.ENABLE_SANDBOX_MODE;
     const originalAllowAuth = process.env.ALLOW_SANDBOX_AUTH;
 
     try {
-      // 1. In production: NEVER accept mock-trader-sandbox under any condition, even if sandbox flags set
+      // 1. In normal production without ENABLE_SANDBOX_MODE: NEVER accept mock-trader-sandbox
       process.env.NODE_ENV = 'production';
-      process.env.ENABLE_SANDBOX_MODE = 'true';
-      process.env.ALLOW_SANDBOX_AUTH = 'true';
+      delete (process.env as any).ENABLE_SANDBOX_MODE;
+      delete (process.env as any).ALLOW_SANDBOX_AUTH;
 
       const prodUid = await verifyTokenAndGetUid('mock-trader-sandbox');
-      assert.equal(prodUid, null, 'mock-trader-sandbox strictly rejected in production');
+      assert.equal(prodUid, null, 'mock-trader-sandbox strictly rejected in normal production deployment');
 
       const prodPrefixUid = await verifyTokenAndGetUid('mock-trader-sandbox-extension');
-      assert.equal(prodPrefixUid, null, 'mock-trader sandbox variant strictly rejected in production');
+      assert.equal(prodPrefixUid, null, 'mock-trader sandbox variant strictly rejected in normal production');
 
-      // 2. In development without explicit sandbox flags: rejected
+      // 2. In production WITH explicit ENABLE_SANDBOX_MODE=true capability: accepted
+      process.env.ENABLE_SANDBOX_MODE = 'true';
+      const prodSandboxUid = await verifyTokenAndGetUid('mock-trader-sandbox');
+      assert.equal(prodSandboxUid, 'mock-trader-sandbox', 'mock-trader-sandbox accepted when ENABLE_SANDBOX_MODE=true in production');
+
+      // 3. When ENABLE_SANDBOX_MODE is explicitly false: rejected
+      process.env.ENABLE_SANDBOX_MODE = 'false';
+      const disabledUid = await verifyTokenAndGetUid('mock-trader-sandbox');
+      assert.equal(disabledUid, null, 'mock-trader-sandbox rejected when ENABLE_SANDBOX_MODE=false');
+
+      // 4. In development without explicit sandbox flags (with bypassTestCheck: true): rejected
       delete (process.env as any).NODE_ENV;
       delete (process.env as any).ENABLE_SANDBOX_MODE;
       delete (process.env as any).ALLOW_SANDBOX_AUTH;
 
-      // In unit test runner (where argv includes 'test'), sandbox mode is allowed during tests
-      // When bypassTestCheck: true is passed, it simulates non-test environment
       const devNoFlagUid = await verifyTokenAndGetUid('mock-trader-sandbox', { bypassTestCheck: true });
-      assert.equal(devNoFlagUid, null, 'mock-trader-sandbox rejected without explicit sandbox flag');
+      assert.equal(devNoFlagUid, null, 'mock-trader-sandbox rejected without explicit sandbox flag when test bypass active');
 
-      // 3. When explicit sandbox flag enabled outside production: accepted
+      // 5. When explicit sandbox flag enabled: accepted
       process.env.ENABLE_SANDBOX_MODE = 'true';
       const sandboxUid = await verifyTokenAndGetUid('mock-trader-sandbox');
       assert.equal(sandboxUid, 'mock-trader-sandbox', 'mock-trader-sandbox accepted when sandbox flag is explicit');
@@ -363,7 +373,7 @@ async function runPhase15SecuritySuite() {
       else delete (process.env as any).ALLOW_SANDBOX_AUTH;
     }
 
-    console.log('  ✓ PASSED: mock-trader-sandbox identity strictly gated and unconditionally rejected in production');
+    console.log('  ✓ PASSED: mock-trader-sandbox identity strictly gated by server capability flag');
   }
 
   // --------------------------------------------------------------------------

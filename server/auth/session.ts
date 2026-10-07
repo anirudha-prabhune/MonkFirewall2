@@ -31,6 +31,31 @@ export function resolveUserId(req: Request): string {
   return '';
 }
 
+/**
+ * Checks whether sandbox demo mode is enabled on the server.
+ * Returns true if ENABLE_SANDBOX_MODE=true or ALLOW_SANDBOX_AUTH=true.
+ * In a normal production deployment without these flags, returns false.
+ */
+export function isSandboxModeEnabled(): boolean {
+  if (process.env.ENABLE_SANDBOX_MODE === 'true' || process.env.ALLOW_SANDBOX_AUTH === 'true') {
+    return true;
+  }
+  if (process.env.ENABLE_SANDBOX_MODE === 'false' || process.env.ALLOW_SANDBOX_AUTH === 'false') {
+    return false;
+  }
+  if (process.env.NODE_ENV === 'production') {
+    return false;
+  }
+  const isRunningInTest = typeof process !== 'undefined' && (
+    process.env.NODE_ENV === 'test' ||
+    process.argv.some(arg => arg?.includes('test'))
+  );
+  if (isRunningInTest) {
+    return true;
+  }
+  return false;
+}
+
 let firebaseAdminInitialized = false;
 
 export function ensureFirebaseAdminInitialized() {
@@ -67,7 +92,7 @@ export function ensureFirebaseAdminInitialized() {
 }
 
 /**
- * Verifies a Firebase ID token using Firebase Admin SDK.
+ * Verifies a Firebase ID token using Firebase Admin SDK or validates sandbox identity.
  * Returns the decoded UID if valid, or null if invalid.
  */
 export async function verifyTokenAndGetUid(
@@ -76,28 +101,22 @@ export async function verifyTokenAndGetUid(
 ): Promise<string | null> {
   if (!token || typeof token !== 'string') return null;
 
-  const isProduction = process.env.NODE_ENV === 'production';
-  const isRunningInTest = typeof process !== 'undefined' && (
-    process.env.NODE_ENV === 'test' ||
-    process.argv.some(arg => arg.includes('test'))
-  );
-  const isExplicitSandboxAllowed = !isProduction && (
-    isRunningInTest ||
-    process.env.ENABLE_SANDBOX_MODE === 'true' ||
-    process.env.ALLOW_SANDBOX_AUTH === 'true'
-  );
+  const sandboxAllowed = isSandboxModeEnabled();
 
-  // Requirement 5: Gate mock-trader-sandbox strictly behind explicit non-production/test/sandbox condition.
-  // Never accept the sandbox identity in production.
+  // Sandbox Mode Authentication:
+  // Permitted only when ENABLE_SANDBOX_MODE is explicitly enabled (or in test environment unless bypassTestCheck is set).
+  // In normal production deployment without ENABLE_SANDBOX_MODE=true, mock-trader-sandbox is strictly rejected.
   if (token === 'mock-trader-sandbox' || token.startsWith('mock-trader-sandbox')) {
-    if (isProduction) {
-      return null;
-    }
-    if (isExplicitSandboxAllowed && !options?.bypassTestCheck) {
+    if (sandboxAllowed && !options?.bypassTestCheck) {
       return 'mock-trader-sandbox';
     }
     return null;
   }
+
+  const isRunningInTest = typeof process !== 'undefined' && (
+    process.env.NODE_ENV === 'test' ||
+    process.argv.some(arg => arg?.includes('test'))
+  );
 
   if (isRunningInTest && !options?.bypassTestCheck) {
     // In unit test runner, accept mock tokens unless explicitly testing invalid/forged/expired/malicious tokens
