@@ -564,6 +564,167 @@ async function runPhase15SecuritySuite() {
     console.log('    ✓ PASSED: ValidationSessionManager strictly requires userId with zero default_user fallback');
   }
 
+  // --------------------------------------------------------------------------
+  // REQUIREMENT 7: RiskConfig Persistence Atomicity & Locked Immutability
+  // --------------------------------------------------------------------------
+  console.log('\n[Req 7] RiskConfig Persistence Atomicity & Locked Immutability:');
+
+  const atomicityUser = 'user_atomicity_test_1';
+  const initialConfig = {
+    dailyLossLimit: 5000,
+    warningThreshold1: 70,
+    warningThreshold2: 85,
+    lockDurationMinutes: 120,
+    lockDurationType: 'FIXED' as const,
+    includeRealisedPnl: true,
+    includeUnrealisedPnl: true,
+    enabled: true,
+  };
+
+  // 7.1 Failed Firestore config write does not alter previous in-memory config
+  console.log('  [7.1] Failed Firestore config write leaves in-memory config unchanged');
+  {
+    // Start with clean initial config in-memory
+    setAdminFirestoreForTesting(null);
+    enableMockStoreForTesting(true);
+    await ServerRiskStore.saveConfig(atomicityUser, initialConfig);
+    const beforeConfig = await ServerRiskStore.getConfig(atomicityUser);
+    assert.equal(beforeConfig.dailyLossLimit, 5000);
+
+    // Mock faulty Firestore that fails on write
+    const mockFaultyDb: any = {
+      doc: (path: string) => ({
+        get: async () => ({ exists: false, data: () => null }),
+        set: async () => {
+          throw new Error('UNAVAILABLE: Firestore replica quorum dropped');
+        },
+      }),
+    };
+    setAdminFirestoreForTesting(mockFaultyDb);
+    enableMockStoreForTesting(false);
+
+    let errThrown = false;
+    try {
+      await ServerRiskStore.saveConfig(atomicityUser, {
+        ...initialConfig,
+        dailyLossLimit: 8500, // Attempted modification
+      });
+    } catch (err: any) {
+      errThrown = true;
+      assert(err.message.includes('FIRESTORE_PERSISTENCE_FAILURE'));
+    }
+    assert.equal(errThrown, true, 'saveConfig throws FIRESTORE_PERSISTENCE_FAILURE when write fails');
+
+    // Verify in-memory config was NOT mutated to 8500
+    // Temporarily switch back to inspect in-memory userState
+    setAdminFirestoreForTesting(null);
+    enableMockStoreForTesting(true);
+    const afterConfig = await ServerRiskStore.getConfig(atomicityUser);
+    assert.equal(afterConfig.dailyLossLimit, 5000, 'dailyLossLimit remains 5000 (unmutated by failed write)');
+    console.log('    ✓ PASSED: Failed Firestore write leaves previous in-memory config intact');
+  }
+
+  // 7.2 Successful Firestore write updates both persistence and in-memory state
+  console.log('  [7.2] Successful Firestore write updates both persistence and in-memory state');
+  {
+    let persistedDoc: any = null;
+    const mockSuccessDb: any = {
+      doc: (path: string) => ({
+        get: async () => ({ exists: false, data: () => null }),
+        set: async (data: any) => {
+          persistedDoc = data;
+        },
+      }),
+    };
+    setAdminFirestoreForTesting(mockSuccessDb);
+    enableMockStoreForTesting(false);
+
+    const updatedInput = {
+      ...initialConfig,
+      dailyLossLimit: 6500,
+      warningThreshold1: 75,
+    };
+    const res = await ServerRiskStore.saveConfig(atomicityUser, updatedInput);
+    assert.equal(res.success, true, 'saveConfig succeeds with valid Firestore');
+    assert.equal(res.config?.dailyLossLimit, 6500);
+
+    // Verify Firestore was written
+    assert(persistedDoc !== null, 'Firestore set was called');
+    assert.equal(persistedDoc.dailyLossLimit, 6500, 'Firestore doc received 6500');
+
+    // Verify in-memory state was updated
+    setAdminFirestoreForTesting(null);
+    enableMockStoreForTesting(true);
+    const cachedConfig = await ServerRiskStore.getConfig(atomicityUser);
+    assert.equal(cachedConfig.dailyLossLimit, 6500, 'In-memory config updated to 6500');
+    assert.equal(cachedConfig.warningThreshold1, 75, 'In-memory warningThreshold1 updated to 75');
+    console.log('    ✓ PASSED: Successful Firestore write updates both persistence and cache');
+  }
+
+  // 7.3 Locked config remains immutable
+  console.log('  [7.3] Locked config remains immutable while active lock exists');
+  {
+    setAdminFirestoreForTesting(null);
+    enableMockStoreForTesting(true);
+
+    const lockedUser = 'user_locked_immutability_regress';
+    await ServerRiskStore.saveConfig(lockedUser, initialConfig);
+
+    // Simulate active LOCKED session
+    const today = new Date().toISOString().split('T')[0];
+    const activeLockSession = {
+      tradingDate: today,
+      userId: lockedUser,
+      state: 'LOCKED' as const,
+      isBreached: true,
+      lockedAt: new Date().toISOString(),
+      lockUntil: new Date(Date.now() + 60 * 60 * 1000).toISOString(), // 1 hour in future
+      currentPnl: -6000,
+      lossAmount: 6000,
+      realisedPnl: -6000,
+      unrealisedPnl: 0,
+      lossLimit: 5000,
+      warningThreshold1: 70,
+      warningThreshold2: 85,
+      lastEvaluatedAt: new Date().toISOString(),
+      reason: 'Daily loss limit breach',
+    };
+    (ServerRiskStore as any).getOrCreateUserState(lockedUser).sessions.set(today, activeLockSession);
+
+    // 1. Attempt to change dailyLossLimit while locked
+    const limitMutationRes = await ServerRiskStore.saveConfig(lockedUser, {
+      ...initialConfig,
+      dailyLossLimit: 12000,
+    });
+    assert.equal(limitMutationRes.success, false, 'Mutating dailyLossLimit rejected while locked');
+    assert.equal(limitMutationRes.code, 'RISK_CONFIG_LOCKED');
+    const configAfterLimit = await ServerRiskStore.getConfig(lockedUser);
+    assert.equal(configAfterLimit.dailyLossLimit, 5000, 'dailyLossLimit remains 5000');
+
+    // 2. Attempt to change lockDurationMinutes while locked
+    const durationMutationRes = await ServerRiskStore.saveConfig(lockedUser, {
+      ...initialConfig,
+      lockDurationMinutes: 180,
+    });
+    assert.equal(durationMutationRes.success, false, 'Mutating lockDurationMinutes rejected while locked');
+    assert.equal(durationMutationRes.code, 'RISK_CONFIG_LOCKED');
+    const configAfterDuration = await ServerRiskStore.getConfig(lockedUser);
+    assert.equal(configAfterDuration.lockDurationMinutes, 120, 'lockDurationMinutes remains 120');
+
+    // 3. Warning thresholds remain editable while locked
+    const warningMutationRes = await ServerRiskStore.saveConfig(lockedUser, {
+      ...initialConfig,
+      warningThreshold1: 72,
+      warningThreshold2: 88,
+    });
+    assert.equal(warningMutationRes.success, true, 'Warning thresholds can be updated while locked');
+    const configAfterWarning = await ServerRiskStore.getConfig(lockedUser);
+    assert.equal(configAfterWarning.warningThreshold1, 72, 'warningThreshold1 updated to 72');
+    assert.equal(configAfterWarning.warningThreshold2, 88, 'warningThreshold2 updated to 88');
+    assert.equal(configAfterWarning.dailyLossLimit, 5000, 'dailyLossLimit remained 5000');
+    console.log('    ✓ PASSED: Locked config immutability strictly preserved');
+  }
+
   console.log('\n================================================================');
   console.log('ALL PHASE 15 SECURITY REGRESSION REQUIREMENTS VERIFIED');
   console.log('================================================================');

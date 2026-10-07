@@ -176,19 +176,31 @@ export class ServerRiskStore {
       }
     }
 
-    userState.config = sanitized;
-    userState.loadedFromFirestore = true;
-
     const adminDb = getAdminFirestore();
+    const isProduction = process.env.NODE_ENV === 'production';
+    const isMock = isMockStoreEnabled();
+
+    if (isProduction && !adminDb && !isMock) {
+      throw new Error(`FIRESTORE_PERSISTENCE_FAILURE: Authoritative Firestore is unavailable in production for user ${userId}.`);
+    }
+
     if (adminDb) {
       try {
         const docRef = adminDb.doc(`users/${userId}/riskConfig/config`);
         await docRef.set(sanitized, { merge: true });
       } catch (err) {
         console.error(`[RiskStore] saveConfig to Firestore failed:`, err);
-        throw new Error(`FIRESTORE_PERSISTENCE_FAILURE: Failed to persist riskConfig to Firestore: ${err instanceof Error ? err.message : String(err)}`);
+        throw new Error(
+          `FIRESTORE_PERSISTENCE_FAILURE: Failed to persist riskConfig to Firestore: ${
+            err instanceof Error ? err.message : String(err)
+          }`
+        );
       }
     }
+
+    // Mutate in-memory cache ONLY AFTER authoritative Firestore persistence succeeds
+    userState.config = sanitized;
+    userState.loadedFromFirestore = true;
 
     const event: RiskEvent = {
       userId,
