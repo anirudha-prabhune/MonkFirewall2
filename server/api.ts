@@ -409,7 +409,8 @@ apiRouter.get('/broker/live/ltp', async (req: Request, res: Response) => {
 // GET /api/pnl - Authoritative Gross F&O P&L (Live Zerodha or Mock Fallback)
 apiRouter.get('/pnl', async (req: Request, res: Response) => {
   try {
-    const userId = resolveUserId(req);
+    const userId = (req as any).userId || await authenticateRequest(req, res);
+    if (!userId) return;
     const config = await ServerRiskStore.getConfig(userId);
     const liveAdapter = BrokerService.getLiveAdapter();
     const connStatus = await liveAdapter.getConnectionStatus(userId);
@@ -509,11 +510,8 @@ apiRouter.get('/pnl', async (req: Request, res: Response) => {
 // GET /api/pnl/live-validation - Phase 8 Live Zerodha P&L Validation & Shadow Mode
 apiRouter.get('/pnl/live-validation', async (req: Request, res: Response) => {
   try {
-    const headerUser = req.headers['x-user-id'] || req.headers['authorization'];
-    if (!headerUser) {
-      return sendJson(res, { error: 'UNAUTHENTICATED', message: 'Authentication required' }, 401);
-    }
-    const userId = resolveUserId(req);
+    const userId = (req as any).userId || await authenticateRequest(req, res);
+    if (!userId) return;
     const config = await ServerRiskStore.getConfig(userId);
     const validationResult = await LivePnlValidationService.validateLivePnl(
       config,
@@ -531,11 +529,8 @@ apiRouter.get('/pnl/live-validation', async (req: Request, res: Response) => {
 // GET /api/risk/shadow - Phase 9 Live P&L → Risk Engine Shadow Integration
 apiRouter.get('/risk/shadow', async (req: Request, res: Response) => {
   try {
-    const headerUser = req.headers['x-user-id'] || req.headers['authorization'];
-    if (!headerUser) {
-      return sendJson(res, { error: 'UNAUTHENTICATED', message: 'Authentication required' }, 401);
-    }
-    const userId = resolveUserId(req);
+    const userId = (req as any).userId || await authenticateRequest(req, res);
+    if (!userId) return;
     const shadowResult = await ShadowRiskService.evaluateLiveShadow(userId);
     sendJson(res, shadowResult);
   } catch (err) {
@@ -546,7 +541,8 @@ apiRouter.get('/risk/shadow', async (req: Request, res: Response) => {
 // GET /api/risk/recording-status - Phase 10B Controlled Live Risk Diagnostic & Status Information
 const handleRecordingStatus = async (req: Request, res: Response) => {
   try {
-    const userId = resolveUserId(req);
+    const userId = (req as any).userId || await authenticateRequest(req, res);
+    if (!userId) return;
     const enabled = getLiveRiskStateRecordingEnabled(userId);
     const session = await ServerRiskStore.getSession(userId);
     const liveAdapter = BrokerService.getLiveAdapter();
@@ -581,14 +577,8 @@ apiRouter.get('/risk/live/recording/status', handleRecordingStatus);
 // GET /api/risk/live/activation/preflight - Phase 11A Server-Authoritative Production Preflight Check
 const handleActivationPreflight = async (req: Request, res: Response) => {
   try {
-    const headerUser = req.headers['x-user-id'] || req.headers['authorization'];
-    if (!headerUser) {
-      return sendJson(res, { error: 'UNAUTHENTICATED', message: 'Authentication required' }, 401);
-    }
-    const userId = resolveUserId(req);
-    if (userId === 'default_trader') {
-      return sendJson(res, { error: 'UNAUTHENTICATED', message: 'Authenticated user required' }, 401);
-    }
+    const userId = (req as any).userId || await authenticateRequest(req, res);
+    if (!userId) return;
     const preflight = await ActivationGuardService.evaluatePreflight(userId);
     sendJson(res, preflight);
   } catch (err) {
@@ -602,14 +592,8 @@ apiRouter.get('/risk/recording/preflight', handleActivationPreflight);
 // POST /api/risk/recording/control - Phase 10B/11A Server-Authoritative Controlled Activation
 const handleRecordingControl = async (req: Request, res: Response) => {
   try {
-    const headerUser = req.headers['x-user-id'] || req.headers['authorization'];
-    if (!headerUser) {
-      return sendJson(res, { error: 'UNAUTHENTICATED', message: 'Authentication required' }, 401);
-    }
-    const userId = resolveUserId(req);
-    if (userId === 'default_trader') {
-      return sendJson(res, { error: 'UNAUTHENTICATED', message: 'Authenticated user required' }, 401);
-    }
+    const userId = (req as any).userId || await authenticateRequest(req, res);
+    if (!userId) return;
     const { enabled } = req.body || {};
     if (typeof enabled !== 'boolean') {
       return sendJson(res, { error: 'INVALID_REQUEST', message: '"enabled" boolean field is required' }, 400);
@@ -772,11 +756,8 @@ apiRouter.get('/lock/status', async (req: Request, res: Response) => {
 // GET /api/enforcement/status - Phase 6 Authoritative Enforcement State
 apiRouter.get('/enforcement/status', async (req: Request, res: Response) => {
   try {
-    const headerUser = req.headers['x-user-id'] || req.headers['authorization'];
-    if (!headerUser) {
-      return sendJson(res, { error: 'UNAUTHENTICATED', message: 'Authentication required' }, 401);
-    }
-    const userId = resolveUserId(req);
+    const userId = (req as any).userId || await authenticateRequest(req, res);
+    if (!userId) return;
     const state = await EnforcementService.getEnforcementState(userId);
     sendJson(res, state);
   } catch (err) {
@@ -787,17 +768,8 @@ apiRouter.get('/enforcement/status', async (req: Request, res: Response) => {
 // GET /api/risk/extension-token - Secure extension token retrieval
 apiRouter.get('/risk/extension-token', async (req: Request, res: Response) => {
   try {
-    const headerUser = req.headers['x-user-id'] || req.headers['authorization'];
-    if (!headerUser) {
-      return sendJson(res, { error: 'UNAUTHENTICATED', message: 'Authentication required' }, 401);
-    }
-    const userId = resolveUserId(req);
-
-    // Secure independent verification of user authorization to prevent impersonation
-    const isAuthorized = await isRequestAuthorizedForUser(req, userId);
-    if (!isAuthorized) {
-      return sendJson(res, { error: 'UNAUTHORIZED_ACCESS', message: 'Not authorized for this user ID' }, 403);
-    }
+    const userId = (req as any).userId || await authenticateRequest(req, res);
+    if (!userId) return;
 
     const token = generateExtensionToken(userId);
     sendJson(res, { userId, extensionToken: token });
@@ -809,15 +781,11 @@ apiRouter.get('/risk/extension-token', async (req: Request, res: Response) => {
 // GET /api/enforcement/broker - Phase 12B Server-Authoritative Broker Enforcement Contract
 apiRouter.get('/enforcement/broker', async (req: Request, res: Response) => {
   try {
-    const headerUser = req.headers['x-user-id'] || req.headers['authorization'];
-    if (!headerUser) {
-      return sendJson(res, { error: 'UNAUTHENTICATED', message: 'Authentication required' }, 401);
-    }
-    const userId = resolveUserId(req);
+    const userId = req.headers['x-user-id'] as string;
     const extensionToken = req.headers['x-extension-token'] as string;
 
     // Independent cryptographic verification of the extension token
-    if (!verifyExtensionToken(userId, extensionToken)) {
+    if (!userId || !extensionToken || !verifyExtensionToken(userId, extensionToken)) {
       return sendJson(res, { error: 'UNAUTHORIZED_EXTENSION', message: 'Invalid or missing extension token' }, 401);
     }
 
@@ -951,7 +919,8 @@ apiRouter.post('/validation/session/capture', async (req: Request, res: Response
       });
     }
 
-    const userId = resolveUserId(req);
+    const userId = (req as any).userId || await authenticateRequest(req, res);
+    if (!userId) return;
     const rawPositions = await liveAdapter.getPositions(userId);
     let liveInstruments: any[] = [];
     try {

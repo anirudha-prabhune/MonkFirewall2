@@ -184,7 +184,7 @@ async function runPhase11bCorrectionTestSuite() {
       currentPositionsPnl = -234.00;
       MarketDataService.ingestTick(mockToken, 15.85 + (-234.00 / 130));
 
-      setLiveRiskStateRecordingEnabled(true);
+      setLiveRiskStateRecordingEnabled(true, testUser);
       const evalResult = await LiveRiskRecorder.evaluateAndRecordLiveRisk(testUser);
       assert.equal(evalResult.grossTradingPnl, -234.00, 'Gross trading P&L is -₹234.00');
       assert.equal(evalResult.lossAmount, 234.00, 'Loss amount is ₹234.00');
@@ -227,14 +227,14 @@ async function runPhase11bCorrectionTestSuite() {
 
     // Reset session for subsequent isolation
     await ServerRiskStore.resetSession(testUser);
-    setLiveRiskStateRecordingEnabled(false);
+    setLiveRiskStateRecordingEnabled(false, testUser);
 
     // --------------------------------------------------------------------------
     // TEST 4: Changing live P&L updates RiskSession evaluation dynamically
     // --------------------------------------------------------------------------
     console.log('[Test 4] Changing live P&L updates RiskSession evaluation dynamically');
     {
-      setLiveRiskStateRecordingEnabled(true);
+      setLiveRiskStateRecordingEnabled(true, testUser);
 
       // Step A: -234.00
       currentPositionsPnl = -234.00;
@@ -263,11 +263,11 @@ async function runPhase11bCorrectionTestSuite() {
     console.log('[Test 5] GET /api/pnl returns riskSession / shadowSession synchronized with live P&L');
     {
       await ServerRiskStore.resetSession(testUser);
-      setLiveRiskStateRecordingEnabled(true);
+      setLiveRiskStateRecordingEnabled(true, testUser);
       currentPositionsPnl = -383.50;
       MarketDataService.ingestTick(mockToken, 15.85 + (-383.50 / 130));
 
-      const req: any = { headers: { 'x-user-id': testUser } };
+      const req: any = { headers: { authorization: `Bearer ${testUser}`, 'x-user-id': testUser } };
       const { res, getCaptured } = createMockRes();
       await pnlHandler(req, res, () => {});
       const captured = getCaptured();
@@ -297,7 +297,7 @@ async function runPhase11bCorrectionTestSuite() {
     // --------------------------------------------------------------------------
     console.log('[Test 7] Repeated identical polling creates zero duplicate risk events');
     {
-      setLiveRiskStateRecordingEnabled(true);
+      setLiveRiskStateRecordingEnabled(true, testUser);
       currentPositionsPnl = -383.50;
       MarketDataService.ingestTick(mockToken, 15.85 + (-383.50 / 130));
 

@@ -96,7 +96,7 @@ async function runPhase11aTestSuite() {
     await ZerodhaCredentialManager.disconnect(testUser);
 
     const req: any = {
-      headers: { 'x-user-id': testUser },
+      headers: { authorization: `Bearer ${testUser}`, 'x-user-id': testUser },
       query: {},
     };
     const { res, getCaptured } = createMockRes();
@@ -258,7 +258,7 @@ async function runPhase11aTestSuite() {
     await ZerodhaCredentialManager.disconnect(testUser);
 
     const req: any = {
-      headers: { 'x-user-id': testUser },
+      headers: { authorization: `Bearer ${testUser}`, 'x-user-id': testUser },
       body: { enabled: true },
     };
     const { res, getCaptured } = createMockRes();
@@ -279,7 +279,7 @@ async function runPhase11aTestSuite() {
   console.log('[Test 8] Activation request without boolean enabled field is rejected');
   {
     const req: any = {
-      headers: { 'x-user-id': testUser },
+      headers: { authorization: `Bearer ${testUser}`, 'x-user-id': testUser },
       body: {}, // missing enabled
     };
     const { res, getCaptured } = createMockRes();

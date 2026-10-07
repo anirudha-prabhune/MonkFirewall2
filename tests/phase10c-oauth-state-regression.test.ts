@@ -93,7 +93,7 @@ async function runPhase10cTestSuite() {
   const userA = 'firebase_user_alpha';
   {
     const req: any = {
-      headers: { 'x-user-id': userA },
+      headers: { authorization: `Bearer ${userA}`, 'x-user-id': userA },
       query: {},
     };
     const { res, getCaptured } = createMockRes();

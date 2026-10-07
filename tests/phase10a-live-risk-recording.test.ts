@@ -211,7 +211,7 @@ async function runPhase10ATestSuite() {
   // [Test 2] flag enabled + positive live P&L → ALLOW
   // ==========================================================================
   console.log('\n[Test 2] flag enabled + positive live P&L (+₹7,280) → ALLOW');
-  setLiveRiskStateRecordingEnabled(true);
+  setLiveRiskStateRecordingEnabled(true, testUser);
   try {
     const res2 = await LiveRiskRecorder.evaluateAndRecordLiveRisk(testUser, {
       injectedPositions: realProfitPositions,
@@ -230,14 +230,14 @@ async function runPhase10ATestSuite() {
     assert(session2.currentPnl === 7280, 'Persisted session currentPnl is 7280');
     assert(session2.isBreached === false, 'Persisted session isBreached is false');
   } finally {
-    setLiveRiskStateRecordingEnabled(false);
+    setLiveRiskStateRecordingEnabled(false, testUser);
   }
 
   // ==========================================================================
   // [Test 3] flag enabled + warning loss → existing WARNING semantics
   // ==========================================================================
   console.log('\n[Test 3] flag enabled + warning loss (72% loss) → WARNING semantics');
-  setLiveRiskStateRecordingEnabled(true);
+  setLiveRiskStateRecordingEnabled(true, testUser);
   try {
     const res3 = await LiveRiskRecorder.evaluateAndRecordLiveRisk(testUser, {
       injectedPositions: createClosedLossPosition(3600), // 72% of 5000
@@ -260,14 +260,14 @@ async function runPhase10ATestSuite() {
     );
     assert(hasWarningEvent, 'RISK_WARNING event successfully recorded');
   } finally {
-    setLiveRiskStateRecordingEnabled(false);
+    setLiveRiskStateRecordingEnabled(false, testUser);
   }
 
   // ==========================================================================
   // [Test 4] flag enabled + breach fixture → LOCKED + lockUntil
   // ==========================================================================
   console.log('\n[Test 4] flag enabled + breach fixture (₹5,000 loss) → LOCKED + lockUntil');
-  setLiveRiskStateRecordingEnabled(true);
+  setLiveRiskStateRecordingEnabled(true, testUser);
   let lockUntilFirst: string | null = null;
   try {
     const evalTime = new Date('2026-10-05T10:00:00.000Z');
@@ -299,14 +299,14 @@ async function runPhase10ATestSuite() {
     assert(hasBreach, 'LOSS_LIMIT_BREACHED event recorded');
     assert(hasLock, 'TRADING_LOCK_CREATED event recorded');
   } finally {
-    setLiveRiskStateRecordingEnabled(false);
+    setLiveRiskStateRecordingEnabled(false, testUser);
   }
 
   // ==========================================================================
   // [Test 5] repeated evaluation is idempotent and does not duplicate events
   // ==========================================================================
   console.log('\n[Test 5] repeated evaluation is idempotent and does not duplicate events');
-  setLiveRiskStateRecordingEnabled(true);
+  setLiveRiskStateRecordingEnabled(true, testUser);
   try {
     const eventsBeforeRepeat = await ServerRiskStore.getAuditEvents(testUser);
     const countBeforeRepeat = eventsBeforeRepeat.length;
@@ -330,14 +330,14 @@ async function runPhase10ATestSuite() {
       `Zero duplicate events emitted on repeated evaluation (before: ${countBeforeRepeat}, after: ${eventsAfterRepeat.length})`
     );
   } finally {
-    setLiveRiskStateRecordingEnabled(false);
+    setLiveRiskStateRecordingEnabled(false, testUser);
   }
 
   // ==========================================================================
   // [Test 6] existing active LOCKED state persists correctly
   // ==========================================================================
   console.log('\n[Test 6] existing active LOCKED state persists even with improving P&L');
-  setLiveRiskStateRecordingEnabled(true);
+  setLiveRiskStateRecordingEnabled(true, testUser);
   try {
     // Trader recovers to massive profit (+₹20,000) while lock is active
     const evalTime3 = new Date('2026-10-05T10:30:00.000Z');
@@ -354,7 +354,7 @@ async function runPhase10ATestSuite() {
     assert(session6.state === 'LOCKED', 'Session remains locked');
     assert(session6.lockUntil === lockUntilFirst, 'lockUntil strictly unchanged');
   } finally {
-    setLiveRiskStateRecordingEnabled(false);
+    setLiveRiskStateRecordingEnabled(false, testUser);
   }
 
   // ==========================================================================

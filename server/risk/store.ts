@@ -65,10 +65,14 @@ export class ServerRiskStore {
               userState.config = validation.sanitized;
             }
           }
-        } catch (err) {
-          console.error(`[RiskStore] getConfig from Firestore failed:`, err);
-        } finally {
           userState.loadedFromFirestore = true;
+        } catch (err) {
+          console.error(`[RiskStore] getConfig from Firestore failed for user ${userId}:`, err);
+          throw new Error(
+            `FIRESTORE_READ_FAILURE: Failed to read riskConfig from Firestore for user ${userId}: ${
+              err instanceof Error ? err.message : String(err)
+            }`
+          );
         }
       } else {
         userState.loadedFromFirestore = true;
@@ -359,6 +363,11 @@ export class ServerRiskStore {
           }
         } catch (err) {
           console.error(`[RiskStore] getSession from Firestore failed for user ${userId}:`, err);
+          throw new Error(
+            `FIRESTORE_READ_FAILURE: Failed to read riskSession from Firestore for user ${userId}: ${
+              err instanceof Error ? err.message : String(err)
+            }`
+          );
         }
       }
     }

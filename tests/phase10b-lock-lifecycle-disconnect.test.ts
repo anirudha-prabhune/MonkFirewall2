@@ -126,17 +126,17 @@ async function runPhase10BTestSuite() {
   // ============================================================================
   console.log('[Test 1] Activation is disabled by default');
   // Ensure flag is reset to default
-  setLiveRiskStateRecordingEnabled(false);
-  assert(getLiveRiskStateRecordingEnabled() === false, 'Default flag state is strictly false');
+  setLiveRiskStateRecordingEnabled(false, testUser);
+  assert(getLiveRiskStateRecordingEnabled(testUser) === false, 'Default flag state is strictly false');
   assert(liveRiskStateRecordingEnabled === false, 'Variable state is strictly false');
 
   console.log('\n[Test 2] Server-authoritative controlled activation & status');
-  setLiveRiskStateRecordingEnabled(true);
-  assert(getLiveRiskStateRecordingEnabled() === true, 'Activation flag updated to true when enabled');
+  setLiveRiskStateRecordingEnabled(true, testUser);
+  assert(getLiveRiskStateRecordingEnabled(testUser) === true, 'Activation flag updated to true when enabled');
   const session1 = await ServerRiskStore.getSession(testUser);
   const statusInfo = {
-    enabled: getLiveRiskStateRecordingEnabled(),
-    activationState: getLiveRiskStateRecordingEnabled() ? 'ACTIVE' : 'SHADOW_ONLY',
+    enabled: getLiveRiskStateRecordingEnabled(testUser),
+    activationState: getLiveRiskStateRecordingEnabled(testUser) ? 'ACTIVE' : 'SHADOW_ONLY',
     currentRiskState: session1?.state || 'ALLOW',
     tradingDate: session1?.tradingDate || getTradingDateKolkata(),
     lockUntil: session1?.lockUntil || null,
@@ -151,8 +151,8 @@ async function runPhase10BTestSuite() {
   assert(!('apiKey' in statusInfo || 'apiSecret' in statusInfo || 'accessToken' in statusInfo), 'No secrets exposed in diagnostic info');
 
   // Deactivate back to default for clean baseline
-  setLiveRiskStateRecordingEnabled(false);
-  assert(getLiveRiskStateRecordingEnabled() === false, 'Deactivated back to shadow mode');
+  setLiveRiskStateRecordingEnabled(false, testUser);
+  assert(getLiveRiskStateRecordingEnabled(testUser) === false, 'Deactivated back to shadow mode');
 
   // ============================================================================
   // SECTION 2: LIVE RISK LOCK LIFECYCLE (DETERMINISTIC FIXTURES)

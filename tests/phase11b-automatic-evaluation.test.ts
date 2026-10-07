@@ -155,7 +155,7 @@ async function runAutomaticEvaluationTests() {
   // TEST 1 — Automatic evaluation on Dashboard load without saving Risk Config
   // ------------------------------------------------------------------
   console.log('[Test 1] Zerodha authenticated → Dashboard load automatically loads config and evaluates shadow risk without Config Save');
-  const req1: any = { headers: { 'x-user-id': testUser } };
+  const req1: any = { headers: { authorization: `Bearer ${testUser}`, 'x-user-id': testUser } };
   const { res: res1, getCaptured: getCaptured1 } = createMockRes();
   await getPnlHandler(req1, res1, () => {});
 

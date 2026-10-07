@@ -190,10 +190,10 @@ async function runPhase11bTestSuite() {
     console.log('[Test 2] Activation rejected when preflight fails (Zerodha disconnected)');
     {
       await ZerodhaCredentialManager.disconnect(testUser);
-      setLiveRiskStateRecordingEnabled(false);
+      setLiveRiskStateRecordingEnabled(false, testUser);
 
       const req: any = {
-        headers: { 'x-user-id': testUser },
+        headers: { authorization: `Bearer ${testUser}`, 'x-user-id': testUser },
         body: { enabled: true },
       };
       const { res, getCaptured } = createMockRes();
@@ -202,7 +202,7 @@ async function runPhase11bTestSuite() {
 
       assert.equal(captured.code, 400, 'Activation with failing preflight returns 400');
       assert.equal(captured.data?.error, 'PREFLIGHT_CHECK_FAILED');
-      assert.equal(getLiveRiskStateRecordingEnabled(), false, 'Recording flag remains false');
+      assert.equal(getLiveRiskStateRecordingEnabled(testUser), false, 'Recording flag remains false');
       console.log('  ✓ PASSED: Activation rejected with PREFLIGHT_CHECK_FAILED when preflight fails');
     }
 
@@ -232,7 +232,7 @@ async function runPhase11bTestSuite() {
 
       // Now issue explicit activation request
       const req: any = {
-        headers: { 'x-user-id': testUser },
+        headers: { authorization: `Bearer ${testUser}`, 'x-user-id': testUser },
         body: { enabled: true },
       };
       const { res, getCaptured } = createMockRes();
@@ -242,7 +242,7 @@ async function runPhase11bTestSuite() {
       assert.equal(captured.code, 200, 'Activation request returns 200');
       assert.equal(captured.data?.success, true);
       assert.equal(captured.data?.enabled, true);
-      assert.equal(getLiveRiskStateRecordingEnabled(), true, 'Recording flag is now true');
+      assert.equal(getLiveRiskStateRecordingEnabled(testUser), true, 'Recording flag is now true');
 
       const firstEval = captured.data?.firstEvaluation;
       assert(firstEval !== undefined, 'firstEvaluation object present in response');
@@ -313,7 +313,7 @@ async function runPhase11bTestSuite() {
       assert.equal(preflight2.ready, false, 'User 2 preflight is not ready');
 
       const req: any = {
-        headers: { 'x-user-id': user2 },
+        headers: { authorization: `Bearer ${user2}`, 'x-user-id': user2 },
         body: { enabled: true },
       };
       const { res, getCaptured } = createMockRes();

@@ -23,61 +23,37 @@ import { LivePnlValidationResult } from '../pnl/liveValidationTypes';
 import { getAdminFirestore } from '../brokers/zerodha/sessionStore';
 
 /**
- * User-scoped in-memory recording state cache and global fallback.
- * STRICTLY FALSE by default for safety.
+ * User-scoped in-memory recording state cache.
+ * STRICTLY FALSE by default for safety. No global fallback.
  */
 const userRecordingStates = new Map<string, boolean>();
-let globalRecordingFallback = false;
 
 export let liveRiskStateRecordingEnabled = false;
 
 export async function initializeRecordingState(userId?: string): Promise<void> {
   const adminDb = getAdminFirestore();
-  if (!adminDb) return;
+  if (!adminDb || !userId || userId.trim().length === 0 || userId === 'default_trader') return;
 
-  if (userId && userId.trim().length > 0 && userId !== 'default_trader') {
-    try {
-      const docRef = adminDb.doc(`users/${userId}/riskRecording/state`);
-      const snap = await docRef.get();
-      if (snap.exists) {
-        const data = snap.data();
-        if (data && typeof data.enabled === 'boolean') {
-          userRecordingStates.set(userId, data.enabled);
-          console.log(`[LiveRiskRecorder] Restored recording state for ${userId}: ${data.enabled}`);
-        }
+  try {
+    const docRef = adminDb.doc(`users/${userId}/riskRecording/state`);
+    const snap = await docRef.get();
+    if (snap.exists) {
+      const data = snap.data();
+      if (data && typeof data.enabled === 'boolean') {
+        userRecordingStates.set(userId, data.enabled);
+        console.log(`[LiveRiskRecorder] Restored recording state for ${userId}: ${data.enabled}`);
       }
-    } catch (err) {
-      console.error(`[LiveRiskRecorder] Failed to load recording state for user ${userId}:`, err);
     }
-  } else {
-    try {
-      const docRef = adminDb.doc('system/recordingState');
-      const snap = await docRef.get();
-      if (snap.exists) {
-        const data = snap.data();
-        if (data && typeof data.enabled === 'boolean') {
-          globalRecordingFallback = data.enabled;
-          liveRiskStateRecordingEnabled = data.enabled;
-          console.log(`[LiveRiskRecorder] Restored global recording state from Firestore: ${data.enabled}`);
-        }
-      }
-    } catch (err) {
-      console.error('[LiveRiskRecorder] Failed to load recording state from Firestore:', err);
-    }
+  } catch (err) {
+    console.error(`[LiveRiskRecorder] Failed to load recording state for user ${userId}:`, err);
   }
 }
 
-// Trigger initial load asynchronously on import
-initializeRecordingState().catch(() => {});
-
 export function getLiveRiskStateRecordingEnabled(userId?: string): boolean {
   if (userId && userId.trim().length > 0) {
-    if (userRecordingStates.has(userId)) {
-      return userRecordingStates.get(userId)!;
-    }
-    return globalRecordingFallback;
+    return userRecordingStates.get(userId) ?? false;
   }
-  return Array.from(userRecordingStates.values()).some(Boolean) || globalRecordingFallback;
+  return Array.from(userRecordingStates.values()).some(Boolean);
 }
 
 export function setLiveRiskStateRecordingEnabled(enabled: boolean, userId?: string): void {
@@ -96,17 +72,16 @@ export function setLiveRiskStateRecordingEnabled(enabled: boolean, userId?: stri
         });
     }
   } else {
+    // If no specific userId provided and enabled === false, reset/clear all states
     if (!enabled) {
       userRecordingStates.clear();
     }
-    globalRecordingFallback = enabled;
   }
-  liveRiskStateRecordingEnabled = Array.from(userRecordingStates.values()).some(Boolean) || globalRecordingFallback;
+  liveRiskStateRecordingEnabled = Array.from(userRecordingStates.values()).some(Boolean);
 }
 
 export function resetRecordingStates(): void {
   userRecordingStates.clear();
-  globalRecordingFallback = false;
   liveRiskStateRecordingEnabled = false;
 }
 

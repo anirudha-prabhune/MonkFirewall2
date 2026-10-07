@@ -32,7 +32,7 @@ async function runPhase12aTestSuite() {
     let captured: { code: number; json?: any } = { code: 200 };
     const req: any = {
       headers: {
-        'x-user-id': userId,
+        ...(userId ? { authorization: `Bearer ${userId}`, 'x-user-id': userId } : {}),
         ...headers,
       },
     };

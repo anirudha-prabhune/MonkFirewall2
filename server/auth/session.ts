@@ -25,16 +25,10 @@ export function resolveUserId(req: Request): string {
   if ((req as any).userId && typeof (req as any).userId === 'string') {
     return (req as any).userId;
   }
-  const custom = req.headers['x-user-id'] as string;
-  if (custom && typeof custom === 'string' && custom.trim().length > 0) {
-    return custom.trim();
+  if ((req as any).auth?.uid && typeof (req as any).auth.uid === 'string') {
+    return (req as any).auth.uid;
   }
-  const authHeader = req.headers['authorization'];
-  if (authHeader && typeof authHeader === 'string' && authHeader.startsWith('Bearer ')) {
-    const token = authHeader.substring(7).trim();
-    if (token) return token;
-  }
-  return 'default_trader';
+  return '';
 }
 
 let firebaseAdminInitialized = false;
@@ -134,19 +128,6 @@ export async function authenticateRequest(
   let token: string | null = null;
   if (authHeader && typeof authHeader === 'string' && authHeader.startsWith('Bearer ')) {
     token = authHeader.substring(7).trim();
-  }
-
-  const isRunningInTest = typeof process !== 'undefined' && (
-    process.env.NODE_ENV === 'test' ||
-    process.argv.some(arg => arg.includes('test'))
-  );
-
-  // In test runner only: if x-user-id is supplied without Bearer token during unit test simulation
-  if (!token && isRunningInTest && !options?.bypassTestCheck) {
-    const xUser = req.headers['x-user-id'];
-    if (xUser && typeof xUser === 'string') {
-      token = xUser.trim();
-    }
   }
 
   if (!token) {

@@ -146,7 +146,7 @@ async function runPhase11cTests() {
 
   // Trigger explicit activation
   const reqActivate: any = {
-    headers: { 'x-user-id': testUser },
+    headers: { authorization: `Bearer ${testUser}`, 'x-user-id': testUser },
     body: { enabled: true },
   };
   const { res: resAct, getCaptured: getCapturedAct } = createMockRes();
@@ -169,7 +169,7 @@ async function runPhase11cTests() {
   // ------------------------------------------------------------------
   console.log('[Test 2] LOCKED Config Immutability: Attempted Daily Loss Limit edit rejected with RISK_CONFIG_LOCKED');
   const reqMutateLimit: any = {
-    headers: { 'x-user-id': testUser },
+    headers: { authorization: `Bearer ${testUser}`, 'x-user-id': testUser },
     body: {
       ...initialConfig,
       dailyLossLimit: 2000, // Attempted weakening from 500 to 2000
@@ -198,7 +198,7 @@ async function runPhase11cTests() {
   // ------------------------------------------------------------------
   console.log('[Test 3] LOCKED Config Immutability: Attempted Lockout Schedule edit rejected');
   const reqMutateSchedule: any = {
-    headers: { 'x-user-id': testUser },
+    headers: { authorization: `Bearer ${testUser}`, 'x-user-id': testUser },
     body: {
       ...initialConfig,
       lockDurationMinutes: 180, // Attempted alteration from 120 to 180
@@ -220,7 +220,7 @@ async function runPhase11cTests() {
   // ------------------------------------------------------------------
   console.log('[Test 4] Normal config attributes (e.g. warning thresholds) update while locked');
   const reqMutateThreshold: any = {
-    headers: { 'x-user-id': testUser },
+    headers: { authorization: `Bearer ${testUser}`, 'x-user-id': testUser },
     body: {
       ...initialConfig,
       warningThreshold1: 65, // Updating threshold 1 from 70 to 65
@@ -267,7 +267,7 @@ async function runPhase11cTests() {
   (ServerRiskStore as any).getOrCreateUserState(unlockedUser).sessions.set('2026-10-06', expiredSession);
 
   const reqExpiredEdit: any = {
-    headers: { 'x-user-id': unlockedUser },
+    headers: { authorization: `Bearer ${unlockedUser}`, 'x-user-id': unlockedUser },
     body: {
       ...initialConfig,
       dailyLossLimit: 1000, // Allowed because lock is expired
