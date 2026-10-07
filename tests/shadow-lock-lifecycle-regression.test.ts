@@ -314,7 +314,7 @@ async function runShadowLockLifecycleTests() {
   app.use(express.json());
   app.use('/api', apiRouter);
 
-  async function invokeExpressRoute(userId: string) {
+  async function invokeExpressRoute(userId: string, evaluationTime?: Date) {
     let capturedCode = 200;
     let capturedData: any = null;
     const req: any = {
@@ -324,7 +324,11 @@ async function runShadowLockLifecycleTests() {
       baseUrl: '/api',
       path: '/risk',
       userId,
-      headers: { host: 'localhost', accept: 'application/json' },
+      headers: {
+        host: 'localhost',
+        accept: 'application/json',
+        ...(evaluationTime ? { 'x-test-evaluation-time': evaluationTime.toISOString() } : {}),
+      },
       query: {},
       params: {},
       body: {},
@@ -403,9 +407,14 @@ async function runShadowLockLifecycleTests() {
     };
   });
 
+  const routeT0 = new Date('2026-10-06T09:30:00.000Z');
+  const routeT3s = new Date(routeT0.getTime() + 3000);
+  const routeT6s = new Date(routeT0.getTime() + 6000);
+  const routeT30s = new Date(routeT0.getTime() + 30000);
+
   try {
-    // Poll 0: Initial breach via GET /api/risk route
-    const resRoute0 = await invokeExpressRoute(routeUser);
+    // Poll 0: Initial breach via GET /api/risk route at t0
+    const resRoute0 = await invokeExpressRoute(routeUser, routeT0);
     assert.equal(resRoute0.code, 200, 'GET /api/risk returns 200');
     assert.equal(resRoute0.data.state, 'LOCKED', 'GET /api/risk returns LOCKED state');
     assert.ok(resRoute0.data.lockedAt !== null, 'lockedAt is non-null');
@@ -414,25 +423,25 @@ async function runShadowLockLifecycleTests() {
     const routeLockedAt = resRoute0.data.lockedAt;
     const routeLockUntil = resRoute0.data.lockUntil;
 
-    // Poll 1: t0 + 3s via GET /api/risk route
-    const resRoute3s = await invokeExpressRoute(routeUser);
+    // Poll 1: t0 + 3s via GET /api/risk route at routeT3s
+    const resRoute3s = await invokeExpressRoute(routeUser, routeT3s);
     assert.equal(resRoute3s.data.lockedAt, routeLockedAt, 'Poll at t0+3s returns byte-for-byte identical lockedAt');
     assert.equal(resRoute3s.data.lockUntil, routeLockUntil, 'Poll at t0+3s returns byte-for-byte identical lockUntil');
 
-    // Poll 2: t0 + 6s via GET /api/risk route with worsening loss (₹8,000)
+    // Poll 2: t0 + 6s via GET /api/risk route with worsening loss (₹8,000) at routeT6s
     currentLossAmount = 8000;
-    const resRoute6s = await invokeExpressRoute(routeUser);
+    const resRoute6s = await invokeExpressRoute(routeUser, routeT6s);
     assert.equal(resRoute6s.data.lockedAt, routeLockedAt, 'Poll at t0+6s preserves byte-for-byte identical lockedAt');
     assert.equal(resRoute6s.data.lockUntil, routeLockUntil, 'Poll at t0+6s preserves byte-for-byte identical lockUntil');
     assert.equal(resRoute6s.data.lossAmount, 8000, 'lossAmount updated to current ₹8,000');
 
-    // Poll 3: t0 + 30s via GET /api/risk route with recovering loss (₹2,500)
+    // Poll 3: t0 + 30s via GET /api/risk route with recovering loss (₹2,500) at routeT30s
     currentLossAmount = 2500;
-    const resRoute30s = await invokeExpressRoute(routeUser);
+    const resRoute30s = await invokeExpressRoute(routeUser, routeT30s);
     assert.equal(resRoute30s.data.lockedAt, routeLockedAt, 'Poll at t0+30s preserves byte-for-byte identical lockedAt');
     assert.equal(resRoute30s.data.lockUntil, routeLockUntil, 'Poll at t0+30s preserves byte-for-byte identical lockUntil');
     assert.equal(resRoute30s.data.lossAmount, 2500, 'lossAmount updated to current ₹2,500');
-    console.log('  ✓ PASSED: Actual Express GET /api/risk route produces byte-for-byte identical lock timestamps');
+    console.log('  ✓ PASSED: Actual Express GET /api/risk route produces byte-for-byte identical lock timestamps across t0, t0+3s, t0+6s, t0+30s');
   } finally {
     liveAdapter.setFetchHandler(undefined);
   }
@@ -479,12 +488,12 @@ async function runShadowLockLifecycleTests() {
   console.log('  ✓ PASSED: Fresh container restart verified; zero database persistence in Shadow Mode');
 
   // --------------------------------------------------------------------------
-  // TEST 10: Authoritative Mode (liveRiskStateRecordingEnabled = true) Lock Stability
+  // TEST 10: Persistence Abstraction Reading & Lock Timestamp Reloading
   // --------------------------------------------------------------------------
-  console.log('\n[Test 10] Authoritative Mode lock stability across polling and container restarts');
+  console.log('\n[Test 10] Persistence Abstraction Reading: GET /api/risk reloads persisted session across cache resets');
   const authUser = 'user_authoritative_mode_restart_test';
 
-  // Provision mock Firestore for Authoritative Mode persistence
+  // Provision mock Firestore for Authoritative Mode persistence abstraction testing
   const mockFirestoreDocs = new Map<string, any>();
   const mockAdminDb: any = {
     doc: (path: string) => ({
@@ -520,7 +529,7 @@ async function runShadowLockLifecycleTests() {
     await setLiveRiskStateRecordingEnabled(true, authUser);
     await ServerRiskStore.saveConfig(authUser, testConfig);
 
-    // Trigger authoritative breach
+    // Persist authoritative session via ServerRiskStore.evaluatePnlResult
     const tAuth0 = new Date();
     const authTradingDate = getTradingDateKolkata(tAuth0);
     const authPnlResult = {
@@ -545,21 +554,21 @@ async function runShadowLockLifecycleTests() {
     const authLockedAt = authEvalResult.lockedAt!;
     const authLockUntil = authEvalResult.lockUntil!;
 
-    // Poll GET /api/risk in Authoritative Mode via Express app
+    // GET /api/risk reads the persisted session
     const resAuthPoll1 = await invokeExpressRoute(authUser);
     assert.equal(resAuthPoll1.data.state, 'LOCKED');
-    assert.equal(resAuthPoll1.data.lockedAt, authLockedAt, 'Authoritative GET /api/risk returns exact lockedAt');
-    assert.equal(resAuthPoll1.data.lockUntil, authLockUntil, 'Authoritative GET /api/risk returns exact lockUntil');
+    assert.equal(resAuthPoll1.data.lockedAt, authLockedAt, 'GET /api/risk reads persisted lockedAt');
+    assert.equal(resAuthPoll1.data.lockUntil, authLockUntil, 'GET /api/risk reads persisted lockUntil');
 
-    // Simulate Cloud Run container/process restart (clear in-memory store)
+    // Simulate in-memory cache reset
     ServerRiskStore.reset();
 
-    // Poll GET /api/risk again on fresh container at tAuth0 + 60s
+    // GET /api/risk successfully reloads the same lock timestamps from store
     const resAuthPollRestart = await invokeExpressRoute(authUser);
     assert.equal(resAuthPollRestart.data.state, 'LOCKED');
-    assert.equal(resAuthPollRestart.data.lockedAt, authLockedAt, 'Authoritative mode preserves lockedAt across process restart');
-    assert.equal(resAuthPollRestart.data.lockUntil, authLockUntil, 'Authoritative mode preserves lockUntil across process restart');
-    console.log('  ✓ PASSED: Authoritative Mode preserves exact lock timestamps across process/container restarts');
+    assert.equal(resAuthPollRestart.data.lockedAt, authLockedAt, 'GET /api/risk reloads identical lockedAt after in-memory reset');
+    assert.equal(resAuthPollRestart.data.lockUntil, authLockUntil, 'GET /api/risk reloads identical lockUntil after in-memory reset');
+    console.log('  ✓ PASSED: Persistence abstraction reading verified; GET /api/risk reloads exact lock timestamps');
   } finally {
     setAdminFirestoreForTesting(null);
   }

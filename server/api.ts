@@ -699,7 +699,11 @@ apiRouter.get('/risk', async (req: Request, res: Response) => {
       const liveAdapter = BrokerService.getLiveAdapter();
       const connStatus = await liveAdapter.getConnectionStatus(userId);
       if (connStatus.status === 'CONNECTED' && connStatus.authenticated) {
-        const shadowResult = await ShadowRiskService.evaluateLiveShadow(userId);
+        const rawEvalTime = (req.headers['x-test-evaluation-time'] as string) || (req.query._testEvaluationTime as string);
+        const testEvalTime = rawEvalTime ? new Date(rawEvalTime) : undefined;
+        const shadowResult = await ShadowRiskService.evaluateLiveShadow(userId, {
+          evaluationTime: testEvalTime,
+        });
         const config = await ServerRiskStore.getConfig(userId);
         return sendJson(res, {
           tradingDate: shadowResult.tradingDate,
