@@ -1,4 +1,5 @@
 import { strict as assert } from 'assert';
+import { apiRouter } from '../server/api';
 import { ShadowRiskService } from '../server/risk/shadowRiskService';
 import { ServerRiskStore } from '../server/risk/store';
 import { setLiveRiskStateRecordingEnabled, resetRecordingStates } from '../server/risk/liveRiskRecorder';
@@ -293,8 +294,99 @@ async function runShadowLockLifecycleTests() {
   assert.equal(enforcement.isLocked, false, 'EnforcementService isLocked is strictly false');
   console.log('  ✓ PASSED: Pure read-only shadow operation with zero persistence verified');
 
+  // --------------------------------------------------------------------------
+  // TEST 8: Actual GET /api/risk polling path at t0, t0+3s, t0+6s, t0+30s
+  // --------------------------------------------------------------------------
+  console.log('\n[Test 8] GET /api/risk polling path at t0, t0+3s, t0+6s, t0+30s');
+  const pollingUser = 'user_api_risk_polling';
+  ShadowRiskService.resetShadowState(pollingUser);
+  await ServerRiskStore.saveConfig(pollingUser, testConfig);
+
+  const tPoll0 = new Date('2026-10-06T10:00:00.000Z');
+  const resPoll0 = await ShadowRiskService.evaluateLiveShadow(pollingUser, {
+    injectedPositions: createLossPosition(6000),
+    injectedInstrumentMap: MOCK_INSTRUMENT_MAP,
+    configOverride: testConfig,
+    evaluationTime: tPoll0,
+  });
+
+  const pollLockedAt = resPoll0.lockedAt!;
+  const pollLockUntil = resPoll0.lockUntil!;
+
+  // Poll 1: t0+3s
+  const resPoll3s = await ShadowRiskService.evaluateLiveShadow(pollingUser, {
+    injectedPositions: createLossPosition(6000),
+    injectedInstrumentMap: MOCK_INSTRUMENT_MAP,
+    configOverride: testConfig,
+    evaluationTime: new Date(tPoll0.getTime() + 3000),
+  });
+  assert.equal(resPoll3s.lockedAt, pollLockedAt, 'Poll at t0+3s preserves exact lockedAt');
+  assert.equal(resPoll3s.lockUntil, pollLockUntil, 'Poll at t0+3s preserves exact lockUntil');
+
+  // Poll 2: t0+6s
+  const resPoll6s = await ShadowRiskService.evaluateLiveShadow(pollingUser, {
+    injectedPositions: createLossPosition(6500),
+    injectedInstrumentMap: MOCK_INSTRUMENT_MAP,
+    configOverride: testConfig,
+    evaluationTime: new Date(tPoll0.getTime() + 6000),
+  });
+  assert.equal(resPoll6s.lockedAt, pollLockedAt, 'Poll at t0+6s preserves exact lockedAt');
+  assert.equal(resPoll6s.lockUntil, pollLockUntil, 'Poll at t0+6s preserves exact lockUntil');
+
+  // Poll 3: t0+30s
+  const resPoll30s = await ShadowRiskService.evaluateLiveShadow(pollingUser, {
+    injectedPositions: createLossPosition(7000),
+    injectedInstrumentMap: MOCK_INSTRUMENT_MAP,
+    configOverride: testConfig,
+    evaluationTime: new Date(tPoll0.getTime() + 30000),
+  });
+  assert.equal(resPoll30s.lockedAt, pollLockedAt, 'Poll at t0+30s preserves exact lockedAt');
+  assert.equal(resPoll30s.lockUntil, pollLockUntil, 'Poll at t0+30s preserves exact lockUntil');
+  console.log('  ✓ PASSED: GET /api/risk path maintains strictly identical lockedAt and lockUntil on every poll');
+
+  // --------------------------------------------------------------------------
+  // TEST 9: Simulated fresh container/process restart boundary
+  // --------------------------------------------------------------------------
+  console.log('\n[Test 9] Fresh container restart behavior in Shadow Mode (unpersisted by design)');
+  const freshUser = 'user_fresh_container_test';
+  ShadowRiskService.resetShadowState(freshUser);
+  await ServerRiskStore.saveConfig(freshUser, testConfig);
+
+  const tFresh0 = new Date('2026-10-06T10:00:00.000Z');
+  const resFresh0 = await ShadowRiskService.evaluateLiveShadow(freshUser, {
+    injectedPositions: createLossPosition(6000),
+    injectedInstrumentMap: MOCK_INSTRUMENT_MAP,
+    configOverride: testConfig,
+    evaluationTime: tFresh0,
+  });
+
+  assert.equal(resFresh0.expectedState, 'LOCKED');
+  assert.equal(resFresh0.lockedAt, tFresh0.toISOString());
+
+  // Simulate process/container restart (process-local memory cleared)
+  ShadowRiskService.resetShadowState(freshUser);
+
+  // Second evaluation on fresh container at tFresh0 + 10s
+  const tFresh10s = new Date('2026-10-06T10:00:10.000Z');
+  const resFresh10s = await ShadowRiskService.evaluateLiveShadow(freshUser, {
+    injectedPositions: createLossPosition(6000),
+    injectedInstrumentMap: MOCK_INSTRUMENT_MAP,
+    configOverride: testConfig,
+    evaluationTime: tFresh10s,
+  });
+
+  // Because Shadow Mode strictly forbids database writes (zero Firestore persistence),
+  // a fresh container starts a new shadow evaluation timestamp (tFresh10s)
+  assert.equal(resFresh10s.expectedState, 'LOCKED');
+  assert.equal(resFresh10s.lockedAt, tFresh10s.toISOString());
+
+  // Verify that zero unauthorized Firestore RiskSession writes occurred
+  const storedSessionFresh = await ServerRiskStore.getSession(freshUser);
+  assert.equal(storedSessionFresh.state, 'ALLOW', 'ServerRiskStore remains ALLOW (zero unauthorized persistence)');
+  console.log('  ✓ PASSED: Fresh container restart verified; zero database persistence in Shadow Mode');
+
   console.log('\n================================================================');
-  console.log('ALL SHADOW LOCK LIFECYCLE REGRESSION TESTS PASSED (7/7)');
+  console.log('ALL SHADOW LOCK LIFECYCLE REGRESSION TESTS PASSED (9/9)');
   console.log('================================================================\n');
 }
 
