@@ -301,9 +301,9 @@ async function runShadowLockLifecycleTests() {
   console.log('  ✓ PASSED: Pure read-only shadow operation with zero persistence verified');
 
   // --------------------------------------------------------------------------
-  // TEST 8: Actual Express GET /api/risk route-level polling path
+  // TEST 8: Express route-level integration test for GET /api/risk polling path
   // --------------------------------------------------------------------------
-  console.log('\n[Test 8] Express GET /api/risk route-level polling path (t0, t0+3s, t0+6s, t0+30s)');
+  console.log('\n[Test 8] Express route-level integration test for GET /api/risk (t0, t0+3s, t0+6s, t0+30s)');
   const routeUser = 'user_express_route_risk_polling';
   ShadowRiskService.resetShadowState(routeUser);
   await ServerRiskStore.saveConfig(routeUser, testConfig);
@@ -573,8 +573,149 @@ async function runShadowLockLifecycleTests() {
     setAdminFirestoreForTesting(null);
   }
 
+  // --------------------------------------------------------------------------
+  // TEST 11: Security & Environment Gating for Test Evaluation Time Header
+  // --------------------------------------------------------------------------
+  console.log('\n[Test 11] Security & Environment Gating for Test Evaluation Time Header');
+  const guardUser = 'user_header_security_guard_test';
+  ShadowRiskService.resetShadowState(guardUser);
+  await ServerRiskStore.saveConfig(guardUser, testConfig);
+  await ZerodhaSessionStore.saveSession(guardUser, 'mock_access_token_guard_test');
+
+  const customTestTime = new Date('2026-10-06T08:15:00.000Z');
+
+  async function invokeExpressCustom(userId: string, customHeaders?: any, customQuery?: any) {
+    let capturedCode = 200;
+    let capturedData: any = null;
+    const req: any = {
+      method: 'GET',
+      url: '/api/risk',
+      originalUrl: '/api/risk',
+      baseUrl: '/api',
+      path: '/risk',
+      userId,
+      headers: {
+        host: 'localhost',
+        accept: 'application/json',
+        ...(customHeaders || {}),
+      },
+      query: customQuery || {},
+      params: {},
+      body: {},
+    };
+    const res: any = {
+      statusCode: 200,
+      status: (code: number) => {
+        capturedCode = code;
+        res.statusCode = code;
+        return res;
+      },
+      json: (data: any) => {
+        capturedData = data;
+        return res;
+      },
+      setHeader: () => res,
+      end: () => res,
+    };
+    await new Promise<void>((resolve, reject) => {
+      app(req, res, (err: any) => {
+        if (err) reject(err);
+        else resolve();
+      });
+    });
+    return { code: capturedCode, data: capturedData };
+  }
+
+  liveAdapter.setFetchHandler(async (url: string) => {
+    if (url.includes('/portfolio/positions')) {
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: (h: string) => h === 'content-type' ? 'application/json' : '' },
+        json: async () => ({
+          status: 'success',
+          data: { net: createLossPosition(6000), day: [] },
+        }),
+      };
+    }
+    if (url.includes('/instruments')) {
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: (h: string) => h === 'content-type' ? 'application/json' : '' },
+        json: async () => [
+          {
+            instrument_token: 10418946,
+            tradingsymbol: 'NIFTY26O0622550CE',
+            name: 'NIFTY',
+            last_price: 74.15,
+            expiry: '2026-10-06',
+            strike: 22550,
+            tick_size: 0.05,
+            lot_size: 50,
+            instrument_type: 'CE',
+            segment: 'NFO-OPT',
+            exchange: 'NFO',
+          },
+        ],
+      };
+    }
+    return {
+      ok: true,
+      status: 200,
+      headers: { get: (h: string) => h === 'content-type' ? 'application/json' : '' },
+      json: async () => ({
+        status: 'success',
+        data: { profile: { user_id: guardUser } },
+      }),
+    };
+  });
+
+  try {
+    // 11.1: Valid x-test-evaluation-time in test environment -> deterministic evaluation time used
+    const resValid = await invokeExpressCustom(guardUser, {
+      'x-test-evaluation-time': customTestTime.toISOString(),
+    });
+    assert.equal(resValid.code, 200);
+    assert.equal(resValid.data.lastEvaluatedAt, customTestTime.toISOString(), 'Valid header in test runner sets lastEvaluatedAt');
+
+    // 11.2: Simulated production environment (NODE_ENV=production) -> header is strictly IGNORED
+    const prevEnv = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'production';
+    try {
+      const resProd = await invokeExpressCustom(guardUser, {
+        'x-test-evaluation-time': customTestTime.toISOString(),
+      });
+      assert.equal(resProd.code, 200);
+      assert.notEqual(resProd.data.lastEvaluatedAt, customTestTime.toISOString(), 'Production environment strictly ignores x-test-evaluation-time header');
+    } finally {
+      process.env.NODE_ENV = prevEnv;
+    }
+
+    // 11.3: Query parameter _testEvaluationTime is strictly IGNORED/UNSUPPORTED
+    ShadowRiskService.resetShadowState(guardUser);
+    const resQuery = await invokeExpressCustom(guardUser, undefined, {
+      _testEvaluationTime: customTestTime.toISOString(),
+    });
+    assert.equal(resQuery.code, 200);
+    assert.notEqual(resQuery.data.lastEvaluatedAt, customTestTime.toISOString(), 'Query parameter _testEvaluationTime is strictly ignored');
+
+    // 11.4: Invalid date string in header -> header is IGNORED (no throw/crash, falls back to current time)
+    ShadowRiskService.resetShadowState(guardUser);
+    const resInvalid = await invokeExpressCustom(guardUser, {
+      'x-test-evaluation-time': 'not-a-valid-date-string',
+    });
+    assert.equal(resInvalid.code, 200);
+    assert.ok(resInvalid.data.lastEvaluatedAt !== null, 'Invalid date string falls back to current time without crashing');
+    assert.notEqual(resInvalid.data.lastEvaluatedAt, 'not-a-valid-date-string');
+
+    console.log('  ✓ PASSED: Test evaluation time header security gating and production isolation verified');
+  } finally {
+    liveAdapter.setFetchHandler(undefined);
+  }
+
   console.log('\n================================================================');
-  console.log('ALL SHADOW LOCK LIFECYCLE REGRESSION TESTS PASSED (10/10)');
+  console.log('ALL SHADOW LOCK LIFECYCLE REGRESSION TESTS PASSED (11/11)');
   console.log('================================================================\n');
 }
 

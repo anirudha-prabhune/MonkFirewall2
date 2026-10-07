@@ -699,8 +699,23 @@ apiRouter.get('/risk', async (req: Request, res: Response) => {
       const liveAdapter = BrokerService.getLiveAdapter();
       const connStatus = await liveAdapter.getConnectionStatus(userId);
       if (connStatus.status === 'CONNECTED' && connStatus.authenticated) {
-        const rawEvalTime = (req.headers['x-test-evaluation-time'] as string) || (req.query._testEvaluationTime as string);
-        const testEvalTime = rawEvalTime ? new Date(rawEvalTime) : undefined;
+        let testEvalTime: Date | undefined = undefined;
+        const isProduction = process.env.NODE_ENV === 'production';
+        const isRunningInTest = typeof process !== 'undefined' && (
+          process.env.NODE_ENV === 'test' ||
+          process.argv.some(arg => arg.includes('test'))
+        );
+
+        if (isRunningInTest && !isProduction) {
+          const headerVal = req.headers['x-test-evaluation-time'];
+          if (typeof headerVal === 'string' && headerVal.trim().length > 0) {
+            const parsed = new Date(headerVal);
+            if (!isNaN(parsed.getTime())) {
+              testEvalTime = parsed;
+            }
+          }
+        }
+
         const shadowResult = await ShadowRiskService.evaluateLiveShadow(userId, {
           evaluationTime: testEvalTime,
         });
