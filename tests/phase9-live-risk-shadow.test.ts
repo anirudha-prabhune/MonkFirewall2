@@ -253,6 +253,7 @@ async function runPhase9TestSuite() {
   // [Test 6] Inclusive daily-loss boundary remains unchanged
   // ==========================================================================
   console.log('\n[Test 6] Inclusive daily-loss boundary (₹4,999 vs ₹5,000)');
+  ShadowRiskService.resetShadowState(testUser);
   const res6a = await ShadowRiskService.evaluateLiveShadow(testUser, {
     injectedPositions: createClosedLossPosition(4999),
     injectedInstrumentMap: testInstrumentMap,
@@ -389,6 +390,7 @@ async function runPhase9TestSuite() {
     },
   ];
 
+  ShadowRiskService.resetShadowState(testUser);
   const unknownRes = await ShadowRiskService.evaluateLiveShadow(testUser, {
     injectedPositions: unknownTokenPos,
     injectedInstrumentMap: testInstrumentMap, // 999999 is NOT in this map

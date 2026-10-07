@@ -16,7 +16,7 @@
  */
 
 import { LivePnlValidationService } from '../pnl/liveValidationService';
-import { RiskEngine } from './engine';
+import { RiskEngine, RiskSession } from './engine';
 import { ServerRiskStore } from './store';
 import { PnlResult } from '../pnl/types';
 import { RawBrokerPosition, BrokerInstrument } from '../brokers/types';
@@ -28,9 +28,35 @@ export interface ShadowEvaluationOptions {
   injectedInstrumentMap?: Map<number, BrokerInstrument>;
   configOverride?: Partial<RiskConfig>;
   evaluationTime?: Date;
+  currentSession?: RiskSession | null;
+  resetShadowSession?: boolean;
 }
 
 export class ShadowRiskService {
+  /**
+   * Deterministic per-user, per-trading-date in-memory shadow session state.
+   * STRICTLY NON-PERSISTENT: Never written to Firestore, ServerRiskStore, or EnforcementService.
+   */
+  private static shadowSessions = new Map<string, RiskSession>();
+
+  /**
+   * Clears shadow session cache (for testing or manual reset).
+   */
+  public static resetShadowState(userId?: string): void {
+    if (userId) {
+      this.shadowSessions.delete(userId);
+    } else {
+      this.shadowSessions.clear();
+    }
+  }
+
+  /**
+   * Retrieves active in-memory shadow session for the given user.
+   */
+  public static getShadowSession(userId: string): RiskSession | null {
+    return this.shadowSessions.get(userId) || null;
+  }
+
   /**
    * Performs an authoritative shadow evaluation of live Zerodha F&O P&L against the user's RiskConfig.
    * STRICTLY READ-ONLY: Never persists to RiskSession, emits riskEvents, or triggers Enforcement locks.
@@ -77,15 +103,34 @@ export class ShadowRiskService {
       calculatedAt: validationResult.timestamp,
     };
 
-    // 4. Feed PnlResult into existing RiskEngine.evaluate WITHOUT mutating session or emitting events
+    const effectiveTradingDate = validationResult.tradingDate;
+
+    // 4. Retrieve deterministic prior shadow session for this user and trading date
+    let currentSession: RiskSession | undefined = undefined;
+    if (options?.currentSession !== undefined) {
+      currentSession = options.currentSession === null ? undefined : options.currentSession;
+    } else if (options?.resetShadowSession) {
+      this.shadowSessions.delete(userId);
+    } else {
+      const prior = this.shadowSessions.get(userId);
+      if (prior && prior.tradingDate === effectiveTradingDate) {
+        currentSession = prior;
+      }
+    }
+
+    // 5. Feed PnlResult into existing RiskEngine.evaluate with prior shadow session
     const riskEval = RiskEngine.evaluate({
       userId,
       config,
       pnlResult,
+      currentSession,
       evaluationTime,
     });
 
-    // 5. Calculate threshold amounts for clear operator visibility
+    // 6. Update in-memory shadow session state for this user (pure RAM cache, zero persistence)
+    this.shadowSessions.set(userId, riskEval.session);
+
+    // 7. Calculate threshold amounts for clear operator visibility
     const warning1Amount = (config.dailyLossLimit * config.warningThreshold1) / 100;
     const warning2Amount = (config.dailyLossLimit * config.warningThreshold2) / 100;
     const lossAmount = Math.max(0, -pnlResult.grossTradingPnl);
@@ -95,7 +140,7 @@ export class ShadowRiskService {
         ? 'Trading allowed: P&L within daily loss parameters.'
         : riskEval.reason || `Risk state evaluated to ${riskEval.state}`;
 
-    // 6. Return strictly immutable SHADOW result
+    // 8. Return strictly immutable SHADOW result
     return {
       shadow: true,
       dataSource: 'ZERODHA_LIVE',
