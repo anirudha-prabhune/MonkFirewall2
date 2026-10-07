@@ -433,7 +433,7 @@ apiRouter.get('/pnl', async (req: Request, res: Response) => {
         let liveRiskSession: any = null;
         let shadowRiskResult: any = null;
 
-        const isRecordingActive = getLiveRiskStateRecordingEnabled(userId);
+        const isRecordingActive = await getLiveRiskStateRecordingEnabled(userId);
         if (isRecordingActive) {
           const liveRiskResult = await LiveRiskRecorder.evaluateAndRecordLiveRisk(userId, {
             evaluationTime: new Date(),
@@ -543,7 +543,7 @@ const handleRecordingStatus = async (req: Request, res: Response) => {
   try {
     const userId = (req as any).userId || await authenticateRequest(req, res);
     if (!userId) return;
-    const enabled = getLiveRiskStateRecordingEnabled(userId);
+    const enabled = await getLiveRiskStateRecordingEnabled(userId);
     const session = await ServerRiskStore.getSession(userId);
     const liveAdapter = BrokerService.getLiveAdapter();
     const connStatus = await liveAdapter.getConnectionStatus(userId);
@@ -616,7 +616,20 @@ const handleRecordingControl = async (req: Request, res: Response) => {
         );
       }
 
-      setLiveRiskStateRecordingEnabled(true, userId);
+      try {
+        await setLiveRiskStateRecordingEnabled(true, userId);
+      } catch (err) {
+        return sendJson(
+          res,
+          {
+            success: false,
+            error: 'RECORDING_STATE_PERSISTENCE_FAILED',
+            message: `Authoritative live risk recording persistence failed: ${err instanceof Error ? err.message : 'Storage failure'}`,
+          },
+          500
+        );
+      }
+
       ServerRiskStore.recordEvent(userId, {
         type: 'CONFIG_UPDATED',
         message: `Authoritative live RiskSession recording explicitly activated for user ${userId}.`,
@@ -641,7 +654,20 @@ const handleRecordingControl = async (req: Request, res: Response) => {
         firstEvaluation,
       });
     } else {
-      setLiveRiskStateRecordingEnabled(false, userId);
+      try {
+        await setLiveRiskStateRecordingEnabled(false, userId);
+      } catch (err) {
+        return sendJson(
+          res,
+          {
+            success: false,
+            error: 'RECORDING_STATE_PERSISTENCE_FAILED',
+            message: `Authoritative live risk recording deactivation persistence failed: ${err instanceof Error ? err.message : 'Storage failure'}`,
+          },
+          500
+        );
+      }
+
       ServerRiskStore.recordEvent(userId, {
         type: 'CONFIG_UPDATED',
         message: `Authoritative live RiskSession recording explicitly deactivated (Shadow Mode) for user ${userId}.`,
@@ -669,7 +695,7 @@ apiRouter.get('/risk', async (req: Request, res: Response) => {
   try {
     const userId = (req as any).userId || await authenticateRequest(req, res);
     if (!userId) return;
-    if (!getLiveRiskStateRecordingEnabled(userId)) {
+    if (!(await getLiveRiskStateRecordingEnabled(userId))) {
       const liveAdapter = BrokerService.getLiveAdapter();
       const connStatus = await liveAdapter.getConnectionStatus(userId);
       if (connStatus.status === 'CONNECTED' && connStatus.authenticated) {
@@ -882,10 +908,12 @@ apiRouter.get('/risk/events', async (req: Request, res: Response) => {
 // ============================================================================
 
 // POST /api/validation/session/start - Start validation session
-apiRouter.post('/validation/session/start', (req: Request, res: Response) => {
+apiRouter.post('/validation/session/start', async (req: Request, res: Response) => {
   try {
+    const userId = (req as any).userId || await authenticateRequest(req, res);
+    if (!userId) return;
     const notes = req.body?.notes;
-    const session = ValidationSessionManager.startSession(notes);
+    const session = ValidationSessionManager.startSession(userId, notes);
     sendJson(res, { success: true, session });
   } catch (err) {
     sendJson(res, { error: err instanceof Error ? err.message : 'Failed to start validation session' }, 500);
@@ -893,21 +921,30 @@ apiRouter.post('/validation/session/start', (req: Request, res: Response) => {
 });
 
 // GET /api/validation/session/active - Get current active validation session
-apiRouter.get('/validation/session/active', (req: Request, res: Response) => {
-  const session = ValidationSessionManager.getActiveSession();
-  sendJson(res, { active: !!session, session });
+apiRouter.get('/validation/session/active', async (req: Request, res: Response) => {
+  try {
+    const userId = (req as any).userId || await authenticateRequest(req, res);
+    if (!userId) return;
+    const session = ValidationSessionManager.getActiveSession(userId);
+    sendJson(res, { active: !!session, session });
+  } catch (err) {
+    sendJson(res, { error: err instanceof Error ? err.message : 'Failed to fetch active session' }, 500);
+  }
 });
 
 // POST /api/validation/session/capture - Capture raw positions snapshot and record observations
 apiRouter.post('/validation/session/capture', async (req: Request, res: Response) => {
   try {
-    let session = ValidationSessionManager.getActiveSession();
+    const userId = (req as any).userId || await authenticateRequest(req, res);
+    if (!userId) return;
+
+    let session = ValidationSessionManager.getActiveSession(userId);
     if (!session) {
-      session = ValidationSessionManager.startSession('Auto-started for capture');
+      session = ValidationSessionManager.startSession(userId, 'Auto-started for capture');
     }
 
     const liveAdapter = BrokerService.getLiveAdapter();
-    const conn = await liveAdapter.getConnectionStatus();
+    const conn = await liveAdapter.getConnectionStatus(userId);
 
     if (conn.status !== 'CONNECTED') {
       return sendJson(res, {
@@ -919,8 +956,6 @@ apiRouter.post('/validation/session/capture', async (req: Request, res: Response
       });
     }
 
-    const userId = (req as any).userId || await authenticateRequest(req, res);
-    if (!userId) return;
     const rawPositions = await liveAdapter.getPositions(userId);
     let liveInstruments: any[] = [];
     try {
@@ -951,7 +986,9 @@ apiRouter.post('/validation/session/capture', async (req: Request, res: Response
           dailyRealised: validationResult.calculated.dailyRealisedPnl,
           dailyUnrealised: validationResult.calculated.dailyUnrealisedPnl,
           grossTradingPnl: validationResult.calculated.grossTradingPnl,
-        } : undefined
+        } : undefined,
+        undefined,
+        userId
       );
     });
 
@@ -970,12 +1007,15 @@ apiRouter.post('/validation/session/capture', async (req: Request, res: Response
 // POST /api/validation/session/end - Conclude active validation session and generate report
 apiRouter.post('/validation/session/end', async (req: Request, res: Response) => {
   try {
-    const active = ValidationSessionManager.getActiveSession();
+    const userId = (req as any).userId || await authenticateRequest(req, res);
+    if (!userId) return;
+
+    const active = ValidationSessionManager.getActiveSession(userId);
     if (!active) {
       return sendJson(res, { error: 'No active validation session to end' }, 400);
     }
-    const ended = ValidationSessionManager.endSession(active.validationSessionId);
-    const report = ValidationSessionManager.generateReport(active.validationSessionId);
+    const ended = ValidationSessionManager.endSession(userId, active.validationSessionId);
+    const report = ValidationSessionManager.generateReport(active.validationSessionId, undefined, userId);
     sendJson(res, { success: true, endedSession: ended, report });
   } catch (err) {
     sendJson(res, { error: err instanceof Error ? err.message : 'Failed to end session' }, 500);
@@ -983,13 +1023,38 @@ apiRouter.post('/validation/session/end', async (req: Request, res: Response) =>
 });
 
 // GET /api/validation/session/report - Generate report for active or requested session
-apiRouter.get('/api/validation/session/report', (req: Request, res: Response) => {
-  const sessionId = (req.query.sessionId as string) || ValidationSessionManager.getActiveSession()?.validationSessionId;
-  if (!sessionId) {
-    return sendJson(res, { error: 'No active or requested sessionId' }, 404);
+const handleValidationReport = async (req: Request, res: Response) => {
+  try {
+    const userId = (req as any).userId || await authenticateRequest(req, res);
+    if (!userId) return;
+
+    const requestedSessionId = (req.query.sessionId as string) || (req.query.validationSessionId as string);
+    const active = ValidationSessionManager.getActiveSession(userId);
+    const sessionId = requestedSessionId || active?.validationSessionId;
+
+    if (!sessionId) {
+      return sendJson(res, { error: 'No active or requested sessionId' }, 404);
+    }
+
+    let report: any;
+    try {
+      report = ValidationSessionManager.generateReport(sessionId, undefined, userId);
+    } catch (reportErr: any) {
+      if (reportErr?.message?.includes('Unauthorized')) {
+        return sendJson(res, { error: 'Validation session not found or access denied' }, 404);
+      }
+      throw reportErr;
+    }
+    if (!report) {
+      return sendJson(res, { error: 'Validation session not found or access denied' }, 404);
+    }
+    sendJson(res, report);
+  } catch (err) {
+    sendJson(res, { error: err instanceof Error ? err.message : 'Failed to generate report' }, 500);
   }
-  const report = ValidationSessionManager.generateReport(sessionId);
-  sendJson(res, report);
-});
+};
+
+apiRouter.get('/validation/session/report', handleValidationReport);
+apiRouter.get('/api/validation/session/report', handleValidationReport);
 
 export default apiRouter;

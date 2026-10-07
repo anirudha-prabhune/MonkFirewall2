@@ -130,7 +130,7 @@ export class ActivationGuardService {
     }
 
     // L & M. Recording status check
-    const recordingEnabled = getLiveRiskStateRecordingEnabled(effectiveUserId);
+    const recordingEnabled = await getLiveRiskStateRecordingEnabled(effectiveUserId);
     if (recordingEnabled) {
       blockers.push('Live risk state recording is already enabled.');
     }

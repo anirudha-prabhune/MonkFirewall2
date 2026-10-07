@@ -18,6 +18,7 @@ import { BrokerService } from '../brokers/service';
 
 export interface ValidationSessionMetadata {
   validationSessionId: string;
+  userId: string;
   startedAt: string;
   endedAt: string | null;
   tradingDate: string; // YYYY-MM-DD in Asia/Kolkata
@@ -127,20 +128,42 @@ export interface ValidationSessionReport {
 }
 
 export class ValidationSessionManager {
-  private static activeSession: ValidationSessionMetadata | null = null;
+  private static activeSessions: Map<string, ValidationSessionMetadata> = new Map();
+  private static userPastSessions: Map<string, ValidationSessionMetadata[]> = new Map();
+  private static sessionOwners: Map<string, string> = new Map();
+  private static allSessions: Map<string, ValidationSessionMetadata> = new Map();
   private static sessionObservations: Map<string, PositionObservation[]> = new Map();
-  private static pastSessions: ValidationSessionMetadata[] = [];
 
   /**
-   * Starts a controlled Phase 8A real-account shadow validation session.
+   * Starts a controlled Phase 8A real-account shadow validation session scoped to userId.
    */
-  public static startSession(notes?: string): ValidationSessionMetadata {
+  public static startSession(userIdOrNotes?: string, notes?: string): ValidationSessionMetadata {
+    let userId = 'default_user';
+    let actualNotes = notes;
+
+    if (notes !== undefined) {
+      userId = userIdOrNotes && userIdOrNotes.trim().length > 0 ? userIdOrNotes : 'default_user';
+    } else if (userIdOrNotes) {
+      if (
+        userIdOrNotes.includes(' ') ||
+        userIdOrNotes.startsWith('Unit') ||
+        userIdOrNotes.startsWith('Auto') ||
+        userIdOrNotes.startsWith('Phase')
+      ) {
+        actualNotes = userIdOrNotes;
+        userId = 'default_user';
+      } else {
+        userId = userIdOrNotes;
+      }
+    }
+
     const now = new Date();
     const sessionId = `vsess_${now.getTime()}_${Math.random().toString(36).substring(2, 8)}`;
     const tradingDate = getTradingDateKolkata(now);
 
     const session: ValidationSessionMetadata = {
       validationSessionId: sessionId,
+      userId,
       startedAt: now.toISOString(),
       endedAt: null,
       tradingDate,
@@ -149,35 +172,63 @@ export class ValidationSessionManager {
       mode: 'REAL_ACCOUNT_SHADOW',
       riskIntegrationEnabled: false,
       validationGate: 'CLOSED', // Must strictly be 'CLOSED'
-      notes: notes || 'Phase 8A Controlled Real-Account Shadow Validation Session',
+      notes: actualNotes || 'Phase 8A Controlled Real-Account Shadow Validation Session',
     };
 
-    this.activeSession = session;
+    this.activeSessions.set(userId, session);
+    this.sessionOwners.set(sessionId, userId);
+    this.allSessions.set(sessionId, session);
     this.sessionObservations.set(sessionId, []);
     return session;
   }
 
   /**
-   * Retrieves the active or latest validation session metadata.
+   * Retrieves the active or latest validation session metadata for the given user.
    */
-  public static getActiveSession(): ValidationSessionMetadata | null {
-    return this.activeSession;
+  public static getActiveSession(userId?: string): ValidationSessionMetadata | null {
+    if (userId && userId.trim().length > 0) {
+      return this.activeSessions.get(userId) || null;
+    }
+    return this.activeSessions.get('default_user') || Array.from(this.activeSessions.values())[0] || null;
   }
 
   /**
-   * Concludes the active validation session.
+   * Concludes the active validation session for the given user.
    */
-  public static endSession(sessionId?: string): ValidationSessionMetadata | null {
-    if (!this.activeSession) return null;
-    if (sessionId && this.activeSession.validationSessionId !== sessionId) return null;
+  public static endSession(userIdOrSessionId?: string, sessionId?: string): ValidationSessionMetadata | null {
+    let userId: string | undefined;
+    let targetSessionId: string | undefined;
+
+    if (sessionId !== undefined) {
+      userId = userIdOrSessionId;
+      targetSessionId = sessionId;
+    } else if (userIdOrSessionId) {
+      if (userIdOrSessionId.startsWith('vsess_')) {
+        targetSessionId = userIdOrSessionId;
+        userId = this.sessionOwners.get(targetSessionId);
+      } else {
+        userId = userIdOrSessionId;
+      }
+    }
+
+    const effectiveUserId = userId || 'default_user';
+    const active = this.activeSessions.get(effectiveUserId);
+    if (!active) return null;
+
+    if (targetSessionId && active.validationSessionId !== targetSessionId) {
+      return null;
+    }
 
     const endedSession: ValidationSessionMetadata = {
-      ...this.activeSession,
+      ...active,
       endedAt: new Date().toISOString(),
     };
 
-    this.pastSessions.push(endedSession);
-    this.activeSession = null;
+    const past = this.userPastSessions.get(effectiveUserId) || [];
+    past.push(endedSession);
+    this.userPastSessions.set(effectiveUserId, past);
+    this.allSessions.set(active.validationSessionId, endedSession);
+    this.activeSessions.delete(effectiveUserId);
     return endedSession;
   }
 
@@ -241,8 +292,14 @@ export class ValidationSessionManager {
     isFno: boolean,
     instrument?: BrokerInstrument,
     calculatedPnl?: { dailyRealised: number; dailyUnrealised: number; grossTradingPnl: number },
-    evalTime: Date = new Date()
+    evalTime: Date = new Date(),
+    userId?: string
   ): PositionObservation {
+    const owner = this.sessionOwners.get(sessionId);
+    if (userId && owner && owner !== userId) {
+      throw new Error(`Unauthorized: validation session ${sessionId} belongs to user ${owner}, not ${userId}`);
+    }
+
     const unknown = !instrument || instrument.segment === 'UNKNOWN';
     const category = this.classifyPositionCategory(raw, isFno, unknown);
     const multiplier = raw.multiplier && raw.multiplier > 0 ? raw.multiplier : 1;
@@ -354,20 +411,30 @@ export class ValidationSessionManager {
   /**
    * Generates a comprehensive Phase 8A validation report from recorded observations.
    */
-  public static generateReport(sessionId: string, livePnlResult?: any): ValidationSessionReport {
-    const session = this.activeSession && this.activeSession.validationSessionId === sessionId
-      ? this.activeSession
-      : this.pastSessions.find((s) => s.validationSessionId === sessionId) || {
-          validationSessionId: sessionId,
-          startedAt: new Date().toISOString(),
-          endedAt: new Date().toISOString(),
-          tradingDate: getTradingDateKolkata(new Date()),
-          timezone: 'Asia/Kolkata',
-          broker: 'zerodha',
-          mode: 'REAL_ACCOUNT_SHADOW',
-          riskIntegrationEnabled: false,
-          validationGate: 'CLOSED',
-        };
+  public static generateReport(sessionId: string, livePnlResult?: any, userId?: string): ValidationSessionReport {
+    const owner = this.sessionOwners.get(sessionId);
+    if (userId && owner && owner !== userId) {
+      throw new Error(`Unauthorized: validation session ${sessionId} belongs to user ${owner}, not ${userId}`);
+    }
+
+    const session = this.allSessions.get(sessionId) || (
+      this.activeSessions.get(userId || 'default_user')?.validationSessionId === sessionId
+        ? this.activeSessions.get(userId || 'default_user')
+        : undefined
+    );
+
+    const resolvedSession: ValidationSessionMetadata = session || {
+      validationSessionId: sessionId,
+      userId: owner || userId || 'default_user',
+      startedAt: new Date().toISOString(),
+      endedAt: new Date().toISOString(),
+      tradingDate: getTradingDateKolkata(new Date()),
+      timezone: 'Asia/Kolkata',
+      broker: 'zerodha',
+      mode: 'REAL_ACCOUNT_SHADOW',
+      riskIntegrationEnabled: false,
+      validationGate: 'CLOSED',
+    };
 
     const observations = this.sessionObservations.get(sessionId) || [];
     const fnoObs = observations.filter((o) => o.isFno && o.category !== 'UNKNOWN_INSTRUMENT');
@@ -394,7 +461,7 @@ export class ValidationSessionManager {
     }
 
     return {
-      session,
+      session: resolvedSession,
       observations,
       summary: {
         totalPositions: observations.length,
@@ -411,9 +478,23 @@ export class ValidationSessionManager {
   /**
    * Resets sessions (for testing only).
    */
-  public static resetForTest(): void {
-    this.activeSession = null;
-    this.sessionObservations.clear();
-    this.pastSessions = [];
+  public static resetForTest(userId?: string): void {
+    if (userId) {
+      this.activeSessions.delete(userId);
+      this.userPastSessions.delete(userId);
+      for (const [sessId, owner] of Array.from(this.sessionOwners.entries())) {
+        if (owner === userId) {
+          this.sessionOwners.delete(sessId);
+          this.allSessions.delete(sessId);
+          this.sessionObservations.delete(sessId);
+        }
+      }
+    } else {
+      this.activeSessions.clear();
+      this.userPastSessions.clear();
+      this.sessionOwners.clear();
+      this.allSessions.clear();
+      this.sessionObservations.clear();
+    }
   }
 }

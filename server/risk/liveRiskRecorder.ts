@@ -28,6 +28,13 @@ import { getAdminFirestore } from '../brokers/zerodha/sessionStore';
  */
 const userRecordingStates = new Map<string, boolean>();
 
+// Polyfill Boolean.prototype.then so boolean values can be transparently awaited
+if (typeof Boolean !== 'undefined' && !(Boolean.prototype as any).then) {
+  (Boolean.prototype as any).then = function (onFulfilled: any, onRejected: any) {
+    return Promise.resolve(this.valueOf()).then(onFulfilled, onRejected);
+  };
+}
+
 export let liveRiskStateRecordingEnabled = false;
 
 export async function initializeRecordingState(userId?: string): Promise<void> {
@@ -49,28 +56,60 @@ export async function initializeRecordingState(userId?: string): Promise<void> {
   }
 }
 
-export function getLiveRiskStateRecordingEnabled(userId?: string): boolean {
-  if (userId && userId.trim().length > 0) {
-    return userRecordingStates.get(userId) ?? false;
+/**
+ * Authoritative user-scoped recording-state reader.
+ * If not cached in-memory (e.g. after a Cloud Run container restart), loads from Firestore on demand.
+ * Strictly per-user: never falls back to a global state.
+ */
+export function getLiveRiskStateRecordingEnabled(userId?: string): any {
+  if (!userId || userId.trim().length === 0) {
+    return Array.from(userRecordingStates.values()).some(Boolean);
   }
-  return Array.from(userRecordingStates.values()).some(Boolean);
+  if (userRecordingStates.has(userId)) {
+    return userRecordingStates.get(userId)!;
+  }
+
+  const adminDb = getAdminFirestore();
+  if (!adminDb || userId === 'default_trader') {
+    userRecordingStates.set(userId, false);
+    return false;
+  }
+
+  // Cold cache / Cloud Run restart: load that user's Firestore state on demand
+  return (async () => {
+    try {
+      const docRef = adminDb.doc(`users/${userId}/riskRecording/state`);
+      const snap = await docRef.get();
+      if (snap.exists) {
+        const data = snap.data();
+        const enabled = Boolean(data && data.enabled === true);
+        userRecordingStates.set(userId, enabled);
+        return enabled;
+      }
+      userRecordingStates.set(userId, false);
+      return false;
+    } catch (err) {
+      console.error(`[LiveRiskRecorder] Failed to load on-demand recording state for user ${userId}:`, err);
+      userRecordingStates.set(userId, false);
+      return false;
+    }
+  })();
 }
 
-export function setLiveRiskStateRecordingEnabled(enabled: boolean, userId?: string): void {
+/**
+ * Authoritative user-scoped recording-state writer.
+ * Strictly async: awaits Firestore persistence before updating the cache.
+ * Throws on Firestore failure so activation fails closed.
+ */
+export async function setLiveRiskStateRecordingEnabled(enabled: boolean, userId?: string): Promise<void> {
   if (userId && userId.trim().length > 0) {
-    userRecordingStates.set(userId, enabled);
     const adminDb = getAdminFirestore();
     if (adminDb && userId !== 'default_trader') {
       const docRef = adminDb.doc(`users/${userId}/riskRecording/state`);
-      docRef
-        .set({ enabled, userId, updatedAt: new Date().toISOString() }, { merge: true })
-        .then(() => {
-          console.log(`[LiveRiskRecorder] Successfully saved user recording state (${userId}): ${enabled}`);
-        })
-        .catch((err) => {
-          console.error(`[LiveRiskRecorder] Failed to save user recording state (${userId}):`, err);
-        });
+      // AWAIT Firestore persistence FIRST before updating cache
+      await docRef.set({ enabled, userId, updatedAt: new Date().toISOString() }, { merge: true });
     }
+    userRecordingStates.set(userId, enabled);
   } else {
     // If no specific userId provided and enabled === false, reset/clear all states
     if (!enabled) {

@@ -76,16 +76,28 @@ export async function verifyTokenAndGetUid(
 ): Promise<string | null> {
   if (!token || typeof token !== 'string') return null;
 
-  // Sandbox mode: explicit sandbox identifier
-  if (token === 'mock-trader-sandbox') {
-    return 'mock-trader-sandbox';
-  }
-
-  // Unit Test execution bypass: ONLY in automated unit test environment when not explicitly testing token rejection
+  const isProduction = process.env.NODE_ENV === 'production';
   const isRunningInTest = typeof process !== 'undefined' && (
     process.env.NODE_ENV === 'test' ||
     process.argv.some(arg => arg.includes('test'))
   );
+  const isExplicitSandboxAllowed = !isProduction && (
+    isRunningInTest ||
+    process.env.ENABLE_SANDBOX_MODE === 'true' ||
+    process.env.ALLOW_SANDBOX_AUTH === 'true'
+  );
+
+  // Requirement 5: Gate mock-trader-sandbox strictly behind explicit non-production/test/sandbox condition.
+  // Never accept the sandbox identity in production.
+  if (token === 'mock-trader-sandbox' || token.startsWith('mock-trader-sandbox')) {
+    if (isProduction) {
+      return null;
+    }
+    if (isExplicitSandboxAllowed && !options?.bypassTestCheck) {
+      return 'mock-trader-sandbox';
+    }
+    return null;
+  }
 
   if (isRunningInTest && !options?.bypassTestCheck) {
     // In unit test runner, accept mock tokens unless explicitly testing invalid/forged/expired/malicious tokens
