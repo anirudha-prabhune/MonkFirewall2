@@ -202,7 +202,7 @@ async function runPhase11bTestSuite() {
 
       assert.equal(captured.code, 400, 'Activation with failing preflight returns 400');
       assert.equal(captured.data?.error, 'PREFLIGHT_CHECK_FAILED');
-      assert.equal(getLiveRiskStateRecordingEnabled(testUser), false, 'Recording flag remains false');
+      assert.equal(await getLiveRiskStateRecordingEnabled(testUser), false, 'Recording flag remains false');
       console.log('  ✓ PASSED: Activation rejected with PREFLIGHT_CHECK_FAILED when preflight fails');
     }
 
@@ -242,7 +242,7 @@ async function runPhase11bTestSuite() {
       assert.equal(captured.code, 200, 'Activation request returns 200');
       assert.equal(captured.data?.success, true);
       assert.equal(captured.data?.enabled, true);
-      assert.equal(getLiveRiskStateRecordingEnabled(testUser), true, 'Recording flag is now true');
+      assert.equal(await getLiveRiskStateRecordingEnabled(testUser), true, 'Recording flag is now true');
 
       const firstEval = captured.data?.firstEvaluation;
       assert(firstEval !== undefined, 'firstEvaluation object present in response');
@@ -260,7 +260,7 @@ async function runPhase11bTestSuite() {
     // --------------------------------------------------------------------------
     console.log('[Test 4] Recording state transition verified (false -> true only after explicit activation)');
     {
-      assert.equal(getLiveRiskStateRecordingEnabled(), true, 'Recording is true now');
+      assert.equal(await getLiveRiskStateRecordingEnabled(), true, 'Recording is true now');
       console.log('  ✓ PASSED: Recording flag set to true strictly upon explicit activation');
     }
 
@@ -411,8 +411,8 @@ async function runPhase11bTestSuite() {
     // --------------------------------------------------------------------------
     console.log('[Test 13] Production safety cleanup: liveRiskStateRecordingEnabled set back to false');
     {
-      setLiveRiskStateRecordingEnabled(false);
-      assert.equal(getLiveRiskStateRecordingEnabled(), false, 'Recording flag set back to false');
+      await setLiveRiskStateRecordingEnabled(false);
+      assert.equal(await getLiveRiskStateRecordingEnabled(), false, 'Recording flag set back to false');
       console.log('  ✓ PASSED: Production account left in Shadow Mode (recording = false)');
     }
   } finally {
@@ -420,7 +420,7 @@ async function runPhase11bTestSuite() {
     process.env.NODE_ENV = originalNodeEnv;
     process.env.ZERODHA_API_KEY = originalApiKey;
     process.env.ZERODHA_API_SECRET = originalApiSecret;
-    setLiveRiskStateRecordingEnabled(false);
+    await setLiveRiskStateRecordingEnabled(false);
   }
 
   console.log('\n================================================================');

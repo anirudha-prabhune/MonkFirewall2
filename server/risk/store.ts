@@ -1,4 +1,4 @@
-import { getAdminFirestore } from '../brokers/zerodha/sessionStore';
+import { getAdminFirestore, isMockStoreEnabled } from '../brokers/zerodha/sessionStore';
 import { RiskConfig, DEFAULT_RISK_CONFIG } from '../../src/types/risk';
 import {
   RiskEngine,
@@ -54,6 +54,13 @@ export class ServerRiskStore {
     const userState = this.getOrCreateUserState(userId);
     if (!userState.loadedFromFirestore) {
       const adminDb = getAdminFirestore();
+      const isProduction = process.env.NODE_ENV === 'production';
+      const isMock = isMockStoreEnabled();
+
+      if (isProduction && !adminDb && !isMock) {
+        throw new Error(`FIRESTORE_READ_FAILURE: Authoritative Firestore is unavailable in production for user ${userId}.`);
+      }
+
       if (adminDb) {
         try {
           const docRef = adminDb.doc(`users/${userId}/riskConfig/config`);
@@ -225,6 +232,13 @@ export class ServerRiskStore {
 
     // 1. Prioritize server-authoritative Firebase Admin SDK transaction
     const adminDb = getAdminFirestore();
+    const isProduction = process.env.NODE_ENV === 'production';
+    const isMock = isMockStoreEnabled();
+
+    if (isProduction && !adminDb && !isMock) {
+      throw new Error('FIRESTORE_PERSISTENCE_FAILURE: Authoritative Firestore is unavailable in production.');
+    }
+
     if (adminDb) {
       const sessionDocRef = adminDb.doc(`users/${userId}/riskSessions/${tradingDate}`);
       const configDocRef = adminDb.doc(`users/${userId}/riskConfig/config`);
@@ -353,6 +367,13 @@ export class ServerRiskStore {
     if (!session) {
       // 1. Try to load from Firestore via Firebase Admin SDK
       const adminDb = getAdminFirestore();
+      const isProduction = process.env.NODE_ENV === 'production';
+      const isMock = isMockStoreEnabled();
+
+      if (isProduction && !adminDb && !isMock) {
+        throw new Error(`FIRESTORE_READ_FAILURE: Authoritative Firestore is unavailable in production for user ${userId}.`);
+      }
+
       if (adminDb) {
         try {
           const docRef = adminDb.doc(`users/${userId}/riskSessions/${date}`);

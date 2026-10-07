@@ -100,6 +100,10 @@ export function enableMockStoreForTesting(enable = true): void {
   useMockStoreForTesting = enable;
 }
 
+export function isMockStoreEnabled(): boolean {
+  return useMockStoreForTesting;
+}
+
 export function setAdminFirestoreForTesting(db: Firestore | null): void {
   cachedAdminDb = db;
 }

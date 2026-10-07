@@ -109,8 +109,8 @@ async function runLiveRiskSafetyGatingTestSuite() {
     // TEST 1: VALID validationState allows authoritative live RiskSession recording
     // --------------------------------------------------------------------------
     console.log('[Test 1] VALID state allows authoritative RiskSession recording when enabled');
-    setLiveRiskStateRecordingEnabled(true, userA);
-    assert.equal(getLiveRiskStateRecordingEnabled(userA), true, 'Recording enabled for user A');
+    await setLiveRiskStateRecordingEnabled(true, userA);
+    assert.equal(await getLiveRiskStateRecordingEnabled(userA), true, 'Recording enabled for user A');
 
     const resValid = await LiveRiskRecorder.evaluateAndRecordLiveRisk(userA, {
       injectedPositions: validPositions,
@@ -387,9 +387,9 @@ async function runLiveRiskSafetyGatingTestSuite() {
     console.log('\n[Test 10] Cross-user recording isolation: User A enabled does NOT enable User B');
     resetRecordingStates();
 
-    setLiveRiskStateRecordingEnabled(true, userA);
-    assert.equal(getLiveRiskStateRecordingEnabled(userA), true, 'User A recording is true');
-    assert.equal(getLiveRiskStateRecordingEnabled(userB), false, 'User B recording is strictly false');
+    await setLiveRiskStateRecordingEnabled(true, userA);
+    assert.equal(await getLiveRiskStateRecordingEnabled(userA), true, 'User A recording is true');
+    assert.equal(await getLiveRiskStateRecordingEnabled(userB), false, 'User B recording is strictly false');
 
     // Reconnect session for User B
     await ZerodhaSessionStore.saveSession(userB, 'token_b', { brokerUserId: 'ZU9999' });

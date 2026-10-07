@@ -136,25 +136,11 @@ export class ValidationSessionManager {
 
   /**
    * Starts a controlled Phase 8A real-account shadow validation session scoped to userId.
+   * userId is strictly required with zero default_user fallback.
    */
-  public static startSession(userIdOrNotes?: string, notes?: string): ValidationSessionMetadata {
-    let userId = 'default_user';
-    let actualNotes = notes;
-
-    if (notes !== undefined) {
-      userId = userIdOrNotes && userIdOrNotes.trim().length > 0 ? userIdOrNotes : 'default_user';
-    } else if (userIdOrNotes) {
-      if (
-        userIdOrNotes.includes(' ') ||
-        userIdOrNotes.startsWith('Unit') ||
-        userIdOrNotes.startsWith('Auto') ||
-        userIdOrNotes.startsWith('Phase')
-      ) {
-        actualNotes = userIdOrNotes;
-        userId = 'default_user';
-      } else {
-        userId = userIdOrNotes;
-      }
+  public static startSession(userId: string, notes?: string): ValidationSessionMetadata {
+    if (!userId || typeof userId !== 'string' || userId.trim().length === 0) {
+      throw new Error('USER_ID_REQUIRED: userId is required to start a validation session.');
     }
 
     const now = new Date();
@@ -172,7 +158,7 @@ export class ValidationSessionManager {
       mode: 'REAL_ACCOUNT_SHADOW',
       riskIntegrationEnabled: false,
       validationGate: 'CLOSED', // Must strictly be 'CLOSED'
-      notes: actualNotes || 'Phase 8A Controlled Real-Account Shadow Validation Session',
+      notes: notes || 'Phase 8A Controlled Real-Account Shadow Validation Session',
     };
 
     this.activeSessions.set(userId, session);
@@ -184,38 +170,28 @@ export class ValidationSessionManager {
 
   /**
    * Retrieves the active or latest validation session metadata for the given user.
+   * userId is strictly required with zero default_user fallback.
    */
-  public static getActiveSession(userId?: string): ValidationSessionMetadata | null {
-    if (userId && userId.trim().length > 0) {
-      return this.activeSessions.get(userId) || null;
+  public static getActiveSession(userId: string): ValidationSessionMetadata | null {
+    if (!userId || typeof userId !== 'string' || userId.trim().length === 0) {
+      throw new Error('USER_ID_REQUIRED: userId is required to retrieve active validation session.');
     }
-    return this.activeSessions.get('default_user') || Array.from(this.activeSessions.values())[0] || null;
+    return this.activeSessions.get(userId) || null;
   }
 
   /**
    * Concludes the active validation session for the given user.
+   * userId is strictly required with zero default_user fallback.
    */
-  public static endSession(userIdOrSessionId?: string, sessionId?: string): ValidationSessionMetadata | null {
-    let userId: string | undefined;
-    let targetSessionId: string | undefined;
-
-    if (sessionId !== undefined) {
-      userId = userIdOrSessionId;
-      targetSessionId = sessionId;
-    } else if (userIdOrSessionId) {
-      if (userIdOrSessionId.startsWith('vsess_')) {
-        targetSessionId = userIdOrSessionId;
-        userId = this.sessionOwners.get(targetSessionId);
-      } else {
-        userId = userIdOrSessionId;
-      }
+  public static endSession(userId: string, sessionId?: string): ValidationSessionMetadata | null {
+    if (!userId || typeof userId !== 'string' || userId.trim().length === 0) {
+      throw new Error('USER_ID_REQUIRED: userId is required to end a validation session.');
     }
 
-    const effectiveUserId = userId || 'default_user';
-    const active = this.activeSessions.get(effectiveUserId);
+    const active = this.activeSessions.get(userId);
     if (!active) return null;
 
-    if (targetSessionId && active.validationSessionId !== targetSessionId) {
+    if (sessionId && active.validationSessionId !== sessionId) {
       return null;
     }
 
@@ -224,11 +200,11 @@ export class ValidationSessionManager {
       endedAt: new Date().toISOString(),
     };
 
-    const past = this.userPastSessions.get(effectiveUserId) || [];
+    const past = this.userPastSessions.get(userId) || [];
     past.push(endedSession);
-    this.userPastSessions.set(effectiveUserId, past);
+    this.userPastSessions.set(userId, past);
     this.allSessions.set(active.validationSessionId, endedSession);
-    this.activeSessions.delete(effectiveUserId);
+    this.activeSessions.delete(userId);
     return endedSession;
   }
 
@@ -295,9 +271,12 @@ export class ValidationSessionManager {
     evalTime: Date = new Date(),
     userId?: string
   ): PositionObservation {
+    if (!userId || typeof userId !== 'string' || userId.trim().length === 0) {
+      throw new Error('USER_ID_REQUIRED: userId is required to record validation observations.');
+    }
     const owner = this.sessionOwners.get(sessionId);
-    if (userId && owner && owner !== userId) {
-      throw new Error(`Unauthorized: validation session ${sessionId} belongs to user ${owner}, not ${userId}`);
+    if (!owner || owner !== userId) {
+      throw new Error(`Unauthorized: validation session ${sessionId} belongs to user ${owner || 'unknown'}, not ${userId}`);
     }
 
     const unknown = !instrument || instrument.segment === 'UNKNOWN';
@@ -410,31 +389,28 @@ export class ValidationSessionManager {
 
   /**
    * Generates a comprehensive Phase 8A validation report from recorded observations.
+   * userId is strictly required with zero default_user fallback.
    */
   public static generateReport(sessionId: string, livePnlResult?: any, userId?: string): ValidationSessionReport {
+    if (!userId || typeof userId !== 'string' || userId.trim().length === 0) {
+      throw new Error('USER_ID_REQUIRED: userId is required to generate a validation report.');
+    }
     const owner = this.sessionOwners.get(sessionId);
-    if (userId && owner && owner !== userId) {
-      throw new Error(`Unauthorized: validation session ${sessionId} belongs to user ${owner}, not ${userId}`);
+    if (!owner || owner !== userId) {
+      throw new Error(`Unauthorized: validation session ${sessionId} belongs to user ${owner || 'unknown'}, not ${userId}`);
     }
 
     const session = this.allSessions.get(sessionId) || (
-      this.activeSessions.get(userId || 'default_user')?.validationSessionId === sessionId
-        ? this.activeSessions.get(userId || 'default_user')
+      this.activeSessions.get(userId)?.validationSessionId === sessionId
+        ? this.activeSessions.get(userId)
         : undefined
     );
 
-    const resolvedSession: ValidationSessionMetadata = session || {
-      validationSessionId: sessionId,
-      userId: owner || userId || 'default_user',
-      startedAt: new Date().toISOString(),
-      endedAt: new Date().toISOString(),
-      tradingDate: getTradingDateKolkata(new Date()),
-      timezone: 'Asia/Kolkata',
-      broker: 'zerodha',
-      mode: 'REAL_ACCOUNT_SHADOW',
-      riskIntegrationEnabled: false,
-      validationGate: 'CLOSED',
-    };
+    if (!session) {
+      throw new Error(`NOT_FOUND: Validation session ${sessionId} not found for user ${userId}`);
+    }
+
+    const resolvedSession: ValidationSessionMetadata = session;
 
     const observations = this.sessionObservations.get(sessionId) || [];
     const fnoObs = observations.filter((o) => o.isFno && o.category !== 'UNKNOWN_INSTRUMENT');

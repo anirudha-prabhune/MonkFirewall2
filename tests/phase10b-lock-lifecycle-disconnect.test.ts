@@ -126,17 +126,17 @@ async function runPhase10BTestSuite() {
   // ============================================================================
   console.log('[Test 1] Activation is disabled by default');
   // Ensure flag is reset to default
-  setLiveRiskStateRecordingEnabled(false, testUser);
-  assert(getLiveRiskStateRecordingEnabled(testUser) === false, 'Default flag state is strictly false');
+  await setLiveRiskStateRecordingEnabled(false, testUser);
+  assert((await getLiveRiskStateRecordingEnabled(testUser)) === false, 'Default flag state is strictly false');
   assert(liveRiskStateRecordingEnabled === false, 'Variable state is strictly false');
 
   console.log('\n[Test 2] Server-authoritative controlled activation & status');
-  setLiveRiskStateRecordingEnabled(true, testUser);
-  assert(getLiveRiskStateRecordingEnabled(testUser) === true, 'Activation flag updated to true when enabled');
+  await setLiveRiskStateRecordingEnabled(true, testUser);
+  assert((await getLiveRiskStateRecordingEnabled(testUser)) === true, 'Activation flag updated to true when enabled');
   const session1 = await ServerRiskStore.getSession(testUser);
   const statusInfo = {
-    enabled: getLiveRiskStateRecordingEnabled(testUser),
-    activationState: getLiveRiskStateRecordingEnabled(testUser) ? 'ACTIVE' : 'SHADOW_ONLY',
+    enabled: await getLiveRiskStateRecordingEnabled(testUser),
+    activationState: (await getLiveRiskStateRecordingEnabled(testUser)) ? 'ACTIVE' : 'SHADOW_ONLY',
     currentRiskState: session1?.state || 'ALLOW',
     tradingDate: session1?.tradingDate || getTradingDateKolkata(),
     lockUntil: session1?.lockUntil || null,
@@ -151,8 +151,8 @@ async function runPhase10BTestSuite() {
   assert(!('apiKey' in statusInfo || 'apiSecret' in statusInfo || 'accessToken' in statusInfo), 'No secrets exposed in diagnostic info');
 
   // Deactivate back to default for clean baseline
-  setLiveRiskStateRecordingEnabled(false, testUser);
-  assert(getLiveRiskStateRecordingEnabled(testUser) === false, 'Deactivated back to shadow mode');
+  await setLiveRiskStateRecordingEnabled(false, testUser);
+  assert((await getLiveRiskStateRecordingEnabled(testUser)) === false, 'Deactivated back to shadow mode');
 
   // ============================================================================
   // SECTION 2: LIVE RISK LOCK LIFECYCLE (DETERMINISTIC FIXTURES)
@@ -453,7 +453,7 @@ async function runPhase10BTestSuite() {
   assert(!('squareOff' in liveAdapter), 'No squareOff method on live adapter');
 
   // Verify default flag state
-  assert(getLiveRiskStateRecordingEnabled() === false, 'liveRiskStateRecordingEnabled is strictly FALSE after all tests');
+  assert((await getLiveRiskStateRecordingEnabled()) === false, 'liveRiskStateRecordingEnabled is strictly FALSE after all tests');
 
   console.log('================================================================');
   console.log(`ALL 23 PHASE 10B INTEGRATION TESTS PASSED (${passedTests}/${totalTests})`);

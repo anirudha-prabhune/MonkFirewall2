@@ -20,20 +20,13 @@ import { PnlResult } from '../pnl/types';
 import { RawBrokerPosition, BrokerInstrument } from '../brokers/types';
 import { RiskConfig } from '../../src/types/risk';
 import { LivePnlValidationResult } from '../pnl/liveValidationTypes';
-import { getAdminFirestore } from '../brokers/zerodha/sessionStore';
+import { getAdminFirestore, isMockStoreEnabled } from '../brokers/zerodha/sessionStore';
 
 /**
  * User-scoped in-memory recording state cache.
  * STRICTLY FALSE by default for safety. No global fallback.
  */
 const userRecordingStates = new Map<string, boolean>();
-
-// Polyfill Boolean.prototype.then so boolean values can be transparently awaited
-if (typeof Boolean !== 'undefined' && !(Boolean.prototype as any).then) {
-  (Boolean.prototype as any).then = function (onFulfilled: any, onRejected: any) {
-    return Promise.resolve(this.valueOf()).then(onFulfilled, onRejected);
-  };
-}
 
 export let liveRiskStateRecordingEnabled = false;
 
@@ -58,10 +51,11 @@ export async function initializeRecordingState(userId?: string): Promise<void> {
 
 /**
  * Authoritative user-scoped recording-state reader.
+ * Truly async returning Promise<boolean> consistently.
  * If not cached in-memory (e.g. after a Cloud Run container restart), loads from Firestore on demand.
  * Strictly per-user: never falls back to a global state.
  */
-export function getLiveRiskStateRecordingEnabled(userId?: string): any {
+export async function getLiveRiskStateRecordingEnabled(userId?: string): Promise<boolean> {
   if (!userId || userId.trim().length === 0) {
     return Array.from(userRecordingStates.values()).some(Boolean);
   }
@@ -76,39 +70,56 @@ export function getLiveRiskStateRecordingEnabled(userId?: string): any {
   }
 
   // Cold cache / Cloud Run restart: load that user's Firestore state on demand
-  return (async () => {
-    try {
-      const docRef = adminDb.doc(`users/${userId}/riskRecording/state`);
-      const snap = await docRef.get();
-      if (snap.exists) {
-        const data = snap.data();
-        const enabled = Boolean(data && data.enabled === true);
-        userRecordingStates.set(userId, enabled);
-        return enabled;
-      }
-      userRecordingStates.set(userId, false);
-      return false;
-    } catch (err) {
-      console.error(`[LiveRiskRecorder] Failed to load on-demand recording state for user ${userId}:`, err);
-      userRecordingStates.set(userId, false);
-      return false;
+  try {
+    const docRef = adminDb.doc(`users/${userId}/riskRecording/state`);
+    const snap = await docRef.get();
+    if (snap.exists) {
+      const data = snap.data();
+      const enabled = Boolean(data && data.enabled === true);
+      userRecordingStates.set(userId, enabled);
+      return enabled;
     }
-  })();
+    userRecordingStates.set(userId, false);
+    return false;
+  } catch (err) {
+    console.error(`[LiveRiskRecorder] Failed to load on-demand recording state for user ${userId}:`, err);
+    userRecordingStates.set(userId, false);
+    return false;
+  }
 }
 
 /**
  * Authoritative user-scoped recording-state writer.
  * Strictly async: awaits Firestore persistence before updating the cache.
- * Throws on Firestore failure so activation fails closed.
+ * In production, fails closed and throws RECORDING_STATE_PERSISTENCE_ERROR if adminDb === null.
+ * Only explicit test/mock mode may use the in-memory path.
  */
 export async function setLiveRiskStateRecordingEnabled(enabled: boolean, userId?: string): Promise<void> {
   if (userId && userId.trim().length > 0) {
     const adminDb = getAdminFirestore();
+    const isProduction = process.env.NODE_ENV === 'production';
+    const isMock = isMockStoreEnabled();
+
+    if (isProduction && !adminDb && !isMock) {
+      throw new Error('RECORDING_STATE_PERSISTENCE_ERROR: Authoritative Firestore is unavailable in production.');
+    }
+
     if (adminDb && userId !== 'default_trader') {
       const docRef = adminDb.doc(`users/${userId}/riskRecording/state`);
       // AWAIT Firestore persistence FIRST before updating cache
-      await docRef.set({ enabled, userId, updatedAt: new Date().toISOString() }, { merge: true });
+      try {
+        await docRef.set({ enabled, userId, updatedAt: new Date().toISOString() }, { merge: true });
+      } catch (err) {
+        throw new Error(
+          `RECORDING_STATE_PERSISTENCE_ERROR: Failed to persist recording state for ${userId}: ${
+            err instanceof Error ? err.message : String(err)
+          }`
+        );
+      }
+    } else if (isProduction && !isMock) {
+      throw new Error('RECORDING_STATE_PERSISTENCE_ERROR: Authoritative Firestore is unavailable in production.');
     }
+
     userRecordingStates.set(userId, enabled);
   } else {
     // If no specific userId provided and enabled === false, reset/clear all states
@@ -159,7 +170,7 @@ export class LiveRiskRecorder {
     options?: LiveRiskEvaluationOptions
   ): Promise<LiveRiskRecordingResult> {
     const evaluationTime = options?.evaluationTime || new Date();
-    const shouldRecord = options?.forceRecord ?? getLiveRiskStateRecordingEnabled(userId);
+    const shouldRecord = options?.forceRecord ?? (await getLiveRiskStateRecordingEnabled(userId));
 
     // 1. Retrieve applicable RiskConfig
     let config: RiskConfig;

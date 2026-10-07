@@ -8,8 +8,11 @@ import { authenticateRequest } from '../auth/session';
  * Employs a stable server-side secret (from ZERODHA_API_SECRET) to prevent fabrication.
  */
 export function generateExtensionToken(userId: string): string {
-  const secret = process.env.ZERODHA_API_SECRET || 'fallback_secret_for_development';
-  return crypto.createHmac('sha256', secret).update(userId).digest('hex');
+  const secret = process.env.ZERODHA_API_SECRET;
+  if (!secret || secret.trim().length === 0) {
+    throw new Error('MISSING_EXTENSION_SECRET: ZERODHA_API_SECRET is required to generate extension tokens.');
+  }
+  return crypto.createHmac('sha256', secret.trim()).update(userId).digest('hex');
 }
 
 /**
@@ -17,8 +20,8 @@ export function generateExtensionToken(userId: string): string {
  */
 export function verifyExtensionToken(userId: string, token: string): boolean {
   if (!userId || !token) return false;
-  const expected = generateExtensionToken(userId);
   try {
+    const expected = generateExtensionToken(userId);
     return crypto.timingSafeEqual(Buffer.from(token, 'hex'), Buffer.from(expected, 'hex'));
   } catch {
     return false;

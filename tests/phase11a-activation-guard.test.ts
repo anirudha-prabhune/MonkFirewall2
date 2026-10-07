@@ -239,12 +239,12 @@ async function runPhase11aTestSuite() {
   // --------------------------------------------------------------------------
   console.log('[Test 6] Preflight does NOT modify or enable liveRiskStateRecordingEnabled');
   {
-    setLiveRiskStateRecordingEnabled(false);
-    assert.equal(getLiveRiskStateRecordingEnabled(), false, 'Pre-condition: recording is false');
+    await setLiveRiskStateRecordingEnabled(false);
+    assert.equal(await getLiveRiskStateRecordingEnabled(), false, 'Pre-condition: recording is false');
 
     await ActivationGuardService.evaluatePreflight(testUser);
 
-    assert.equal(getLiveRiskStateRecordingEnabled(), false, 'Post-condition: recording remains strictly false');
+    assert.equal(await getLiveRiskStateRecordingEnabled(), false, 'Post-condition: recording remains strictly false');
     console.log('  ✓ PASSED: Preflight does not enable live risk state recording');
   }
 
@@ -253,7 +253,7 @@ async function runPhase11aTestSuite() {
   // --------------------------------------------------------------------------
   console.log('[Test 7] Activation POST request rejected with PREFLIGHT_CHECK_FAILED when preflight has blockers');
   {
-    setLiveRiskStateRecordingEnabled(false);
+    await setLiveRiskStateRecordingEnabled(false);
     // Disconnect Zerodha to ensure preflight has blockers
     await ZerodhaCredentialManager.disconnect(testUser);
 
@@ -269,7 +269,7 @@ async function runPhase11aTestSuite() {
     assert.equal(captured.data?.success, false, 'Success is false');
     assert.equal(captured.data?.error, 'PREFLIGHT_CHECK_FAILED', 'Error code is PREFLIGHT_CHECK_FAILED');
     assert(captured.data?.blockers?.length > 0, 'Blockers list returned in response');
-    assert.equal(getLiveRiskStateRecordingEnabled(), false, 'Recording flag remains strictly false after rejected activation');
+    assert.equal(await getLiveRiskStateRecordingEnabled(), false, 'Recording flag remains strictly false after rejected activation');
     console.log('  ✓ PASSED: Activation strictly rejected when preflight blockers exist');
   }
 
@@ -327,7 +327,7 @@ async function runPhase11aTestSuite() {
   // --------------------------------------------------------------------------
   console.log('[Test 11] Confirmation: liveRiskStateRecordingEnabled remains OFF after test suite');
   {
-    assert.equal(getLiveRiskStateRecordingEnabled(), false, 'Recording flag is strictly false after test suite');
+    assert.equal(await getLiveRiskStateRecordingEnabled(), false, 'Recording flag is strictly false after test suite');
     console.log('  ✓ PASSED: liveRiskStateRecordingEnabled = false confirmed');
   }
 

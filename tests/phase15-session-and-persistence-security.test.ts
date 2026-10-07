@@ -5,10 +5,17 @@ import {
   getLiveRiskStateRecordingEnabled,
   setLiveRiskStateRecordingEnabled,
   resetRecordingStates,
+  LiveRiskRecorder,
 } from '../server/risk/liveRiskRecorder';
 import { verifyTokenAndGetUid } from '../server/auth/session';
-import { getAdminFirestore, setAdminFirestoreForTesting } from '../server/brokers/zerodha/sessionStore';
+import {
+  getAdminFirestore,
+  setAdminFirestoreForTesting,
+  enableMockStoreForTesting,
+} from '../server/brokers/zerodha/sessionStore';
 import { ServerRiskStore } from '../server/risk/store';
+import { ZerodhaCredentialManager } from '../server/brokers/zerodha/credentials';
+import { generateExtensionToken, verifyExtensionToken } from '../server/enforcement/guard';
 
 function createMockRes() {
   let capturedCode = 200;
@@ -242,7 +249,7 @@ async function runPhase15SecuritySuite() {
       assert.equal(otherEnabled, false, 'Unactivated user returns strictly false with zero global state leak');
 
       // Verify that subsequent calls use the populated in-memory cache
-      assert.equal(getLiveRiskStateRecordingEnabled(restartUser), true, 'In-memory cache now serves restartUser');
+      assert.equal(await getLiveRiskStateRecordingEnabled(restartUser), true, 'In-memory cache now serves restartUser');
     } finally {
       setAdminFirestoreForTesting(null);
       resetRecordingStates();
@@ -359,8 +366,206 @@ async function runPhase15SecuritySuite() {
     console.log('  ✓ PASSED: mock-trader-sandbox identity strictly gated and unconditionally rejected in production');
   }
 
+  // --------------------------------------------------------------------------
+  // REQUIREMENT 6: Focused Regression Tests for Phase 15 Authority & Persistence
+  // --------------------------------------------------------------------------
+  console.log('\n[Req 6] Focused Phase 15 Authority & Persistence Regression Tests:');
+
+  // 6.1 Cold-cache recording state
+  console.log('  [6.1] Cold-cache recording state');
+  {
+    resetRecordingStates();
+    const coldUser = 'cold_cache_user_regress';
+    // When cold, returns a true Promise<boolean> resolving to false
+    const promise = getLiveRiskStateRecordingEnabled(coldUser);
+    assert(promise instanceof Promise, 'Returns a true Promise');
+    const resolved = await promise;
+    assert.equal(resolved, false, 'Cold cache resolves to false');
+
+    // LiveRiskRecorder awaits it and does not record when false
+    const evalRes = await LiveRiskRecorder.evaluateAndRecordLiveRisk(coldUser);
+    assert.equal(evalRes.recorded, false, 'Cold cache does NOT accidentally enable recording');
+    console.log('    ✓ PASSED: Cold-cache read returns Promise<boolean> and does not accidentally enable recording');
+  }
+
+  // 6.2 Firestore-unavailable activation
+  console.log('  [6.2] Firestore-unavailable activation');
+  {
+    const origEnv = process.env.NODE_ENV;
+    try {
+      process.env.NODE_ENV = 'production';
+      enableMockStoreForTesting(false);
+      setAdminFirestoreForTesting(null);
+      resetRecordingStates();
+
+      let errThrown = false;
+      try {
+        await setLiveRiskStateRecordingEnabled(true, 'prod_user_without_db');
+      } catch (err: any) {
+        errThrown = true;
+        assert(err.message.includes('RECORDING_STATE_PERSISTENCE_ERROR'), 'Throws RECORDING_STATE_PERSISTENCE_ERROR');
+      }
+      assert.equal(errThrown, true, 'Activation throws when Firestore unavailable in production');
+      assert.equal(await getLiveRiskStateRecordingEnabled('prod_user_without_db'), false, 'Cache not updated');
+      console.log('    ✓ PASSED: setLiveRiskStateRecordingEnabled fails closed when Firestore unavailable in production');
+    } finally {
+      process.env.NODE_ENV = origEnv;
+      enableMockStoreForTesting(true);
+    }
+  }
+
+  // 6.3 Firestore-unavailable RiskEngine persistence
+  console.log('  [6.3] Firestore-unavailable RiskEngine persistence');
+  {
+    const origEnv = process.env.NODE_ENV;
+    try {
+      process.env.NODE_ENV = 'production';
+      enableMockStoreForTesting(false);
+      setAdminFirestoreForTesting(null);
+
+      const syntheticPnl: any = {
+        grossTradingPnl: 1000,
+        netPnl: 1000,
+        realisedPnl: 1000,
+        unrealisedPnl: 0,
+        fnoPositionCount: 1,
+        totalPositionCount: 1,
+        source: 'ZERODHA_LIVE',
+        positions: [],
+      };
+
+      let evalFailed = false;
+      try {
+        await ServerRiskStore.evaluatePnlResult('prod_user_no_fs', syntheticPnl);
+      } catch (err: any) {
+        evalFailed = true;
+        assert(err.message.includes('FIRESTORE_PERSISTENCE_FAILURE'), 'Throws FIRESTORE_PERSISTENCE_FAILURE');
+      }
+      assert.equal(evalFailed, true, 'evaluatePnlResult fails closed when Firestore unavailable in production');
+
+      let configFailed = false;
+      try {
+        await ServerRiskStore.getConfig('prod_user_no_fs');
+      } catch (err: any) {
+        configFailed = true;
+        assert(err.message.includes('FIRESTORE_READ_FAILURE'), 'Throws FIRESTORE_READ_FAILURE');
+      }
+      assert.equal(configFailed, true, 'getConfig fails closed without silently synthesizing production config');
+
+      let sessionFailed = false;
+      try {
+        await ServerRiskStore.getSession('prod_user_no_fs');
+      } catch (err: any) {
+        sessionFailed = true;
+        assert(err.message.includes('FIRESTORE_READ_FAILURE'), 'Throws FIRESTORE_READ_FAILURE');
+      }
+      assert.equal(sessionFailed, true, 'getSession fails closed without silently synthesizing production session');
+      console.log('    ✓ PASSED: ServerRiskStore persistence and state retrieval fail closed in production without Firestore');
+    } finally {
+      process.env.NODE_ENV = origEnv;
+      enableMockStoreForTesting(true);
+    }
+  }
+
+  // 6.4 Production env-token rejection
+  console.log('  [6.4] Production env-token rejection');
+  {
+    const origEnv = process.env.NODE_ENV;
+    const origZerodhaToken = process.env.ZERODHA_ACCESS_TOKEN;
+    const origKiteToken = process.env.KITE_ACCESS_TOKEN;
+
+    try {
+      process.env.NODE_ENV = 'production';
+      process.env.ZERODHA_ACCESS_TOKEN = 'mock_env_token_prod_attack';
+      process.env.KITE_ACCESS_TOKEN = 'mock_env_token_prod_attack';
+
+      // Clear cached session
+      ZerodhaCredentialManager.setRuntimeSession(null as any);
+
+      const sessionResult = await ZerodhaCredentialManager.getAuthenticatedSession('prod_victim');
+      assert.equal(sessionResult, null, 'getAuthenticatedSession rejects env token in production');
+
+      const activeToken = ZerodhaCredentialManager.getActiveAccessToken('prod_victim');
+      assert.equal(activeToken, null, 'getActiveAccessToken rejects env token in production');
+      console.log('    ✓ PASSED: ZERODHA_ACCESS_TOKEN / KITE_ACCESS_TOKEN strictly rejected in production');
+    } finally {
+      process.env.NODE_ENV = origEnv;
+      if (origZerodhaToken !== undefined) process.env.ZERODHA_ACCESS_TOKEN = origZerodhaToken;
+      else delete process.env.ZERODHA_ACCESS_TOKEN;
+      if (origKiteToken !== undefined) process.env.KITE_ACCESS_TOKEN = origKiteToken;
+      else delete process.env.KITE_ACCESS_TOKEN;
+    }
+  }
+
+  // 6.5 Missing extension secret rejection
+  console.log('  [6.5] Missing extension secret rejection');
+  {
+    const origSecret = process.env.ZERODHA_API_SECRET;
+    try {
+      delete process.env.ZERODHA_API_SECRET;
+
+      let tokenErrorThrown = false;
+      try {
+        generateExtensionToken('extension_user_1');
+      } catch (err: any) {
+        tokenErrorThrown = true;
+        assert(err.message.includes('MISSING_EXTENSION_SECRET'), 'Throws MISSING_EXTENSION_SECRET');
+      }
+      assert.equal(tokenErrorThrown, true, 'generateExtensionToken throws when ZERODHA_API_SECRET is absent');
+
+      // verifyExtensionToken must return false
+      const verifyRes = verifyExtensionToken('extension_user_1', 'abc12345');
+      assert.equal(verifyRes, false, 'verifyExtensionToken returns false when secret is absent');
+      console.log('    ✓ PASSED: generateExtensionToken fails closed without fallback secret');
+    } finally {
+      if (origSecret !== undefined) process.env.ZERODHA_API_SECRET = origSecret;
+      else delete process.env.ZERODHA_API_SECRET;
+    }
+  }
+
+  // 6.6 Validation session operations without implicit default identity
+  console.log('  [6.6] Validation session operations without implicit default identity');
+  {
+    ValidationSessionManager.resetForTest();
+
+    // startSession requires userId
+    assert.throws(() => {
+      ValidationSessionManager.startSession('');
+    }, /USER_ID_REQUIRED/);
+
+    // getActiveSession requires userId
+    assert.throws(() => {
+      ValidationSessionManager.getActiveSession('');
+    }, /USER_ID_REQUIRED/);
+
+    // endSession requires userId
+    assert.throws(() => {
+      ValidationSessionManager.endSession('');
+    }, /USER_ID_REQUIRED/);
+
+    // recordObservation requires userId
+    assert.throws(() => {
+      ValidationSessionManager.recordObservation(
+        'dummy_sess',
+        { instrument_token: 1, exchange: 'NFO', tradingsymbol: 'T', quantity: 1 } as any,
+        true,
+        undefined,
+        undefined,
+        undefined,
+        ''
+      );
+    }, /USER_ID_REQUIRED/);
+
+    // generateReport requires userId
+    assert.throws(() => {
+      ValidationSessionManager.generateReport('dummy_sess', undefined, '');
+    }, /USER_ID_REQUIRED/);
+
+    console.log('    ✓ PASSED: ValidationSessionManager strictly requires userId with zero default_user fallback');
+  }
+
   console.log('\n================================================================');
-  console.log('ALL 5 PHASE 15 SECURITY REGRESSION REQUIREMENTS VERIFIED (5/5)');
+  console.log('ALL PHASE 15 SECURITY REGRESSION REQUIREMENTS VERIFIED');
   console.log('================================================================');
 }
 

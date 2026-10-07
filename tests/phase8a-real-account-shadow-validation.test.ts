@@ -190,7 +190,8 @@ async function runPhase8aTestSuite() {
   // SECTION 3: VALIDATION SESSION METADATA & OBSERVATIONS
   // --------------------------------------------------------------------------
   console.log('\n[Phase 8A Test 3] Validation session lifecycle and metadata');
-  const session = ValidationSessionManager.startSession('Unit verification shadow session');
+  const testUser = 'phase8a_test_user';
+  const session = ValidationSessionManager.startSession(testUser, 'Unit verification shadow session');
   assert(session.validationSessionId.startsWith('vsess_'), 'validationSessionId has proper prefix');
   assert(session.timezone === 'Asia/Kolkata', 'timezone is Asia/Kolkata');
   assert(session.broker === 'zerodha', 'broker is zerodha');
@@ -199,7 +200,7 @@ async function runPhase8aTestSuite() {
   assert(session.validationGate === 'CLOSED', 'validationGate is CLOSED');
   assert(session.endedAt === null, 'active session endedAt is null');
 
-  const active = ValidationSessionManager.getActiveSession();
+  const active = ValidationSessionManager.getActiveSession(testUser);
   assert(active?.validationSessionId === session.validationSessionId, 'ValidationSessionManager tracks active session');
 
   // --------------------------------------------------------------------------
@@ -278,7 +279,9 @@ async function runPhase8aTestSuite() {
     catAPos,
     true,
     MOCK_INSTRUMENT_MAP.get(110001),
-    { dailyRealised: 5000.0, dailyUnrealised: 5000.0, grossTradingPnl: 10000.0 }
+    { dailyRealised: 5000.0, dailyUnrealised: 5000.0, grossTradingPnl: 10000.0 },
+    undefined,
+    testUser
   );
   assert(catAObs.category === 'CATEGORY_A_PURE_INTRADAY', 'Classified as CATEGORY_A_PURE_INTRADAY');
   assert(catAObs.rawSnapshot.overnight_quantity === 0, 'Overnight quantity is 0');
@@ -316,7 +319,9 @@ async function runPhase8aTestSuite() {
     catBPos,
     true,
     MOCK_INSTRUMENT_MAP.get(110002),
-    { dailyRealised: 0.0, dailyUnrealised: 3000.0, grossTradingPnl: 3000.0 }
+    { dailyRealised: 0.0, dailyUnrealised: 3000.0, grossTradingPnl: 3000.0 },
+    undefined,
+    testUser
   );
   assert(catBObs.category === 'CATEGORY_B_CARRIED_FORWARD', 'Classified as CATEGORY_B_CARRIED_FORWARD');
   assert(catBObs.rawSnapshot.close_price === 52100.0, 'Close price captured for carried position');
@@ -351,7 +356,10 @@ async function runPhase8aTestSuite() {
     session.validationSessionId,
     catCPos,
     true,
-    MOCK_INSTRUMENT_MAP.get(110001)
+    MOCK_INSTRUMENT_MAP.get(110001),
+    undefined,
+    undefined,
+    testUser
   );
   assert(catCObs.category === 'CATEGORY_C_MIXED', 'Classified as CATEGORY_C_MIXED');
   assert(catCObs.rawSnapshot.overnight_quantity === 50, 'Authoritative overnight_quantity preserved');
@@ -386,7 +394,9 @@ async function runPhase8aTestSuite() {
     closedPos,
     true,
     MOCK_INSTRUMENT_MAP.get(110001),
-    { dailyRealised: 2500.0, dailyUnrealised: 0.0, grossTradingPnl: 2500.0 }
+    { dailyRealised: 2500.0, dailyUnrealised: 0.0, grossTradingPnl: 2500.0 },
+    undefined,
+    testUser
   );
   assert(closedObs.category === 'FULLY_CLOSED_INTRADAY', 'Classified as FULLY_CLOSED_INTRADAY');
   assert(closedObs.rawSnapshot.quantity === 0, 'Quantity is 0');
@@ -422,7 +432,10 @@ async function runPhase8aTestSuite() {
     session.validationSessionId,
     partialPos,
     true,
-    MOCK_INSTRUMENT_MAP.get(110001)
+    MOCK_INSTRUMENT_MAP.get(110001),
+    undefined,
+    undefined,
+    testUser
   );
   assert(partialObs.category === 'PARTIAL_CLOSE', 'Classified as PARTIAL_CLOSE');
   assert(partialObs.rawSnapshot.overnight_quantity === 50, 'Overnight qty is 50');
@@ -457,7 +470,10 @@ async function runPhase8aTestSuite() {
     session.validationSessionId,
     reversalPos,
     true,
-    MOCK_INSTRUMENT_MAP.get(110001)
+    MOCK_INSTRUMENT_MAP.get(110001),
+    undefined,
+    undefined,
+    testUser
   );
   assert(reversalObs.category === 'REVERSAL', 'Classified as REVERSAL');
   assert(reversalObs.rawSnapshot.overnight_quantity > 0, 'Overnight was long');
@@ -481,7 +497,9 @@ async function runPhase8aTestSuite() {
     mult2Pos,
     true,
     { ...MOCK_INSTRUMENT_MAP.get(110001)!, instrumentToken: 110003, lotSize: 10 },
-    { dailyRealised: 0, dailyUnrealised: (110 - 100) * 10 * 2, grossTradingPnl: 200 }
+    { dailyRealised: 0, dailyUnrealised: (110 - 100) * 10 * 2, grossTradingPnl: 200 },
+    undefined,
+    testUser
   );
   assert(mult2Obs.rawSnapshot.multiplier === 2, 'Raw multiplier is 2');
   assert(mult2Obs.calculated.multiplier === 2, 'Calculated multiplier is 2');
@@ -537,7 +555,10 @@ async function runPhase8aTestSuite() {
     session.validationSessionId,
     carriedNoM2mPos,
     true,
-    MOCK_INSTRUMENT_MAP.get(110002)
+    MOCK_INSTRUMENT_MAP.get(110002),
+    undefined,
+    undefined,
+    testUser
   );
   assert(carriedNoM2mObs.reconciliation.status === 'NOT_COMPARABLE', 'Carried without m2m marked NOT_COMPARABLE');
 
@@ -589,10 +610,10 @@ async function runPhase8aTestSuite() {
   // SECTION 21: EVIDENCE REPORT GENERATION & SAFETY AUDIT
   // --------------------------------------------------------------------------
   console.log('\n[Phase 8A Test 19] Evidence report generation & zero-mutation safety audit');
-  const endedSession = ValidationSessionManager.endSession(session.validationSessionId);
+  const endedSession = ValidationSessionManager.endSession(testUser, session.validationSessionId);
   assert(endedSession?.endedAt !== null, 'Session ended successfully');
 
-  const report = ValidationSessionManager.generateReport(session.validationSessionId, shadowPnlRes);
+  const report = ValidationSessionManager.generateReport(session.validationSessionId, shadowPnlRes, testUser);
   assert(report.session.validationSessionId === session.validationSessionId, 'Report linked to session');
   assert(report.observations.length >= 6, 'All observations recorded in report');
   assert(report.summary.safetyAudit.ordersPlaced === 0, 'Audit: 0 orders placed');

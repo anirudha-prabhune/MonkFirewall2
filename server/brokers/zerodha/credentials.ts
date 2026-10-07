@@ -1,6 +1,6 @@
 import crypto from 'crypto';
 import { BrokerAuthState, CredentialPresenceDiagnostic } from '../types';
-import { ZerodhaSessionStore, DecryptedRuntimeSession, SessionPersistenceError } from './sessionStore';
+import { ZerodhaSessionStore, DecryptedRuntimeSession, SessionPersistenceError, isMockStoreEnabled } from './sessionStore';
 
 export interface OAuthStatePayload {
   userId: string;
@@ -187,14 +187,25 @@ export class ZerodhaCredentialManager {
     }
 
     // 3. Fallback: Dev/Test/Applet environment variable if no persisted session exists
-    const envToken = process.env.ZERODHA_ACCESS_TOKEN || process.env.KITE_ACCESS_TOKEN;
-    if (envToken && envToken.trim().length > 0) {
-      return {
-        accessToken: envToken.trim(),
-        sessionVersion: 0,
-        source: 'DEV_ENV',
-        expiresAt: new Date(Date.now() + 12 * 3600 * 1000).toISOString(),
-      };
+    // Strictly disallowed in production. Allow only explicit non-production/test/dev mode.
+    const isProduction = process.env.NODE_ENV === 'production';
+    const isExplicitNonProd = !isProduction && (
+      process.env.NODE_ENV === 'test' ||
+      process.env.NODE_ENV === 'development' ||
+      process.argv.some(arg => arg.includes('test')) ||
+      Boolean(process.env.TEST_MODE) ||
+      isMockStoreEnabled()
+    );
+    if (isExplicitNonProd) {
+      const envToken = process.env.ZERODHA_ACCESS_TOKEN || process.env.KITE_ACCESS_TOKEN;
+      if (envToken && envToken.trim().length > 0) {
+        return {
+          accessToken: envToken.trim(),
+          sessionVersion: 0,
+          source: 'DEV_ENV',
+          expiresAt: new Date(Date.now() + 12 * 3600 * 1000).toISOString(),
+        };
+      }
     }
 
     return null;
@@ -210,10 +221,20 @@ export class ZerodhaCredentialManager {
         return this.cachedSession.accessToken;
       }
     }
-    // Fall back to DEV_ENV token when available
-    const envToken = process.env.ZERODHA_ACCESS_TOKEN || process.env.KITE_ACCESS_TOKEN;
-    if (envToken && envToken.trim().length > 0) {
-      return envToken.trim();
+    // Fall back to DEV_ENV token strictly in explicit non-production/test/dev mode
+    const isProduction = process.env.NODE_ENV === 'production';
+    const isExplicitNonProd = !isProduction && (
+      process.env.NODE_ENV === 'test' ||
+      process.env.NODE_ENV === 'development' ||
+      process.argv.some(arg => arg.includes('test')) ||
+      Boolean(process.env.TEST_MODE) ||
+      isMockStoreEnabled()
+    );
+    if (isExplicitNonProd) {
+      const envToken = process.env.ZERODHA_ACCESS_TOKEN || process.env.KITE_ACCESS_TOKEN;
+      if (envToken && envToken.trim().length > 0) {
+        return envToken.trim();
+      }
     }
     return null;
   }
@@ -229,9 +250,14 @@ export class ZerodhaCredentialManager {
       expiresAt?: string;
       userId?: string;
       userName?: string;
-    },
+    } | null,
     userId = 'default_trader'
   ): void {
+    if (!session) {
+      this.cachedSession = null;
+      this.authState = 'AUTHENTICATION_REQUIRED';
+      return;
+    }
     const now = Date.now();
     this.cachedSession = {
       accessToken: session.accessToken,

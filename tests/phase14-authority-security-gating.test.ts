@@ -342,35 +342,35 @@ async function runPhase14SecuritySuite() {
     const user3 = 'isolation_user_3';
 
     // Verify initial states are all false
-    assert.equal(getLiveRiskStateRecordingEnabled(user1), false, 'user1 recording starts false');
-    assert.equal(getLiveRiskStateRecordingEnabled(user2), false, 'user2 recording starts false');
-    assert.equal(getLiveRiskStateRecordingEnabled(user3), false, 'user3 recording starts false');
+    assert.equal(await getLiveRiskStateRecordingEnabled(user1), false, 'user1 recording starts false');
+    assert.equal(await getLiveRiskStateRecordingEnabled(user2), false, 'user2 recording starts false');
+    assert.equal(await getLiveRiskStateRecordingEnabled(user3), false, 'user3 recording starts false');
 
     // Enable for user1 ONLY
-    setLiveRiskStateRecordingEnabled(true, user1);
+    await setLiveRiskStateRecordingEnabled(true, user1);
 
     // Verify strict isolation
-    assert.equal(getLiveRiskStateRecordingEnabled(user1), true, 'user1 recording is true');
-    assert.equal(getLiveRiskStateRecordingEnabled(user2), false, 'user2 recording remains strictly false');
-    assert.equal(getLiveRiskStateRecordingEnabled(user3), false, 'user3 recording remains strictly false');
+    assert.equal(await getLiveRiskStateRecordingEnabled(user1), true, 'user1 recording is true');
+    assert.equal(await getLiveRiskStateRecordingEnabled(user2), false, 'user2 recording remains strictly false');
+    assert.equal(await getLiveRiskStateRecordingEnabled(user3), false, 'user3 recording remains strictly false');
 
     // Enable for user2
-    setLiveRiskStateRecordingEnabled(true, user2);
-    assert.equal(getLiveRiskStateRecordingEnabled(user1), true, 'user1 recording remains true');
-    assert.equal(getLiveRiskStateRecordingEnabled(user2), true, 'user2 recording is true');
-    assert.equal(getLiveRiskStateRecordingEnabled(user3), false, 'user3 recording remains false');
+    await setLiveRiskStateRecordingEnabled(true, user2);
+    assert.equal(await getLiveRiskStateRecordingEnabled(user1), true, 'user1 recording remains true');
+    assert.equal(await getLiveRiskStateRecordingEnabled(user2), true, 'user2 recording is true');
+    assert.equal(await getLiveRiskStateRecordingEnabled(user3), false, 'user3 recording remains false');
 
     // Disable for user1
-    setLiveRiskStateRecordingEnabled(false, user1);
-    assert.equal(getLiveRiskStateRecordingEnabled(user1), false, 'user1 recording is now false');
-    assert.equal(getLiveRiskStateRecordingEnabled(user2), true, 'user2 recording remains true');
-    assert.equal(getLiveRiskStateRecordingEnabled(user3), false, 'user3 recording remains false');
+    await setLiveRiskStateRecordingEnabled(false, user1);
+    assert.equal(await getLiveRiskStateRecordingEnabled(user1), false, 'user1 recording is now false');
+    assert.equal(await getLiveRiskStateRecordingEnabled(user2), true, 'user2 recording remains true');
+    assert.equal(await getLiveRiskStateRecordingEnabled(user3), false, 'user3 recording remains false');
 
     // Global reset
     resetRecordingStates();
-    assert.equal(getLiveRiskStateRecordingEnabled(user1), false, 'user1 false after reset');
-    assert.equal(getLiveRiskStateRecordingEnabled(user2), false, 'user2 false after reset');
-    assert.equal(getLiveRiskStateRecordingEnabled(user3), false, 'user3 false after reset');
+    assert.equal(await getLiveRiskStateRecordingEnabled(user1), false, 'user1 false after reset');
+    assert.equal(await getLiveRiskStateRecordingEnabled(user2), false, 'user2 false after reset');
+    assert.equal(await getLiveRiskStateRecordingEnabled(user3), false, 'user3 false after reset');
 
     console.log('  ✓ PASSED: Cross-user live recording isolation verified with zero state leakage');
   }
