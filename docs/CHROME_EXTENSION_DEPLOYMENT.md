@@ -12,6 +12,7 @@ The extension source files reside in the `/extension` directory:
 - `content_monktrades.js`: Injected into MonkTrades to pair user credentials and server origin securely.
 - `content_kite.js`: Injected into Kite Zerodha to check initial lock status.
 - `blocked.html`: Lockout overlay displayed when daily risk limits are breached.
+- `blocked.js`: External script for `blocked.html` complying with MV3 Content Security Policy (no inline scripts).
 - `popup.html`: Extension status popup.
 
 ---

@@ -834,6 +834,146 @@ async function runPhase12cExtensionE2ETestSuite() {
 
       console.log('  ✓ PASSED: Malformed/revoked/missing auth fails closed');
     }
+
+    // --------------------------------------------------------------------------
+    // TEST 13: blocked.html contains no inline executable script and references blocked.js (MV3 CSP compliance)
+    // --------------------------------------------------------------------------
+    console.log('\n[Test 13] blocked.html contains no inline executable script and references blocked.js (MV3 CSP compliance)');
+    {
+      const blockedHtmlPath = path.resolve('./extension/blocked.html');
+      const blockedJsPath = path.resolve('./extension/blocked.js');
+
+      assert.ok(fs.existsSync(blockedHtmlPath), 'blocked.html must exist');
+      assert.ok(fs.existsSync(blockedJsPath), 'blocked.js must exist');
+
+      const blockedHtmlContent = fs.readFileSync(blockedHtmlPath, 'utf-8');
+      const blockedJsContent = fs.readFileSync(blockedJsPath, 'utf-8');
+
+      // 1. Verify blocked.html references blocked.js
+      assert.ok(
+        blockedHtmlContent.includes('<script src="blocked.js"></script>'),
+        'blocked.html must include <script src="blocked.js"></script>'
+      );
+
+      // 2. Verify blocked.html contains NO inline executable script tags
+      const scriptTags = blockedHtmlContent.match(/<script\b[^>]*>([\s\S]*?)<\/script>/gi) || [];
+      assert.ok(scriptTags.length > 0, 'Must have at least one script tag');
+      for (const tag of scriptTags) {
+        assert.ok(
+          tag.includes('src='),
+          `Script tag "${tag}" must have a src attribute (no inline scripts permitted under MV3 CSP)`
+        );
+        const innerContent = tag.replace(/<script\b[^>]*>/i, '').replace(/<\/script>/i, '').trim();
+        assert.equal(
+          innerContent,
+          '',
+          `Script tag "${tag}" must not contain inline JavaScript code`
+        );
+      }
+
+      // 3. Verify blocked.js execution in mock DOM environment:
+      // Reads chrome.storage.local, queries /api/enforcement/broker, displays lockUntil in IST, sets dashboard URL
+      const mockElements = new Map<string, { id: string; href?: string; innerText?: string }>();
+      mockElements.set('btn-back', { id: 'btn-back', href: '#' });
+      mockElements.set('lock-time', { id: 'lock-time', innerText: 'Checking lock status...' });
+      mockElements.set('description', { id: 'description', innerText: 'Initial description' });
+
+      const mockDocument = {
+        getElementById: (id: string) => mockElements.get(id) || null,
+      };
+
+      let storageGetCallback: any = null;
+      const mockChromeStorage = {
+        storage: {
+          local: {
+            get: (keys: string[], cb: (data: any) => void) => {
+              storageGetCallback = cb;
+            },
+          },
+        },
+      };
+
+      const blockedSandbox = {
+        chrome: mockChromeStorage,
+        document: mockDocument,
+        console,
+        URL,
+        Date,
+        fetch,
+        setTimeout,
+      };
+
+      const blockedContext = vm.createContext(blockedSandbox);
+      vm.runInContext(blockedJsContent, blockedContext);
+
+      assert.ok(typeof storageGetCallback === 'function', 'blocked.js must call chrome.storage.local.get');
+
+      // Ensure testUser session is locked
+      injectSession(testUser, {
+        tradingDate,
+        userId: testUser,
+        state: 'LOCKED',
+        isBreached: true,
+        currentPnl: -1500,
+        realisedPnl: -1500,
+        unrealisedPnl: 0,
+        lossLimit: 1000,
+        warningThreshold1: 70,
+        warningThreshold2: 90,
+        lastEvaluatedAt: new Date().toISOString(),
+        lockedAt: new Date().toISOString(),
+        lockUntil: new Date(Date.now() + 3600 * 1000).toISOString(),
+        reason: 'Breached Daily Loss Limit',
+      });
+
+      // Trigger callback with valid credentials pointing to the test server
+      await storageGetCallback({
+        userId: testUser,
+        extensionToken: validToken,
+        serverUrl,
+      });
+
+      // Allow async fetch & DOM updates
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      const btnBack = mockElements.get('btn-back')!;
+      const lockTime = mockElements.get('lock-time')!;
+      const description = mockElements.get('description')!;
+
+      assert.equal(btnBack.href, serverUrl, 'btn-back href must be set to serverUrl');
+      assert.ok(
+        lockTime.innerText?.includes('Restricted until') && lockTime.innerText?.includes('IST'),
+        `lock-time must show IST time string, got: ${lockTime.innerText}`
+      );
+      assert.ok(
+        description.innerText?.includes('Trading access in MonkTrades is restricted until') &&
+          description.innerText?.includes('IST'),
+        `description must show IST time string, got: ${description.innerText}`
+      );
+
+      // 4. Test missing credentials fallback
+      mockElements.get('btn-back')!.href = '#';
+      mockElements.get('lock-time')!.innerText = 'Checking lock status...';
+      await storageGetCallback({
+        userId: '',
+        extensionToken: '',
+        serverUrl: '',
+      });
+      assert.equal(mockElements.get('btn-back')!.href, 'http://localhost:3000');
+      assert.equal(mockElements.get('lock-time')!.innerText, 'Lock Active (Please log in to MonkTrades)');
+
+      // 5. Test offline fallback
+      await storageGetCallback({
+        userId: testUser,
+        extensionToken: validToken,
+        serverUrl: 'http://127.0.0.1:59999', // invalid/offline port
+      });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      assert.equal(mockElements.get('lock-time')!.innerText, 'Active Lock (Connection offline)');
+
+      console.log('  ✓ PASSED: blocked.html is CSP-compliant (external blocked.js, no inline scripts)');
+      console.log('  ✓ PASSED: blocked.js successfully reads storage, fetches broker contract, and formats IST lock time');
+    }
   } finally {
     server.close();
   }
