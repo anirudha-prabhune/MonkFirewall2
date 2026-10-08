@@ -14,6 +14,7 @@
     "http://localhost:3000/*",
     "http://127.0.0.1:3000/*",
     "http://localhost/*",
+    "https://monk-firewall.ai.studio/*",
     "https://ais-dev-wyyezpv6s2lo3nusdgb6dl-608043296632.asia-southeast1.run.app/*",
     "https://ais-pre-wyyezpv6s2lo3nusdgb6dl-608043296632.asia-southeast1.run.app/*"
   ],
@@ -26,6 +27,7 @@
         "http://localhost:3000/*",
         "http://127.0.0.1:3000/*",
         "http://localhost/*",
+        "https://monk-firewall.ai.studio/*",
         "https://ais-dev-wyyezpv6s2lo3nusdgb6dl-608043296632.asia-southeast1.run.app/*",
         "https://ais-pre-wyyezpv6s2lo3nusdgb6dl-608043296632.asia-southeast1.run.app/*"
       ],

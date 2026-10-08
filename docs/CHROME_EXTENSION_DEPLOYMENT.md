@@ -32,6 +32,9 @@ Chrome Manifest V3 strictly validates URL match patterns. Middle wildcards (such
 
 The extension manifest is pre-configured with the exact established origins for this application:
 
+- **Production Origin**:
+  - `https://monk-firewall.ai.studio/*` (Production MonkTrades application URL)
+
 - **Localhost Development Origins**:
   - `http://localhost:3000/*`
   - `http://127.0.0.1:3000/*`
@@ -44,13 +47,13 @@ The extension manifest is pre-configured with the exact established origins for 
 - **Broker Host Permissions**:
   - `https://kite.zerodha.com/*` (minimized to exact Kite domain)
 
-Both `host_permissions` and `content_scripts[0].matches` contain these exact origins so `content_monktrades.js` automatically pairs when navigating to either the local dev server or the deployed Cloud Run instance.
+Both `host_permissions` and `content_scripts[0].matches` contain these exact origins so `content_monktrades.js` automatically pairs when navigating to production (`https://monk-firewall.ai.studio`), the local dev server, or the deployed Cloud Run instances.
 
 ---
 
 ## 4. Pairing and Verification
 
-1. Start and log in to the MonkTrades application in Chrome (via localhost or the deployed Cloud Run URL).
+1. Start and log in to the MonkTrades application in Chrome (via `https://monk-firewall.ai.studio`, localhost, or Cloud Run).
 2. When the user session is authenticated, MonkTrades renders a hidden pairing element (`#monktrades-extension-sync`) containing `data-user-id` and asynchronously populating `data-extension-token`.
 3. `content_monktrades.js` uses a MutationObserver to detect the presence of the node and the arrival of the asynchronous token, automatically pairing the credentials into `chrome.storage.local`.
 4. **Verification Step**:

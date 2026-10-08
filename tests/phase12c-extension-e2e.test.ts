@@ -344,6 +344,7 @@ async function runPhase12cExtensionE2ETestSuite() {
       const manifestPath = path.resolve('./extension/manifest.json');
       const manifestContent = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
 
+      const exactProdOrigin = 'https://monk-firewall.ai.studio/*';
       const exactDevOrigin = 'https://ais-dev-wyyezpv6s2lo3nusdgb6dl-608043296632.asia-southeast1.run.app/*';
       const exactPreOrigin = 'https://ais-pre-wyyezpv6s2lo3nusdgb6dl-608043296632.asia-southeast1.run.app/*';
       const exactKiteOrigin = 'https://kite.zerodha.com/*';
@@ -367,7 +368,11 @@ async function runPhase12cExtensionE2ETestSuite() {
         'host_permissions should avoid broad *.zerodha.com wildcard'
       );
 
-      // 4. Exact deployed MonkTrades origins exist in host_permissions
+      // 4. Exact deployed and production MonkTrades origins exist in host_permissions
+      assert.ok(
+        manifestContent.host_permissions.includes(exactProdOrigin),
+        `host_permissions must include exact production origin: ${exactProdOrigin}`
+      );
       assert.ok(
         manifestContent.host_permissions.includes(exactDevOrigin),
         `host_permissions must include exact deployed Dev origin: ${exactDevOrigin}`
@@ -377,11 +382,15 @@ async function runPhase12cExtensionE2ETestSuite() {
         `host_permissions must include exact deployed Shared/Preview origin: ${exactPreOrigin}`
       );
 
-      // 5. Exact deployed MonkTrades origins exist in content_scripts[0].matches
+      // 5. Exact deployed and production MonkTrades origins exist in content_scripts[0].matches
       const monktradesContentScript = manifestContent.content_scripts.find((cs: any) =>
         cs.js && cs.js.includes('content_monktrades.js')
       );
       assert.ok(monktradesContentScript, 'content_monktrades.js script entry must exist');
+      assert.ok(
+        monktradesContentScript.matches.includes(exactProdOrigin),
+        `content_monktrades.js matches must include exact production origin: ${exactProdOrigin}`
+      );
       assert.ok(
         monktradesContentScript.matches.includes(exactDevOrigin),
         `content_monktrades.js matches must include exact deployed Dev origin: ${exactDevOrigin}`
