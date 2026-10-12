@@ -27,10 +27,13 @@ export interface AdminRunnerOptions {
 
 const ISOLATED_TEST_SYMBOL = Symbol('STAGE2A_ISOLATED_TEST_TOKEN');
 
+// Private module state for single-use token lifecycle
+const issuedTestTokens = new WeakSet<object>();
+const consumedTestTokens = new WeakSet<object>();
+
 export interface IsolatedTestToken {
   readonly [ISOLATED_TEST_SYMBOL]: true;
   readonly id: string;
-  consumed: boolean;
 }
 
 /**
@@ -61,11 +64,14 @@ export function createIsolatedTestToken(): IsolatedTestToken {
     throw new Error('ISOLATED_TEST_TOKEN_FORBIDDEN: Isolated test token can only be created from test files inside /tests/.');
   }
 
-  return {
-    [ISOLATED_TEST_SYMBOL]: true,
+  const token: IsolatedTestToken = Object.freeze({
+    [ISOLATED_TEST_SYMBOL]: true as const,
     id: `token_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`,
-    consumed: false,
-  };
+  });
+
+  issuedTestTokens.add(token);
+
+  return token;
 }
 
 /**
@@ -268,10 +274,11 @@ export async function runAdminMigrationRunnerForIsolatedTesting(
   options: AdminRunnerOptions,
   testToken: IsolatedTestToken
 ): Promise<AdminRunnerResult> {
-  // 1. Verify token authenticity
+  // 1. Verify token authenticity using private module state
   if (
     !testToken ||
     typeof testToken !== 'object' ||
+    !issuedTestTokens.has(testToken) ||
     (testToken as any)[ISOLATED_TEST_SYMBOL] !== true
   ) {
     return {
@@ -283,8 +290,8 @@ export async function runAdminMigrationRunnerForIsolatedTesting(
     };
   }
 
-  // 2. Verify token is unconsumed (single use)
-  if (testToken.consumed) {
+  // 2. Verify token is unconsumed using private module state (one-way consumption)
+  if (consumedTestTokens.has(testToken)) {
     return {
       success: false,
       schemaVersion: 0,
@@ -309,8 +316,8 @@ export async function runAdminMigrationRunnerForIsolatedTesting(
     };
   }
 
-  // 4. Burn the token
-  testToken.consumed = true;
+  // 4. One-way burn in private module state (immutable to caller modification)
+  consumedTestTokens.add(testToken);
 
   return executeRunnerInternal(options, { isAuthorizedTestBypass: true });
 }

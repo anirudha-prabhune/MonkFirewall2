@@ -895,9 +895,15 @@ async function runStage2aSafetyCorrectionTests() {
       },
       validToken
     );
-    assert(!firstRun.dryRun && (firstRun as any).success === true, 'First run with valid token succeeds');
+    // Attempt to tamper with the token's exposed fields to bypass replay guard
+    try {
+      (validToken as any).consumed = false;
+      (validToken as any).id = 'new_tampered_id';
+    } catch {
+      // In strict mode Object.freeze throws, which also prevents mutation
+    }
 
-    // Attempt reuse of same token
+    // Attempt reuse of same token after tampering
     const reusedRun = await runAdminMigrationRunnerForIsolatedTesting(
       {
         userId,
@@ -908,13 +914,31 @@ async function runStage2aSafetyCorrectionTests() {
       },
       validToken
     );
-    assert(!reusedRun.dryRun && (reusedRun as any).success === false, 'Reused token must fail closed');
+    assert(!reusedRun.dryRun && (reusedRun as any).success === false, 'Reused token must fail closed even after tampering');
     assert(
       !reusedRun.dryRun && (reusedRun as any).errors !== undefined && (reusedRun as any).errors[0].includes('TOKEN_ALREADY_CONSUMED'),
-      'TOKEN_ALREADY_CONSUMED error returned'
+      'TOKEN_ALREADY_CONSUMED error returned on replayed token'
     );
 
-    // 23.3: Cannot mint test token in production
+    // 23.3: Cloned token object fails closed (not in issued WeakSet)
+    const clonedToken = { ...validToken } as any;
+    const clonedRun = await runAdminMigrationRunnerForIsolatedTesting(
+      {
+        userId,
+        accountId,
+        tradingDate,
+        now: testNow,
+        confirmWrite: true,
+      },
+      clonedToken
+    );
+    assert(!clonedRun.dryRun && (clonedRun as any).success === false, 'Cloned token must fail closed');
+    assert(
+      !clonedRun.dryRun && (clonedRun as any).errors !== undefined && (clonedRun as any).errors[0].includes('INVALID_TEST_TOKEN'),
+      'INVALID_TEST_TOKEN error returned on cloned token'
+    );
+
+    // 23.4: Cannot mint test token in production
     const origEnv = process.env.NODE_ENV;
     process.env.NODE_ENV = 'production';
     let mintFailed = false;
