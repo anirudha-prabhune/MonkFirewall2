@@ -90,6 +90,7 @@ export interface RiskSession {
   warningThreshold2: number;
   lastEvaluatedAt: string;
   reason: string | null;
+  updatedAt?: string;
 }
 
 export type RiskSessionSnapshot = RiskSession;

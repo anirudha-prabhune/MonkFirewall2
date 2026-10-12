@@ -159,7 +159,10 @@ export function validateRiskConfig(input: any): ValidationResult {
     includeRealisedPnl: typeof rawRealised === 'boolean' ? rawRealised : true,
     includeUnrealisedPnl: typeof rawUnrealised === 'boolean' ? rawUnrealised : true,
     enabled: typeof rawEnabled === 'boolean' ? rawEnabled : true,
-    updatedAt: new Date().toISOString(),
+    updatedAt:
+      typeof input.updatedAt === 'string' && !isNaN(Date.parse(input.updatedAt))
+        ? input.updatedAt
+        : new Date().toISOString(),
   };
 
   return { valid: true, errors: [], sanitized };
