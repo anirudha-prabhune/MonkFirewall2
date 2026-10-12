@@ -143,9 +143,11 @@ export interface NormalizedPosition {
  * GUARANTEE: Read-only contract! No order-placement or trading methods.
  */
 export interface BrokerAdapter {
-  getConnectionStatus(): Promise<BrokerConnectionStatus>;
-  getPositions(): Promise<RawBrokerPosition[]>;
-  getInstruments(): Promise<BrokerInstrument[]>;
+  readonly providerId: string;
+  getConnectionStatus(userId?: string): Promise<BrokerConnectionStatus>;
+  getPositions(userId?: string): Promise<RawBrokerPosition[]>;
+  getInstruments(userId?: string): Promise<BrokerInstrument[]>;
+  getLtpSnapshot?(instrumentToken: number, userId?: string): Promise<LtpSnapshotResult>;
 }
 
 /**

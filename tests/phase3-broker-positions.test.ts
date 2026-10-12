@@ -284,6 +284,7 @@ const initialAdapter = BrokerService.getActiveAdapter();
 assert(initialAdapter !== null, 'Initial adapter must exist');
 
 class TestAlternateAdapter implements BrokerAdapter {
+  public readonly providerId: string = 'test_alt';
   async getConnectionStatus() {
     return {
       broker: 'test_alt',

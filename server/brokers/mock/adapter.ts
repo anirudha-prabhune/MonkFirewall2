@@ -14,6 +14,7 @@ import { MOCK_INSTRUMENT_MASTER } from '../../instruments/master';
  * on the broker abstraction rather than direct Zerodha Kite Connect dependencies.
  */
 export class MockZerodhaAdapter implements BrokerAdapter {
+  public readonly providerId: string = 'zerodha';
   private isConnected: boolean = true;
 
   public async getConnectionStatus(): Promise<BrokerConnectionStatus> {

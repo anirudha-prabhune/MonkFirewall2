@@ -34,6 +34,7 @@ export type HttpFetchFn = (url: string, options?: any) => Promise<{
  * 4. TOKENEXCEPTION CONCURRENCY SAFETY: 401/403 invalidates only the failed sessionVersion without destroying newer sessions.
  */
 export class LiveZerodhaAdapter implements BrokerAdapter {
+  public readonly providerId: string = 'zerodha';
   private customFetch?: HttpFetchFn;
   private cachedInstruments: BrokerInstrument[] | null = null;
   private instrumentCacheTimestamp: number = 0;
