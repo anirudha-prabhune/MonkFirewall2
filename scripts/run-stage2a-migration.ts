@@ -64,8 +64,8 @@ export function createIsolatedTestToken(): IsolatedTestToken {
       break;
     }
   }
-  if (callerIndex === -1 || callerIndex >= lines.length) {
-    callerIndex = 2;
+  if (callerIndex === -1 || callerIndex >= lines.length || !lines[callerIndex]?.trim()) {
+    throw new Error('ISOLATED_TEST_TOKEN_FORBIDDEN: Unable to verify caller stack frame.');
   }
 
   const immediateCallerFrame = lines[callerIndex] || '';
@@ -341,8 +341,14 @@ export async function runAdminMigrationRunnerForIsolatedTesting(
       break;
     }
   }
-  if (callerIndex === -1 || callerIndex >= lines.length) {
-    callerIndex = 2;
+  if (callerIndex === -1 || callerIndex >= lines.length || !lines[callerIndex]?.trim()) {
+    return {
+      success: false,
+      schemaVersion: 0,
+      errors: [
+        'INVALID_TEST_CALLER: Unable to verify caller stack frame.',
+      ],
+    };
   }
 
   const immediateCallerFrame = lines[callerIndex] || '';

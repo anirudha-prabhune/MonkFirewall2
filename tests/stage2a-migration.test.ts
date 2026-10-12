@@ -985,7 +985,119 @@ async function runStage2aSafetyCorrectionTests() {
     }
     assert(nonTestCallerRejected, 'Calling createIsolatedTestToken from outside /tests/ must fail closed');
 
-    console.log('  PASSED: Isolated test token security (forgery, single-use, production blocking, helper delegation, and non-test rejection) verified.');
+    // 23.7: Real threat regression — Code outside /tests/ (e.g. application code in /server/) invokes a test helper to mint/use bypass -> FAILS CLOSED with zero writes
+    clearMigrationMockStore();
+    setMigrationMockDoc(`users/${userId}/riskConfig/config`, validLegacyConfig);
+
+    // Test helpers defined within /tests/
+    function helperMintTokenInTests() {
+      return createIsolatedTestToken();
+    }
+    async function helperRunMigrationInTests(opts: any, token: any) {
+      return runAdminMigrationRunnerForIsolatedTesting(opts, token);
+    }
+
+    // Rogue caller originating from application code (/server/)
+    const rogueServerCaller = new Function(
+      'helper',
+      'opts',
+      'token',
+      '//# sourceURL=/server/risk/rogueApplicationCaller.ts\nreturn helper(opts, token);'
+    );
+
+    // 23.7a: Invoking test helper to mint token from application code in /server/ fails closed
+    let rogueMintBlocked = false;
+    try {
+      rogueServerCaller(helperMintTokenInTests);
+    } catch (err: any) {
+      rogueMintBlocked = true;
+      assert(
+        err.message.includes('ISOLATED_TEST_TOKEN_FORBIDDEN') &&
+        err.message.includes('Call chain contains application code'),
+        'Attempt to mint test token via test helper from /server/ code strictly rejected'
+      );
+    }
+    assert(rogueMintBlocked, 'Rogue caller outside /tests/ invoking test helper to mint token must fail closed');
+
+    // 23.7b: Invoking test helper to run migration from /server/ fails closed
+    const preMintedToken = createIsolatedTestToken();
+    const rogueRunnerRes = await rogueServerCaller(
+      helperRunMigrationInTests,
+      {
+        userId,
+        accountId,
+        tradingDate,
+        now: testNow,
+        confirmWrite: true,
+        backupDir: './test_backups',
+      },
+      preMintedToken
+    );
+    assert(!rogueRunnerRes.dryRun, 'Executed in write mode attempt');
+    assert(rogueRunnerRes.success === false, 'Rogue application caller must fail closed even when delegating through test helper');
+    assert(
+      rogueRunnerRes.errors !== undefined &&
+      rogueRunnerRes.errors[0].includes('INVALID_TEST_CALLER') &&
+      rogueRunnerRes.errors[0].includes('Call chain contains application code'),
+      'Runner reports INVALID_TEST_CALLER due to application code in call chain'
+    );
+
+    // 23.7c: Verify ZERO mock writes occurred
+    assert(
+      getMigrationMockDoc(`users/${userId}/system/migrationState`) === undefined,
+      'Zero writes: rogue caller outside /tests/ invoking test helper resulted in ZERO mock writes'
+    );
+
+    // 23.8: Fail-closed verification when stack frame cannot be identified/parsed (removal of callerIndex = 2 fallbacks)
+    const origPrepareStackTrace = Error.prepareStackTrace;
+    try {
+      Error.prepareStackTrace = () => '';
+      let mintWithoutStackBlocked = false;
+      try {
+        createIsolatedTestToken();
+      } catch (err: any) {
+        mintWithoutStackBlocked = true;
+        assert(
+          err.message.includes('ISOLATED_TEST_TOKEN_FORBIDDEN') &&
+          err.message.includes('Unable to verify caller stack frame'),
+          'createIsolatedTestToken fails closed when stack frame cannot be parsed'
+        );
+      }
+      assert(mintWithoutStackBlocked, 'createIsolatedTestToken without identifiable stack frame must fail closed');
+    } finally {
+      Error.prepareStackTrace = origPrepareStackTrace;
+    }
+
+    const tokenForStackTest = createIsolatedTestToken();
+    try {
+      Error.prepareStackTrace = () => '';
+      const runnerResNoStack = await runAdminMigrationRunnerForIsolatedTesting(
+        {
+          userId,
+          accountId,
+          tradingDate,
+          now: testNow,
+          confirmWrite: true,
+        },
+        tokenForStackTest
+      );
+      assert(!runnerResNoStack.dryRun && runnerResNoStack.success === false, 'Runner must fail closed when stack cannot be verified');
+      assert(
+        runnerResNoStack.errors !== undefined &&
+        runnerResNoStack.errors[0].includes('INVALID_TEST_CALLER') &&
+        runnerResNoStack.errors[0].includes('Unable to verify caller stack frame'),
+        'Runner reports INVALID_TEST_CALLER when stack frame is unidentifiable'
+      );
+    } finally {
+      Error.prepareStackTrace = origPrepareStackTrace;
+    }
+
+    assert(
+      getMigrationMockDoc(`users/${userId}/system/migrationState`) === undefined,
+      'Zero writes: unparseable stack attempts resulted in zero mock writes'
+    );
+
+    console.log('  PASSED: Isolated test token security (forgery, single-use, production blocking, helper delegation, rogue /server/ caller rejection, and unparseable stack fail-closed) verified.');
   }
 
   console.log('\n=== ALL STAGE 2A SAFETY CORRECTION & ADMIN RUNNER TESTS PASSED SUCCESSFULLY ===');
