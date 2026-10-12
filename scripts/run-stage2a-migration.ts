@@ -19,11 +19,53 @@ export interface AdminRunnerOptions {
   confirmWrite?: boolean;
   dryRun?: boolean;
   useMockStore?: boolean;
-  allowMockForTesting?: boolean; // Explicit test-only override for isolated unit testing
   isCli?: boolean;
   now?: Date;
   backupDir?: string;
   failBackupForTest?: boolean;
+}
+
+const ISOLATED_TEST_SYMBOL = Symbol('STAGE2A_ISOLATED_TEST_TOKEN');
+
+export interface IsolatedTestToken {
+  readonly [ISOLATED_TEST_SYMBOL]: true;
+  readonly id: string;
+  consumed: boolean;
+}
+
+/**
+ * Creates a single-use authorization token for isolated unit testing.
+ * Strictly verifies caller authenticity via stack frame inspection and environment.
+ * Cannot be called from production, CLI, or non-test files.
+ */
+export function createIsolatedTestToken(): IsolatedTestToken {
+  if (typeof process === 'undefined') {
+    throw new Error('ISOLATED_TEST_TOKEN_FORBIDDEN: process is undefined.');
+  }
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error('ISOLATED_TEST_TOKEN_FORBIDDEN: Cannot mint test token in production environment.');
+  }
+  if (process.env.NODE_ENV !== 'test') {
+    throw new Error('ISOLATED_TEST_TOKEN_FORBIDDEN: Test token can only be minted when NODE_ENV=test.');
+  }
+
+  // Caller stack frame inspection: must originate directly from tests/
+  const stack = new Error().stack || '';
+  const lines = stack.split('\n');
+  const callerLine = lines[2] || lines[1] || '';
+  const isFromTestFile =
+    (callerLine.includes('/tests/') || callerLine.includes('\\tests\\')) &&
+    !callerLine.includes('run-stage2a-migration');
+
+  if (!isFromTestFile) {
+    throw new Error('ISOLATED_TEST_TOKEN_FORBIDDEN: Isolated test token can only be created from test files inside /tests/.');
+  }
+
+  return {
+    [ISOLATED_TEST_SYMBOL]: true,
+    id: `token_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`,
+    consumed: false,
+  };
 }
 
 /**
@@ -197,8 +239,89 @@ export async function createAndVerifyBackup(
 
 /**
  * Stage 2A Administrative Migration Runner
+ * Public entry point for administrative migration execution.
+ * Mock write bypass is strictly forbidden for ordinary programmatic callers, even when NODE_ENV=test.
  */
 export async function runAdminMigrationRunner(options: AdminRunnerOptions): Promise<AdminRunnerResult> {
+  // Programmatic Bypass Guard:
+  // allowMockForTesting is strictly forbidden for all ordinary programmatic callers,
+  // even when NODE_ENV === 'test'.
+  if ((options as any).allowMockForTesting !== undefined) {
+    return {
+      success: false,
+      schemaVersion: 0,
+      errors: [
+        'PROGRAMMATIC_BYPASS_FORBIDDEN: allowMockForTesting override is not accessible to programmatic callers. Mock writes cannot be enabled through this option, even when NODE_ENV=test.',
+      ],
+    };
+  }
+
+  return executeRunnerInternal(options, { isAuthorizedTestBypass: false });
+}
+
+/**
+ * Test-isolated execution entry point for unit testing write mode with mock store.
+ * Requires a valid, unconsumed IsolatedTestToken minted by createIsolatedTestToken().
+ * Rejects ordinary programmatic callers, production, and CLI execution.
+ */
+export async function runAdminMigrationRunnerForIsolatedTesting(
+  options: AdminRunnerOptions,
+  testToken: IsolatedTestToken
+): Promise<AdminRunnerResult> {
+  // 1. Verify token authenticity
+  if (
+    !testToken ||
+    typeof testToken !== 'object' ||
+    (testToken as any)[ISOLATED_TEST_SYMBOL] !== true
+  ) {
+    return {
+      success: false,
+      schemaVersion: 0,
+      errors: [
+        'INVALID_TEST_TOKEN: Isolated test execution requires a valid IsolatedTestToken minted via createIsolatedTestToken().',
+      ],
+    };
+  }
+
+  // 2. Verify token is unconsumed (single use)
+  if (testToken.consumed) {
+    return {
+      success: false,
+      schemaVersion: 0,
+      errors: [
+        'TOKEN_ALREADY_CONSUMED: IsolatedTestToken is single-use and has already been consumed.',
+      ],
+    };
+  }
+
+  // 3. Caller stack inspection: call site must be within /tests/
+  const stack = new Error().stack || '';
+  const isFromTestFile =
+    (stack.includes('/tests/') || stack.includes('\\tests\\')) &&
+    !stack.includes('node_modules');
+  if (!isFromTestFile) {
+    return {
+      success: false,
+      schemaVersion: 0,
+      errors: [
+        'INVALID_TEST_CALLER: runAdminMigrationRunnerForIsolatedTesting can only be invoked from test suites in /tests/.',
+      ],
+    };
+  }
+
+  // 4. Burn the token
+  testToken.consumed = true;
+
+  return executeRunnerInternal(options, { isAuthorizedTestBypass: true });
+}
+
+/**
+ * Internal execution kernel shared by public runner and authenticated test runner.
+ */
+async function executeRunnerInternal(
+  options: AdminRunnerOptions,
+  { isAuthorizedTestBypass }: { isAuthorizedTestBypass: boolean }
+): Promise<AdminRunnerResult> {
   const now = options.now || new Date();
 
   // 1. Argument Validation
@@ -308,26 +431,16 @@ export async function runAdminMigrationRunner(options: AdminRunnerOptions): Prom
     );
   }
 
-  // Security Guard: allowMockForTesting is strictly forbidden in CLI and production execution.
-  // It may ONLY be utilized in an explicitly isolated test environment (NODE_ENV === 'test').
-  if (options.allowMockForTesting) {
-    if (options.isCli || !isIsolatedTestEnvironment()) {
-      return {
-        success: false,
-        schemaVersion: 0,
-        errors: [
-          'ALLOW_MOCK_TESTING_FORBIDDEN: allowMockForTesting bypass is strictly forbidden in CLI and production execution. Mock writes can only be enabled in an explicitly isolated test environment (NODE_ENV === "test").',
-        ],
-      };
-    }
-  }
-
   // Fail-Closed Store Guard:
   // In write mode, require real Firestore to be initialized and mock mode to be disabled.
   // Never silently fall back to mock storage.
-  // Isolated mock testing is allowed ONLY through explicit options.allowMockForTesting === true within an isolated test environment.
+  // Isolated mock testing is allowed ONLY through authorized test bypass within an isolated test environment.
   if (isWriteMode) {
-    const isTestBypassActive = Boolean(options.allowMockForTesting && !options.isCli && isIsolatedTestEnvironment());
+    const isTestBypassActive = Boolean(
+      isAuthorizedTestBypass &&
+      !options.isCli &&
+      isIsolatedTestEnvironment()
+    );
 
     if (isMock && !isTestBypassActive) {
       return {

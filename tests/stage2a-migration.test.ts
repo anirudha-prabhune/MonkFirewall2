@@ -10,11 +10,18 @@ import {
   getMigrationMockDoc,
   setMockTransactionFailureInjector,
 } from '../server/risk/migration';
+import fs from 'fs';
 import { enableMockStoreForTesting } from '../server/brokers/zerodha/sessionStore';
 import { DEFAULT_RISK_CONFIG } from '../src/types/risk';
 
 enableMockStoreForTesting(true);
 process.env.NODE_ENV = 'test';
+
+function cleanupTestBackups() {
+  if (fs.existsSync('./test_backups')) {
+    fs.rmSync('./test_backups', { recursive: true, force: true });
+  }
+}
 
 function assert(condition: boolean, message: string) {
   if (!condition) {
@@ -23,6 +30,7 @@ function assert(condition: boolean, message: string) {
 }
 
 async function runStage2aSafetyCorrectionTests() {
+  cleanupTestBackups();
   console.log('=== RUNNING STAGE 2A SAFETY CORRECTION TESTS ===\n');
 
   const userId = 'user_safety_test';
@@ -438,20 +446,23 @@ async function runStage2aSafetyCorrectionTests() {
   console.log('\nTest 12: Admin Runner Backup Verification Failure Handling');
   {
     clearMigrationMockStore();
-    const { runAdminMigrationRunner } = await import('../scripts/run-stage2a-migration');
+    const { runAdminMigrationRunnerForIsolatedTesting, createIsolatedTestToken } = await import('../scripts/run-stage2a-migration');
 
     setMigrationMockDoc(`users/${userId}/riskConfig/config`, validLegacyConfig);
+    const testToken = createIsolatedTestToken();
 
-    const backupFailRes = await runAdminMigrationRunner({
-      userId,
-      accountId,
-      tradingDate,
-      now: testNow,
-      confirmWrite: true,
-      allowMockForTesting: true,
-      backupDir: './test_backups',
-      failBackupForTest: true, // Inject backup failure
-    });
+    const backupFailRes = await runAdminMigrationRunnerForIsolatedTesting(
+      {
+        userId,
+        accountId,
+        tradingDate,
+        now: testNow,
+        confirmWrite: true,
+        backupDir: './test_backups',
+        failBackupForTest: true, // Inject backup failure
+      },
+      testToken
+    );
 
     assert(backupFailRes.dryRun !== true, 'Not executed in dry-run mode');
     if (!backupFailRes.dryRun) {
@@ -469,19 +480,22 @@ async function runStage2aSafetyCorrectionTests() {
   console.log('\nTest 13: Admin Runner Write Mode Execution & Backup Creation');
   {
     clearMigrationMockStore();
-    const { runAdminMigrationRunner } = await import('../scripts/run-stage2a-migration');
+    const { runAdminMigrationRunnerForIsolatedTesting, createIsolatedTestToken } = await import('../scripts/run-stage2a-migration');
 
     setMigrationMockDoc(`users/${userId}/riskConfig/config`, validLegacyConfig);
+    const testToken = createIsolatedTestToken();
 
-    const writeResult = await runAdminMigrationRunner({
-      userId,
-      accountId,
-      tradingDate,
-      now: testNow,
-      confirmWrite: true,
-      allowMockForTesting: true,
-      backupDir: './test_backups',
-    });
+    const writeResult = await runAdminMigrationRunnerForIsolatedTesting(
+      {
+        userId,
+        accountId,
+        tradingDate,
+        now: testNow,
+        confirmWrite: true,
+        backupDir: './test_backups',
+      },
+      testToken
+    );
 
     assert(writeResult.dryRun !== true, 'Executed in write mode');
     if (!writeResult.dryRun) {
@@ -695,14 +709,14 @@ async function runStage2aSafetyCorrectionTests() {
         now: testNow,
         confirmWrite: true,
         allowMockForTesting: true, // Attempt bypass in production
-      });
+      } as any);
 
       assert(res.dryRun !== true, 'Executed in write mode attempt');
       if (!res.dryRun) {
         assert(res.success === false, 'Production write mode MUST fail closed even if allowMockForTesting is set');
         assert(
-          res.errors !== undefined && res.errors[0].includes('ALLOW_MOCK_TESTING_FORBIDDEN'),
-          'Explicit ALLOW_MOCK_TESTING_FORBIDDEN error returned'
+          res.errors !== undefined && res.errors[0].includes('PROGRAMMATIC_BYPASS_FORBIDDEN'),
+          'Explicit PROGRAMMATIC_BYPASS_FORBIDDEN error returned'
         );
       }
       assert(
@@ -733,14 +747,14 @@ async function runStage2aSafetyCorrectionTests() {
         now: testNow,
         confirmWrite: true,
         allowMockForTesting: true, // Attempt bypass in non-test env
-      });
+      } as any);
 
       assert(res.dryRun !== true, 'Executed in write mode attempt');
       if (!res.dryRun) {
         assert(res.success === false, 'Non-test environment MUST fail closed even if allowMockForTesting is set');
         assert(
-          res.errors !== undefined && res.errors[0].includes('ALLOW_MOCK_TESTING_FORBIDDEN'),
-          'Explicit ALLOW_MOCK_TESTING_FORBIDDEN error returned'
+          res.errors !== undefined && res.errors[0].includes('PROGRAMMATIC_BYPASS_FORBIDDEN'),
+          'Explicit PROGRAMMATIC_BYPASS_FORBIDDEN error returned'
         );
       }
       assert(
@@ -769,14 +783,14 @@ async function runStage2aSafetyCorrectionTests() {
       confirmWrite: true,
       allowMockForTesting: true,
       isCli: true,
-    });
+    } as any);
 
     assert(programmaticCliRes.dryRun !== true, 'Executed in write mode attempt');
     if (!programmaticCliRes.dryRun) {
       assert(programmaticCliRes.success === false, 'CLI execution MUST fail closed with allowMockForTesting');
       assert(
-        programmaticCliRes.errors !== undefined && programmaticCliRes.errors[0].includes('ALLOW_MOCK_TESTING_FORBIDDEN'),
-        'Explicit ALLOW_MOCK_TESTING_FORBIDDEN error returned'
+        programmaticCliRes.errors !== undefined && programmaticCliRes.errors[0].includes('PROGRAMMATIC_BYPASS_FORBIDDEN'),
+        'Explicit PROGRAMMATIC_BYPASS_FORBIDDEN error returned'
       );
     }
     assert(
@@ -804,10 +818,127 @@ async function runStage2aSafetyCorrectionTests() {
     console.log('  PASSED: CLI execution strictly rejects allowMockForTesting and exits without writes.');
   }
 
+  console.log('\nTest 22: Ordinary Programmatic Caller Cannot Enable Mock Writes Even When NODE_ENV=test (Programmatic Bypass Rejection)');
+  {
+    clearMigrationMockStore();
+    const { runAdminMigrationRunner } = await import('../scripts/run-stage2a-migration');
+
+    setMigrationMockDoc(`users/${userId}/riskConfig/config`, validLegacyConfig);
+
+    // Call public runAdminMigrationRunner with allowMockForTesting when NODE_ENV is strictly 'test'
+    assert(process.env.NODE_ENV === 'test', 'Test environment active');
+    const res = await runAdminMigrationRunner({
+      userId,
+      accountId,
+      tradingDate,
+      now: testNow,
+      confirmWrite: true,
+      allowMockForTesting: true, // Ordinary programmatic bypass attempt
+    } as any);
+
+    assert(res.dryRun !== true, 'Executed in write mode attempt');
+    if (!res.dryRun) {
+      assert(res.success === false, 'Programmatic bypass attempt must fail closed');
+      assert(
+        res.errors !== undefined && res.errors[0].includes('PROGRAMMATIC_BYPASS_FORBIDDEN'),
+        'Explicit PROGRAMMATIC_BYPASS_FORBIDDEN error returned'
+      );
+    }
+    assert(
+      getMigrationMockDoc(`users/${userId}/system/migrationState`) === undefined,
+      'Zero writes: ordinary programmatic caller cannot write to mock store even when NODE_ENV=test'
+    );
+
+    console.log('  PASSED: Ordinary programmatic caller strictly blocked from mock writes even when NODE_ENV=test.');
+  }
+
+  console.log('\nTest 23: Isolated Test Token Security & Tamper Proofing');
+  {
+    clearMigrationMockStore();
+    const {
+      runAdminMigrationRunnerForIsolatedTesting,
+      createIsolatedTestToken,
+    } = await import('../scripts/run-stage2a-migration');
+
+    // 23.1: Forged token (not minted by createIsolatedTestToken) fails closed
+    const forgedToken = { id: 'forged_token', consumed: false } as any;
+    const forgedRes = await runAdminMigrationRunnerForIsolatedTesting(
+      {
+        userId,
+        accountId,
+        tradingDate,
+        now: testNow,
+        confirmWrite: true,
+      },
+      forgedToken
+    );
+    assert(forgedRes.dryRun !== true, 'Executed in write mode');
+    if (!forgedRes.dryRun) {
+      assert(forgedRes.success === false, 'Forged token must fail closed');
+      assert(
+        forgedRes.errors !== undefined && forgedRes.errors[0].includes('INVALID_TEST_TOKEN'),
+        'INVALID_TEST_TOKEN error returned'
+      );
+    }
+
+    // 23.2: Reused token fails closed (single-use burned)
+    setMigrationMockDoc(`users/${userId}/riskConfig/config`, validLegacyConfig);
+    const validToken = createIsolatedTestToken();
+    const firstRun = await runAdminMigrationRunnerForIsolatedTesting(
+      {
+        userId,
+        accountId,
+        tradingDate,
+        now: testNow,
+        confirmWrite: true,
+        backupDir: './test_backups',
+      },
+      validToken
+    );
+    assert(!firstRun.dryRun && (firstRun as any).success === true, 'First run with valid token succeeds');
+
+    // Attempt reuse of same token
+    const reusedRun = await runAdminMigrationRunnerForIsolatedTesting(
+      {
+        userId,
+        accountId,
+        tradingDate,
+        now: testNow,
+        confirmWrite: true,
+      },
+      validToken
+    );
+    assert(!reusedRun.dryRun && (reusedRun as any).success === false, 'Reused token must fail closed');
+    assert(
+      !reusedRun.dryRun && (reusedRun as any).errors !== undefined && (reusedRun as any).errors[0].includes('TOKEN_ALREADY_CONSUMED'),
+      'TOKEN_ALREADY_CONSUMED error returned'
+    );
+
+    // 23.3: Cannot mint test token in production
+    const origEnv = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'production';
+    let mintFailed = false;
+    try {
+      createIsolatedTestToken();
+    } catch (e: any) {
+      mintFailed = true;
+      assert(e.message.includes('ISOLATED_TEST_TOKEN_FORBIDDEN'), 'Error mentions ISOLATED_TEST_TOKEN_FORBIDDEN');
+    } finally {
+      process.env.NODE_ENV = origEnv;
+    }
+    assert(mintFailed, 'Cannot mint test token in production environment');
+
+    console.log('  PASSED: Isolated test token security (forgery, single-use, production blocking) verified.');
+  }
+
   console.log('\n=== ALL STAGE 2A SAFETY CORRECTION & ADMIN RUNNER TESTS PASSED SUCCESSFULLY ===');
 }
 
-runStage2aSafetyCorrectionTests().catch((err) => {
-  console.error('\nSTAGE 2A SAFETY CORRECTION TESTS FAILED:', err);
-  process.exit(1);
-});
+runStage2aSafetyCorrectionTests()
+  .catch((err) => {
+    console.error('\nSTAGE 2A SAFETY CORRECTION TESTS FAILED:', err);
+    process.exit(1);
+  })
+  .finally(() => {
+    cleanupTestBackups();
+  });
