@@ -55,6 +55,50 @@ export function setMockTransactionFailureInjector(fn: (() => void) | null): void
  * 8. Strictly idempotent: schemaVersion >= 2 results in 0 writes.
  */
 /**
+ * Verifies that a backup payload contains each of the exact required paths exactly once.
+ * Rejects missing, duplicate, or malformed document entries.
+ */
+export function verifyBackupPathIntegrity(
+  documents: any[],
+  expectedPaths: string[]
+): { valid: boolean; error?: string } {
+  if (!Array.isArray(documents) || documents.length !== expectedPaths.length) {
+    return {
+      valid: false,
+      error: `BACKUP_VERIFICATION_FAILED: Expected exactly ${expectedPaths.length} documents in backup, got ${Array.isArray(documents) ? documents.length : 0}`,
+    };
+  }
+
+  const seenPaths = new Set<string>();
+  for (const entry of documents) {
+    if (!entry || typeof entry.path !== 'string' || typeof entry.exists !== 'boolean') {
+      return {
+        valid: false,
+        error: `BACKUP_VERIFICATION_FAILED: Malformed document entry in backup: ${JSON.stringify(entry)}`,
+      };
+    }
+    if (seenPaths.has(entry.path)) {
+      return {
+        valid: false,
+        error: `BACKUP_VERIFICATION_FAILED: Duplicate document path found in backup: '${entry.path}'`,
+      };
+    }
+    seenPaths.add(entry.path);
+  }
+
+  for (const reqPath of expectedPaths) {
+    if (!seenPaths.has(reqPath)) {
+      return {
+        valid: false,
+        error: `BACKUP_VERIFICATION_FAILED: Required document path missing from backup: '${reqPath}'`,
+      };
+    }
+  }
+
+  return { valid: true };
+}
+
+/**
  * Compares a live document snapshot against a pre-migration backup payload.
  * Aborts migration if any document existence or content was modified post-backup.
  */
@@ -66,7 +110,9 @@ export function checkBackupDocumentStaleness(
 ): string | null {
   if (!expectedBackup || !Array.isArray(expectedBackup.documents)) return null;
   const backupEntry = expectedBackup.documents.find((d: any) => d.path === docPath);
-  if (!backupEntry) return null;
+  if (!backupEntry) {
+    return `BACKUP_STALE_CONCURRENT_MUTATION: Required path '${docPath}' is missing from the provided backup payload.`;
+  }
 
   if (backupEntry.exists !== liveExists) {
     return `BACKUP_STALE_CONCURRENT_MUTATION: Document '${docPath}' existence changed from ${backupEntry.exists} at backup time to ${liveExists} at transaction execution time. Aborting migration writes.`;
@@ -103,6 +149,14 @@ export async function migrateUserRiskData(
   const legacySessionDocPath = `users/${cleanUserId}/riskSessions/${effectiveTradingDate}`;
   const accountSessionDocPath = `users/${cleanUserId}/accountRiskSessions/${accountId}__${effectiveTradingDate}`;
 
+  const expectedPaths = [
+    migrationDocPath,
+    legacyConfigDocPath,
+    accountConfigDocPath,
+    legacySessionDocPath,
+    accountSessionDocPath,
+  ];
+
   const adminDb = getAdminFirestore();
   const isMock = isMockStoreEnabled();
 
@@ -135,6 +189,15 @@ export async function migrateUserRiskData(
 
         // Backup Staleness Guard: Check for concurrent mutations post-backup
         if (expectedBackup) {
+          const pathCheck = verifyBackupPathIntegrity(expectedBackup.documents, expectedPaths);
+          if (!pathCheck.valid) {
+            return {
+              success: false,
+              schemaVersion: 0,
+              errors: [pathCheck.error || 'Backup path integrity verification failed.'],
+            };
+          }
+
           const checkEntries = [
             { path: migrationDocPath, data: migrationSnap.exists ? migrationSnap.data() : null, exists: migrationSnap.exists },
             { path: legacyConfigDocPath, data: legacyConfigSnap.exists ? legacyConfigSnap.data() : null, exists: legacyConfigSnap.exists },
@@ -262,6 +325,15 @@ export async function migrateUserRiskData(
 
   // Backup Staleness Guard in Mock Execution
   if (expectedBackup) {
+    const pathCheck = verifyBackupPathIntegrity(expectedBackup.documents, expectedPaths);
+    if (!pathCheck.valid) {
+      return {
+        success: false,
+        schemaVersion: 0,
+        errors: [pathCheck.error || 'Backup path integrity verification failed.'],
+      };
+    }
+
     const checkEntries = [
       { path: migrationDocPath, data: migrationData, exists: migrationData !== undefined && migrationData !== null },
       { path: legacyConfigDocPath, data: legacyRaw, exists: legacyRaw !== undefined && legacyRaw !== null },

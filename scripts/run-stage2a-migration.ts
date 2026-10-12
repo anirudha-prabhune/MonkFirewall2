@@ -6,6 +6,7 @@ import {
   reconcileRiskConfigs,
   evaluateLockMirroring,
   getMigrationMockDoc,
+  verifyBackupPathIntegrity,
   MigrationResult,
 } from '../server/risk/migration';
 import { RiskSession, getTradingDateKolkata } from '../server/risk/engine';
@@ -17,6 +18,7 @@ export interface AdminRunnerOptions {
   confirmWrite?: boolean;
   dryRun?: boolean;
   useMockStore?: boolean;
+  allowMockForTesting?: boolean; // Explicit test-only override for isolated unit testing
   now?: Date;
   backupDir?: string;
   failBackupForTest?: boolean;
@@ -69,6 +71,7 @@ export function isValidCalendarDate(dateStr?: string): boolean {
 /**
  * Creates and verifies a 5-document pre-migration snapshot backup.
  * Includes absent-document markers (`exists: false`, `data: null`).
+ * Strictly verifies each of the exact five required paths is present exactly once.
  */
 export async function createAndVerifyBackup(
   userId: string,
@@ -123,15 +126,10 @@ export async function createAndVerifyBackup(
     documents: docs,
   };
 
-  // Verify backup payload completeness
-  if (backup.documents.length !== 5) {
-    return { success: false, error: `BACKUP_VERIFICATION_FAILED: Expected 5 documents in backup, got ${backup.documents.length}` };
-  }
-
-  for (const entry of backup.documents) {
-    if (!entry.path || typeof entry.exists !== 'boolean') {
-      return { success: false, error: `BACKUP_VERIFICATION_FAILED: Malformed document entry for ${entry.path}` };
-    }
+  // Verify backup payload contains each of the exact 5 paths exactly once before saving
+  const preCheck = verifyBackupPathIntegrity(backup.documents, paths);
+  if (!preCheck.valid) {
+    return { success: false, error: preCheck.error };
   }
 
   // Save backup artifact to disk
@@ -149,8 +147,13 @@ export async function createAndVerifyBackup(
     const fileContent = fs.readFileSync(filePath, 'utf-8');
     const reloaded = JSON.parse(fileContent) as MigrationBackup;
 
-    if (!reloaded || reloaded.documents.length !== 5) {
+    if (!reloaded || !Array.isArray(reloaded.documents)) {
       return { success: false, error: 'BACKUP_VERIFICATION_FAILED: Reloaded backup on disk is incomplete or corrupted.' };
+    }
+
+    const postCheck = verifyBackupPathIntegrity(reloaded.documents, paths);
+    if (!postCheck.valid) {
+      return { success: false, error: postCheck.error };
     }
 
     return { success: true, backupPath: filePath, backup: reloaded };
@@ -262,11 +265,40 @@ export async function runAdminMigrationRunner(options: AdminRunnerOptions): Prom
     };
   }
 
+  const adminDb = getAdminFirestore();
+  const isMock = isMockStoreEnabled();
+
   // Store Mode Safeguard: Verify requested store mode aligns with active environment store mode
-  if (options.useMockStore !== undefined && options.useMockStore !== isMockStoreEnabled()) {
+  if (options.useMockStore !== undefined && options.useMockStore !== isMock) {
     throw new Error(
-      `STORE_MODE_MISMATCH: Requested useMockStore=${options.useMockStore} but active system store mode is isMockStoreEnabled()=${isMockStoreEnabled()}. Execution blocked to prevent routing mismatch.`
+      `STORE_MODE_MISMATCH: Requested useMockStore=${options.useMockStore} but active system store mode is isMockStoreEnabled()=${isMock}. Execution blocked to prevent routing mismatch.`
     );
+  }
+
+  // Fail-Closed Store Guard:
+  // In write mode, require real Firestore to be initialized and mock mode to be disabled.
+  // Never silently fall back to mock storage.
+  // Isolated mock testing is allowed ONLY through explicit options.allowMockForTesting === true.
+  if (isWriteMode) {
+    if (isMock && !options.allowMockForTesting) {
+      return {
+        success: false,
+        schemaVersion: 0,
+        errors: [
+          'REAL_FIRESTORE_REQUIRED: Write mode requires mock store to be disabled (isMockStoreEnabled() === false). Mock store execution in write mode is blocked in production to prevent silent mock fallback.',
+        ],
+      };
+    }
+
+    if (!isMock && !adminDb) {
+      return {
+        success: false,
+        schemaVersion: 0,
+        errors: [
+          'REAL_FIRESTORE_REQUIRED: Real Firestore Admin SDK is not initialized. Write mode cannot proceed without an active Firestore connection.',
+        ],
+      };
+    }
   }
 
   // 3. WRITE MODE (Requires Backup Verification First)

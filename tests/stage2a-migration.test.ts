@@ -447,6 +447,7 @@ async function runStage2aSafetyCorrectionTests() {
       tradingDate,
       now: testNow,
       confirmWrite: true,
+      allowMockForTesting: true,
       backupDir: './test_backups',
       failBackupForTest: true, // Inject backup failure
     });
@@ -477,6 +478,7 @@ async function runStage2aSafetyCorrectionTests() {
       tradingDate,
       now: testNow,
       confirmWrite: true,
+      allowMockForTesting: true,
       backupDir: './test_backups',
     });
 
@@ -545,6 +547,134 @@ async function runStage2aSafetyCorrectionTests() {
     assert(threwMismatch, 'Runner must throw STORE_MODE_MISMATCH when requested store mode conflicts with active environment');
 
     console.log('  PASSED: Store mode mismatch safeguard enforced.');
+  }
+
+  console.log('\nTest 16: Active Mock Mode Without Explicit Test Bypass Fails Closed in Write Mode');
+  {
+    clearMigrationMockStore();
+    const { runAdminMigrationRunner } = await import('../scripts/run-stage2a-migration');
+
+    // Call write mode without allowMockForTesting when isMockStoreEnabled() === true
+    const res = await runAdminMigrationRunner({
+      userId,
+      accountId,
+      tradingDate,
+      now: testNow,
+      confirmWrite: true,
+      // allowMockForTesting is omitted
+    });
+
+    assert(res.dryRun !== true, 'Executed in write mode attempt');
+    if (!res.dryRun) {
+      assert(res.success === false, 'Write mode in mock mode without allowMockForTesting MUST fail closed');
+      assert(
+        res.errors !== undefined && res.errors[0].includes('REAL_FIRESTORE_REQUIRED'),
+        'Explicit REAL_FIRESTORE_REQUIRED error returned'
+      );
+    }
+    assert(getMigrationMockDoc(`users/${userId}/system/migrationState`) === undefined, 'No migration state created');
+
+    console.log('  PASSED: Active mock mode without explicit test bypass fails closed before writes.');
+  }
+
+  console.log('\nTest 17: Missing Firestore in Real Write Mode Fails Closed');
+  {
+    clearMigrationMockStore();
+    const { runAdminMigrationRunner } = await import('../scripts/run-stage2a-migration');
+    const { enableMockStoreForTesting } = await import('../server/brokers/zerodha/sessionStore');
+
+    // Temporarily disable mock store to simulate real production mode where Admin SDK is uninitialized
+    enableMockStoreForTesting(false);
+
+    try {
+      const res = await runAdminMigrationRunner({
+        userId,
+        accountId,
+        tradingDate,
+        now: testNow,
+        confirmWrite: true,
+      });
+
+      assert(res.dryRun !== true, 'Executed in write mode attempt');
+      if (!res.dryRun) {
+        assert(res.success === false, 'Real write mode MUST fail when Firestore is uninitialized');
+        assert(
+          res.errors !== undefined && res.errors[0].includes('REAL_FIRESTORE_REQUIRED'),
+          'Explicit REAL_FIRESTORE_REQUIRED error returned'
+        );
+      }
+    } finally {
+      // Restore mock store for remainder of tests
+      enableMockStoreForTesting(true);
+    }
+
+    console.log('  PASSED: Missing Firestore in real write mode fails closed before backup or writes.');
+  }
+
+  console.log('\nTest 18: Malformed Backup Paths Fail Closed Before Writes');
+  {
+    clearMigrationMockStore();
+    const { verifyBackupPathIntegrity } = await import('../server/risk/migration');
+
+    const expectedPaths = [
+      `users/${userId}/system/migrationState`,
+      `users/${userId}/riskConfig/config`,
+      `users/${userId}/accountRiskConfigs/${accountId}`,
+      `users/${userId}/riskSessions/${tradingDate}`,
+      `users/${userId}/accountRiskSessions/${accountId}__${tradingDate}`,
+    ];
+
+    // 18.1 Missing required path
+    const missingOnePath = expectedPaths.slice(0, 4).map((p) => ({ path: p, exists: true, data: {} }));
+    const missingRes = verifyBackupPathIntegrity(missingOnePath, expectedPaths);
+    assert(missingRes.valid === false, 'verifyBackupPathIntegrity must reject missing path');
+    assert(
+      missingRes.error !== undefined && (missingRes.error.includes('Required document path missing') || missingRes.error.includes('Expected exactly 5')),
+      'Error identifies missing path'
+    );
+
+    // 18.2 Duplicate path
+    const duplicatePaths = [
+      ...expectedPaths.slice(0, 4).map((p) => ({ path: p, exists: true, data: {} })),
+      { path: expectedPaths[0], exists: true, data: {} }, // duplicate of index 0
+    ];
+    const dupRes = verifyBackupPathIntegrity(duplicatePaths, expectedPaths);
+    assert(dupRes.valid === false, 'verifyBackupPathIntegrity must reject duplicate path');
+    assert(
+      dupRes.error !== undefined && dupRes.error.includes('Duplicate document path found'),
+      'Error identifies duplicate path'
+    );
+
+    // 18.3 Wrong path
+    const wrongPaths = [
+      ...expectedPaths.slice(0, 4).map((p) => ({ path: p, exists: true, data: {} })),
+      { path: 'users/wrong_user/riskConfig/config', exists: true, data: {} },
+    ];
+    const wrongRes = verifyBackupPathIntegrity(wrongPaths, expectedPaths);
+    assert(wrongRes.valid === false, 'verifyBackupPathIntegrity must reject unexpected/wrong path');
+    assert(
+      wrongRes.error !== undefined && wrongRes.error.includes('Required document path missing'),
+      'Error identifies missing required path'
+    );
+
+    // 18.4 Malformed backup passed to migrateUserRiskData causes immediate failure with zero writes
+    setMigrationMockDoc(`users/${userId}/riskConfig/config`, validLegacyConfig);
+    const malformedBackup = {
+      userId,
+      accountId,
+      tradingDate,
+      createdAt: new Date().toISOString(),
+      documents: duplicatePaths,
+    };
+    const migrationRes = await migrateUserRiskData(userId, accountId, tradingDate, testNow, malformedBackup);
+    assert(migrationRes.success === false, 'migrateUserRiskData must fail closed when backup paths are malformed');
+    assert(
+      migrationRes.errors !== undefined && migrationRes.errors[0].includes('BACKUP_VERIFICATION_FAILED'),
+      'Explicit BACKUP_VERIFICATION_FAILED error returned'
+    );
+    assert(getMigrationMockDoc(`users/${userId}/system/migrationState`) === undefined, 'Zero writes on malformed backup');
+
+    console.log('  PASSED: Malformed backup paths (missing, duplicate, wrong) fail closed before writes.');
   }
 
   console.log('\n=== ALL STAGE 2A SAFETY CORRECTION & ADMIN RUNNER TESTS PASSED SUCCESSFULLY ===');
