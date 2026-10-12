@@ -15,9 +15,11 @@ export interface MigrationResult {
 
 // In-memory store for unit testing when Firestore Admin SDK is not active or mock store is enabled
 const migrationMockStore = new Map<string, any>();
+let mockTransactionFailureInjector: (() => void) | null = null;
 
 export function clearMigrationMockStore(): void {
   migrationMockStore.clear();
+  mockTransactionFailureInjector = null;
 }
 
 export function setMigrationMockDoc(path: string, data: any): void {
@@ -28,16 +30,20 @@ export function getMigrationMockDoc(path: string): any {
   return migrationMockStore.get(path);
 }
 
+export function setMockTransactionFailureInjector(fn: (() => void) | null): void {
+  mockTransactionFailureInjector = fn;
+}
+
 /**
- * Stage 2A — Authoritative Risk Data Migration Utility
+ * Stage 2A — Authoritative Risk Data Migration Utility (Corrected Pass)
  *
  * Responsibilities:
  * 1. Single atomic transaction reading all required docs before issuing writes.
  * 2. Migration completion metadata stored ONLY in `users/{userId}/system/migrationState` (schemaVersion: 2).
- * 3. Reconciles legacy vs account-level RiskConfigs using timestamp precedence and maxLoss alias fallback.
+ * 3. Reconciles legacy vs account-level RiskConfigs using original timestamp precedence and maxLoss alias fallback.
  * 4. Runs canonical validation (validateRiskConfig) and sanitizes documents before writing.
- * 5. Preserves `users/{userId}/riskSessions/{tradingDate}` completely unchanged.
- * 6. Mirrors active legacy locks to `users/{userId}/accountRiskSessions/{accountId}__{tradingDate}`.
+ * 5. Preserves `users/{userId}/riskSessions/{tradingDate}` completely unchanged and untouched.
+ * 6. Mirrors active legacy locks to `users/{userId}/accountRiskSessions/{accountId}__{tradingDate}` preserving field values verbatim without fabricated fallbacks.
  * 7. Strictly idempotent: schemaVersion >= 2 results in 0 writes.
  */
 export async function migrateUserRiskData(
@@ -133,7 +139,7 @@ export async function migrateUserRiskData(
           now
         );
 
-        // STEP 4: ISSUE WRITES (READS COMPLETED)
+        // STEP 4: ISSUE WRITES (ALL READS COMPLETED BEFORE ANY WRITE)
         tx.set(accountConfigRef, reconciledConfig);
         tx.set(legacyConfigRef, reconciledConfig);
 
@@ -168,8 +174,10 @@ export async function migrateUserRiskData(
   }
 
   // --------------------------------------------------------------------------
-  // PATH B: Mock Store / Testing Execution
+  // PATH B: Transactional Mock Store Execution
   // --------------------------------------------------------------------------
+
+  // STEP 1: READ ALL REQUIRED DOCUMENTS
   const migrationData = migrationMockStore.get(migrationDocPath);
   if (migrationData && typeof migrationData.schemaVersion === 'number' && migrationData.schemaVersion >= 2) {
     return {
@@ -182,7 +190,10 @@ export async function migrateUserRiskData(
 
   const legacyRaw = migrationMockStore.get(legacyConfigDocPath) || null;
   const accountRaw = migrationMockStore.get(accountConfigDocPath) || null;
+  const legacySession = migrationMockStore.get(legacySessionDocPath) as RiskSession | null;
+  const existingAccountSession = migrationMockStore.get(accountSessionDocPath) as RiskSession | null;
 
+  // STEP 2: RECONCILE CONFIGURATIONS
   const { reconciledConfig, errors } = reconcileRiskConfigs(legacyRaw, accountRaw, now);
   if (!reconciledConfig) {
     return {
@@ -192,9 +203,7 @@ export async function migrateUserRiskData(
     };
   }
 
-  const legacySession = migrationMockStore.get(legacySessionDocPath) as RiskSession | null;
-  const existingAccountSession = migrationMockStore.get(accountSessionDocPath) as RiskSession | null;
-
+  // STEP 3: EVALUATE LOCK MIRRORING
   const { shouldMirror, mirroredSession } = evaluateLockMirroring(
     legacySession,
     existingAccountSession,
@@ -205,12 +214,13 @@ export async function migrateUserRiskData(
     now
   );
 
-  // Write reconciled state to mock store
-  migrationMockStore.set(accountConfigDocPath, JSON.parse(JSON.stringify(reconciledConfig)));
-  migrationMockStore.set(legacyConfigDocPath, JSON.parse(JSON.stringify(reconciledConfig)));
+  // STEP 4: STAGE ALL PROPOSED WRITES IN A TRANSACTION STAGING MAP
+  const stagedWrites = new Map<string, any>();
+  stagedWrites.set(accountConfigDocPath, JSON.parse(JSON.stringify(reconciledConfig)));
+  stagedWrites.set(legacyConfigDocPath, JSON.parse(JSON.stringify(reconciledConfig)));
 
   if (shouldMirror && mirroredSession) {
-    migrationMockStore.set(accountSessionDocPath, JSON.parse(JSON.stringify(mirroredSession)));
+    stagedWrites.set(accountSessionDocPath, JSON.parse(JSON.stringify(mirroredSession)));
   }
 
   const migrationState = {
@@ -218,7 +228,25 @@ export async function migrateUserRiskData(
     migratedAt: now.toISOString(),
     accountId,
   };
-  migrationMockStore.set(migrationDocPath, migrationState);
+  stagedWrites.set(migrationDocPath, migrationState);
+
+  // SIMULATE TRANSACTION FAILURE IF INJECTED (Verifies atomic rollback & zero partial writes)
+  if (mockTransactionFailureInjector) {
+    try {
+      mockTransactionFailureInjector();
+    } catch (injErr: any) {
+      return {
+        success: false,
+        schemaVersion: 0,
+        errors: [`TRANSACTION_ABORTED: ${injErr?.message || String(injErr)}`],
+      };
+    }
+  }
+
+  // COMMIT PHASE: Apply staged writes atomically to migrationMockStore
+  for (const [path, val] of stagedWrites.entries()) {
+    migrationMockStore.set(path, val);
+  }
 
   return {
     success: true,
@@ -231,12 +259,69 @@ export async function migrateUserRiskData(
 }
 
 /**
+ * Validates whether a dailyLossLimit or maxLoss numeric value satisfies all strict limit rules:
+ * - Finite number, > 0, >= 500, and in increments of 500.
+ */
+export function isValidLossLimit(val: any): boolean {
+  if (typeof val !== 'number' || isNaN(val) || !isFinite(val)) {
+    return false;
+  }
+  return val >= 500 && val % 500 === 0;
+}
+
+/**
+ * Resolves effective dailyLossLimit with alias precedence:
+ * 1. Selects valid `dailyLossLimit` first.
+ * 2. If invalid or absent, selects valid `maxLoss`.
+ * 3. Otherwise returns approved default (`DEFAULT_RISK_CONFIG.dailyLossLimit`).
+ */
+export function resolveLossLimit(raw: any): number {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return DEFAULT_RISK_CONFIG.dailyLossLimit;
+  }
+
+  if (isValidLossLimit(raw.dailyLossLimit)) {
+    return raw.dailyLossLimit;
+  }
+
+  if (isValidLossLimit(raw.maxLoss)) {
+    return raw.maxLoss;
+  }
+
+  return DEFAULT_RISK_CONFIG.dailyLossLimit;
+}
+
+/**
+ * Normalizes a raw config object by applying alias precedence to set `dailyLossLimit` and removing `maxLoss`.
+ */
+export function normalizeConfigObject(raw: any): any {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return raw;
+  const clone = { ...raw };
+  const effectiveLimit = resolveLossLimit(clone);
+  clone.dailyLossLimit = effectiveLimit;
+  delete clone.maxLoss;
+  return clone;
+}
+
+/**
+ * Parses raw `updatedAt` string from unvalidated input doc.
+ * Returns timestamp number in ms if valid ISO string, or null if missing/invalid.
+ */
+export function parseRawTimestamp(raw: any): number | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const ts = raw.updatedAt;
+  if (typeof ts !== 'string' || !ts.trim()) return null;
+  const ms = new Date(ts).getTime();
+  return isNaN(ms) ? null : ms;
+}
+
+/**
  * Reconciles legacy vs account-level risk configurations.
  * Rules:
- * 1. Alias `maxLoss` to `dailyLossLimit` if `dailyLossLimit` is absent.
- * 2. Validate legacy and account configs using `validateRiskConfig`.
- * 3. Timestamp comparison: Highest valid `updatedAt` wins.
- * 4. Equal / missing timestamps: Account-level config takes precedence.
+ * 1. Extract original raw timestamp validity before running validation.
+ * 2. Select valid `dailyLossLimit` first; fallback to valid `maxLoss`; fallback to default limit.
+ * 3. Timestamp precedence: Highest valid original `updatedAt` wins.
+ * 4. Equal or missing timestamps: Account-level config takes precedence.
  * 5. Sanitize document completely before returning.
  */
 export function reconcileRiskConfigs(
@@ -244,9 +329,13 @@ export function reconcileRiskConfigs(
   accountRaw: any,
   now: Date
 ): { reconciledConfig?: RiskConfig; errors?: string[] } {
-  // Normalize alias fallback for maxLoss -> dailyLossLimit
-  const prepLegacy = normalizeMaxLossAlias(legacyRaw);
-  const prepAccount = normalizeMaxLossAlias(accountRaw);
+  // Extract original raw timestamps BEFORE running validation that injects generated timestamps
+  const legacyTime = parseRawTimestamp(legacyRaw);
+  const accountTime = parseRawTimestamp(accountRaw);
+
+  // Normalize loss limit alias
+  const prepLegacy = normalizeConfigObject(legacyRaw);
+  const prepAccount = normalizeConfigObject(accountRaw);
 
   const legacyVal = prepLegacy ? validateRiskConfig(prepLegacy) : null;
   const accountVal = prepAccount ? validateRiskConfig(prepAccount) : null;
@@ -257,9 +346,6 @@ export function reconcileRiskConfigs(
   let chosen: RiskConfig | null = null;
 
   if (validLegacyConfig && validAccountConfig) {
-    const legacyTime = parseTimestamp(validLegacyConfig.updatedAt);
-    const accountTime = parseTimestamp(validAccountConfig.updatedAt);
-
     if (legacyTime !== null && accountTime !== null) {
       if (legacyTime > accountTime) {
         chosen = validLegacyConfig;
@@ -269,7 +355,10 @@ export function reconcileRiskConfigs(
       }
     } else if (legacyTime !== null) {
       chosen = validLegacyConfig;
+    } else if (accountTime !== null) {
+      chosen = validAccountConfig;
     } else {
+      // Both timestamps missing or invalid -> Account-level precedence
       chosen = validAccountConfig;
     }
   } else if (validAccountConfig) {
@@ -277,14 +366,14 @@ export function reconcileRiskConfigs(
   } else if (validLegacyConfig) {
     chosen = validLegacyConfig;
   } else {
-    // Default baseline if neither document exists or both are invalid
+    // Neither exists or both invalid -> baseline default config
     chosen = {
       ...DEFAULT_RISK_CONFIG,
       updatedAt: now.toISOString(),
     };
   }
 
-  // Final sanitization check
+  // Final sanitization pass
   const reval = validateRiskConfig(chosen);
   if (!reval.valid || !reval.sanitized) {
     return { errors: reval.errors };
@@ -298,32 +387,38 @@ export function reconcileRiskConfigs(
   return { reconciledConfig: finalConfig };
 }
 
-function normalizeMaxLossAlias(raw: any): any {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return raw;
-  const clone = { ...raw };
-  if (clone.dailyLossLimit === undefined && clone.maxLoss !== undefined) {
-    clone.dailyLossLimit = clone.maxLoss;
-    delete clone.maxLoss;
-  }
-  return clone;
-}
+/**
+ * Checks whether a risk session lock is active under exact Risk Engine lock-expiry semantics:
+ * 1. Must be locked (`state === 'LOCKED'` or `isBreached === true`).
+ * 2. Missing or null `lockUntil` means indefinite active lock.
+ * 3. An invalid non-null `lockUntil` (e.g. `'invalid-date'`) is NOT active.
+ * 4. Valid date string is active if `now.getTime() < lockUntilMs`.
+ */
+export function checkIsLockActive(session: RiskSession | null, now: Date): boolean {
+  if (!session) return false;
+  const isLocked = session.state === 'LOCKED' || session.isBreached === true;
+  if (!isLocked) return false;
 
-function parseTimestamp(ts?: string): number | null {
-  if (!ts) return null;
-  const parsed = new Date(ts).getTime();
-  return isNaN(parsed) ? null : parsed;
+  const rawLockUntil = session.lockUntil;
+  // Missing or null -> Indefinite active lock
+  if (rawLockUntil === null || rawLockUntil === undefined) {
+    return true;
+  }
+
+  // Non-null string -> parse timestamp
+  const lockUntilMs = new Date(rawLockUntil).getTime();
+  // Invalid non-null date string (NaN) -> NOT active!
+  if (isNaN(lockUntilMs)) {
+    return false;
+  }
+
+  // Active if current evaluation time is strictly BEFORE lockUntil expiration time
+  return now.getTime() < lockUntilMs;
 }
 
 /**
  * Determines whether the legacy risk session lock is active and should be mirrored.
- * Semantics:
- * A lock is active if:
- * 1. `state === 'LOCKED'` OR `isBreached === true`
- * 2. AND (`lockUntil` is missing/null [indefinite lock] OR `new Date(lockUntil).getTime() > now.getTime()`).
- *
- * Conflict resolution:
- * If an account-level risk session already exists and is active, preserve it.
- * If legacy session is active, mirror it to account-level risk session without inventing fields.
+ * Preserves the legacy session's existing fields and values verbatim when mirroring without fabricating fallbacks.
  */
 export function evaluateLockMirroring(
   legacySession: RiskSession | null,
@@ -333,58 +428,31 @@ export function evaluateLockMirroring(
   tradingDate: string,
   reconciledConfig: RiskConfig,
   now: Date
-): { shouldMirror: boolean; mirroredSession?: RiskSession & { accountId?: string } } {
+): { shouldMirror: boolean; mirroredSession?: Record<string, any> } {
   if (!legacySession) {
     return { shouldMirror: false };
   }
 
-  const isLegacyLocked = legacySession.state === 'LOCKED' || legacySession.isBreached === true;
-  if (!isLegacyLocked) {
-    return { shouldMirror: false };
-  }
-
-  const lockUntilMs = legacySession.lockUntil ? new Date(legacySession.lockUntil).getTime() : null;
-  const isLockActive = lockUntilMs === null || isNaN(lockUntilMs) || lockUntilMs > now.getTime();
-
-  if (!isLockActive) {
+  const isLegacyActive = checkIsLockActive(legacySession, now);
+  if (!isLegacyActive) {
     return { shouldMirror: false };
   }
 
   // Legacy lock is ACTIVE.
   // Check if existing account session is already active:
-  if (existingAccountSession) {
-    const isAccountLocked =
-      existingAccountSession.state === 'LOCKED' || existingAccountSession.isBreached === true;
-    const accountLockUntilMs = existingAccountSession.lockUntil
-      ? new Date(existingAccountSession.lockUntil).getTime()
-      : null;
-    const isAccountActive =
-      isAccountLocked &&
-      (accountLockUntilMs === null || isNaN(accountLockUntilMs) || accountLockUntilMs > now.getTime());
-
-    if (isAccountActive) {
-      // Existing account session is already locked and active — do not overwrite active lock
-      return { shouldMirror: false };
-    }
+  if (existingAccountSession && checkIsLockActive(existingAccountSession, now)) {
+    // Existing account session is already active — preserve it without overwriting
+    return { shouldMirror: false };
   }
 
-  // Mirror legacy active lock to account risk session without inventing extra fields
-  const mirroredSession: RiskSession & { accountId?: string } = {
-    tradingDate: legacySession.tradingDate || tradingDate,
+  // Preserve the legacy session's existing fields and values verbatim when mirroring!
+  // Do NOT fabricate fallback P&L, timestamps, reasons, or thresholds.
+  // Add only fields required by the established account-session schema.
+  const mirroredSession: Record<string, any> = {
+    ...legacySession,
     userId,
     accountId,
-    state: legacySession.state || 'LOCKED',
-    isBreached: legacySession.isBreached ?? true,
-    lockedAt: legacySession.lockedAt || now.toISOString(),
-    lockUntil: legacySession.lockUntil ?? null,
-    currentPnl: legacySession.currentPnl ?? 0,
-    realisedPnl: legacySession.realisedPnl ?? 0,
-    unrealisedPnl: legacySession.unrealisedPnl ?? 0,
-    lossLimit: legacySession.lossLimit ?? reconciledConfig.dailyLossLimit,
-    warningThreshold1: legacySession.warningThreshold1 ?? reconciledConfig.warningThreshold1,
-    warningThreshold2: legacySession.warningThreshold2 ?? reconciledConfig.warningThreshold2,
-    lastEvaluatedAt: legacySession.lastEvaluatedAt || now.toISOString(),
-    reason: legacySession.reason || 'Daily loss limit breached (Mirrored)',
+    tradingDate: legacySession.tradingDate || tradingDate,
     updatedAt: now.toISOString(),
   };
 

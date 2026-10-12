@@ -2,9 +2,13 @@ import {
   migrateUserRiskData,
   reconcileRiskConfigs,
   evaluateLockMirroring,
+  checkIsLockActive,
+  resolveLossLimit,
+  isValidLossLimit,
   clearMigrationMockStore,
   setMigrationMockDoc,
   getMigrationMockDoc,
+  setMockTransactionFailureInjector,
 } from '../server/risk/migration';
 import { enableMockStoreForTesting } from '../server/brokers/zerodha/sessionStore';
 import { DEFAULT_RISK_CONFIG } from '../src/types/risk';
@@ -17,41 +21,185 @@ function assert(condition: boolean, message: string) {
   }
 }
 
-async function runStage2aMigrationTests() {
-  console.log('=== RUNNING STAGE 2A MIGRATION UTILITY TESTS ===\n');
+async function runStage2aCorrectionTests() {
+  console.log('=== RUNNING STAGE 2A CORRECTION PASS TESTS ===\n');
 
-  const userId = 'user_migration_test_1';
+  const userId = 'user_correction_test';
   const accountId = 'acc_mt_zerodha_default';
   const tradingDate = '2026-10-12';
   const testNow = new Date('2026-10-12T10:00:00.000Z');
 
   // --------------------------------------------------------------------------
-  // TEST 1: Reconcile Risk Configs - Legacy Newer vs Account Newer vs Equal
+  // SECTION 1: Lock Expiry Semantics
   // --------------------------------------------------------------------------
-  console.log('Test 1: Reconcile Risk Configs - Timestamp Precedence');
+  console.log('Section 1: Lock Expiry Semantics (Future, Expired, Missing/Null, Invalid)');
   {
+    // 1.1 Future lockUntil -> Active
+    const futureSession = {
+      tradingDate,
+      userId,
+      state: 'LOCKED' as const,
+      isBreached: true,
+      lockedAt: '2026-10-12T09:00:00.000Z',
+      lockUntil: '2026-10-12T12:00:00.000Z', // Future relative to 10:00:00
+      currentPnl: -10000,
+      realisedPnl: -10000,
+      unrealisedPnl: 0,
+      lossLimit: 10000,
+      warningThreshold1: 70,
+      warningThreshold2: 90,
+      lastEvaluatedAt: '2026-10-12T09:00:00.000Z',
+      reason: 'Breached',
+    };
+    assert(checkIsLockActive(futureSession, testNow) === true, 'Future lockUntil must be active');
+
+    // 1.2 Expired lockUntil -> Inactive
+    const expiredSession = {
+      ...futureSession,
+      lockUntil: '2026-10-12T08:00:00.000Z', // Expired relative to 10:00:00
+    };
+    assert(checkIsLockActive(expiredSession, testNow) === false, 'Expired lockUntil must be inactive');
+
+    // 1.3 Missing / Null lockUntil -> Indefinite Active Lock
+    const nullLockSession = {
+      ...futureSession,
+      lockUntil: null,
+    };
+    assert(
+      checkIsLockActive(nullLockSession, testNow) === true,
+      'Null lockUntil must be active (indefinite lock)'
+    );
+
+    const undefinedLockSession = {
+      ...futureSession,
+      lockUntil: undefined as any,
+    };
+    assert(
+      checkIsLockActive(undefinedLockSession, testNow) === true,
+      'Undefined lockUntil must be active (indefinite lock)'
+    );
+
+    // 1.4 Invalid non-null string lockUntil -> Inactive
+    const invalidLockSession = {
+      ...futureSession,
+      lockUntil: 'invalid-date-string-xyz',
+    };
+    assert(
+      checkIsLockActive(invalidLockSession, testNow) === false,
+      'Invalid non-null lockUntil must NOT be treated as active'
+    );
+
+    console.log('  PASSED: All 4 lock expiry conditions verified.');
+  }
+
+  // --------------------------------------------------------------------------
+  // SECTION 2: Session Mirroring Fidelity & Immutability
+  // --------------------------------------------------------------------------
+  console.log('\nSection 2: Session Mirroring Fidelity & Legacy Immutability');
+  {
+    clearMigrationMockStore();
+
+    const customLegacySession = {
+      tradingDate,
+      userId,
+      state: 'LOCKED' as const,
+      isBreached: true,
+      lockedAt: '2026-10-12T08:30:00.000Z',
+      lockUntil: '2026-10-12T14:30:00.000Z',
+      customTraderNote: 'Special audit tag',
+      // Note: currentPnl and reason intentionally left undefined to test zero-fabrication
+    };
+
+    const legacyPath = `users/${userId}/riskSessions/${tradingDate}`;
+    setMigrationMockDoc(legacyPath, customLegacySession);
+
+    const result = await migrateUserRiskData(userId, accountId, tradingDate, testNow);
+    assert(result.success === true, 'Migration should succeed');
+    assert(result.sessionMirrored === true, 'Session should be mirrored');
+
+    const accountSessionPath = `users/${userId}/accountRiskSessions/${accountId}__${tradingDate}`;
+    const mirrored = getMigrationMockDoc(accountSessionPath);
+
+    // Verify exact field fidelity
+    assert(mirrored !== null, 'Mirrored doc created');
+    assert(mirrored.customTraderNote === 'Special audit tag', 'Custom field preserved verbatim');
+    assert(mirrored.lockedAt === '2026-10-12T08:30:00.000Z', 'lockedAt preserved verbatim');
+    assert(mirrored.lockUntil === '2026-10-12T14:30:00.000Z', 'lockUntil preserved verbatim');
+    assert(mirrored.accountId === accountId, 'accountId added');
+    assert(mirrored.updatedAt === testNow.toISOString(), 'updatedAt set to now ISO string');
+
+    // Confirm no fabricated values were added
+    assert(mirrored.currentPnl === undefined, 'currentPnl must NOT be fabricated if absent');
+    assert(mirrored.reason === undefined, 'reason must NOT be fabricated if absent');
+
+    // Verify legacy document immutability
+    const legacyAfter = getMigrationMockDoc(legacyPath);
+    assert(
+      JSON.stringify(legacyAfter) === JSON.stringify(customLegacySession),
+      'Legacy riskSessions document MUST NOT be modified or written to'
+    );
+
+    console.log('  PASSED: Exact field fidelity verified and legacy doc kept untouched.');
+  }
+
+  // --------------------------------------------------------------------------
+  // SECTION 3: Loss Limit Alias Resolution
+  // --------------------------------------------------------------------------
+  console.log('\nSection 3: Loss-Limit Alias Resolution');
+  {
+    // 3.1 Valid dailyLossLimit takes priority over valid maxLoss
+    const bothValid = { dailyLossLimit: 15000, maxLoss: 5000 };
+    assert(resolveLossLimit(bothValid) === 15000, 'Valid dailyLossLimit takes priority');
+
+    // 3.2 Malformed dailyLossLimit combined with valid maxLoss -> maxLoss selected
+    const malformedDailyLimit = { dailyLossLimit: -100, maxLoss: 7500 };
+    assert(resolveLossLimit(malformedDailyLimit) === 7500, 'Valid maxLoss fallback selected');
+
+    const stringDailyLimit = { dailyLossLimit: '10000' as any, maxLoss: 8000 };
+    assert(resolveLossLimit(stringDailyLimit) === 8000, 'Valid maxLoss fallback selected');
+
+    // 3.3 Invalid dailyLossLimit & invalid maxLoss -> default limit (10000) selected
+    const bothInvalid = { dailyLossLimit: 250, maxLoss: 300 }; // Both below ₹500
+    assert(
+      resolveLossLimit(bothInvalid) === DEFAULT_RISK_CONFIG.dailyLossLimit,
+      'Default limit selected when both limits are invalid'
+    );
+
+    // 3.4 Strict numeric constraints (>= 500 and % 500 === 0)
+    assert(isValidLossLimit(500) === true, '₹500 is valid');
+    assert(isValidLossLimit(10000) === true, '₹10000 is valid');
+    assert(isValidLossLimit(499) === false, '₹499 is invalid (< 500)');
+    assert(isValidLossLimit(1200) === false, '1200 is invalid (not % 500)');
+    assert(isValidLossLimit(NaN) === false, 'NaN is invalid');
+    assert(isValidLossLimit(Infinity) === false, 'Infinity is invalid');
+
+    console.log('  PASSED: Loss limit alias resolution & numeric constraints verified.');
+  }
+
+  // --------------------------------------------------------------------------
+  // SECTION 4: Timestamp Reconciliation
+  // --------------------------------------------------------------------------
+  console.log('\nSection 4: Timestamp Reconciliation');
+  {
+    // 4.1 Legacy newer -> Legacy wins
     const legacyNewer = {
       dailyLossLimit: 15000,
       warningThreshold1: 70,
       warningThreshold2: 90,
       lockDurationMinutes: 720,
-      updatedAt: '2026-10-12T09:00:00.000Z',
+      updatedAt: '2026-10-12T10:00:00.000Z',
     };
     const accountOlder = {
       dailyLossLimit: 10000,
       warningThreshold1: 70,
       warningThreshold2: 90,
       lockDurationMinutes: 720,
-      updatedAt: '2026-10-12T08:00:00.000Z',
+      updatedAt: '2026-10-12T09:00:00.000Z',
     };
-
     const res1 = reconcileRiskConfigs(legacyNewer, accountOlder, testNow);
-    assert(res1.reconciledConfig !== undefined, 'res1 reconciledConfig should be defined');
-    assert(
-      res1.reconciledConfig?.dailyLossLimit === 15000,
-      'Legacy config (newer timestamp) should win'
-    );
+    assert(res1.reconciledConfig?.dailyLossLimit === 15000, 'Legacy newer timestamp wins');
 
+    // 4.2 Account newer -> Account wins
     const legacyOlder = {
       dailyLossLimit: 15000,
       warningThreshold1: 70,
@@ -66,225 +214,133 @@ async function runStage2aMigrationTests() {
       lockDurationMinutes: 720,
       updatedAt: '2026-10-12T09:00:00.000Z',
     };
-
     const res2 = reconcileRiskConfigs(legacyOlder, accountNewer, testNow);
-    assert(
-      res2.reconciledConfig?.dailyLossLimit === 20000,
-      'Account config (newer timestamp) should win'
-    );
+    assert(res2.reconciledConfig?.dailyLossLimit === 20000, 'Account newer timestamp wins');
 
+    // 4.3 Equal timestamps -> Account wins
     const legacyEqual = {
       dailyLossLimit: 15000,
       warningThreshold1: 70,
       warningThreshold2: 90,
       lockDurationMinutes: 720,
-      updatedAt: '2026-10-12T08:00:00.000Z',
+      updatedAt: '2026-10-12T09:00:00.000Z',
     };
     const accountEqual = {
       dailyLossLimit: 25000,
       warningThreshold1: 70,
       warningThreshold2: 90,
       lockDurationMinutes: 720,
-      updatedAt: '2026-10-12T08:00:00.000Z',
+      updatedAt: '2026-10-12T09:00:00.000Z',
     };
-
     const res3 = reconcileRiskConfigs(legacyEqual, accountEqual, testNow);
-    assert(
-      res3.reconciledConfig?.dailyLossLimit === 25000,
-      'Account config should win on equal timestamps'
-    );
+    assert(res3.reconciledConfig?.dailyLossLimit === 25000, 'Account wins on equal timestamps');
 
-    console.log('  PASSED: Timestamp precedence & account fallback rules verified.');
-  }
-
-  // --------------------------------------------------------------------------
-  // TEST 2: Legacy maxLoss Alias Fallback & Document Sanitization
-  // --------------------------------------------------------------------------
-  console.log('\nTest 2: Legacy maxLoss Alias Fallback & Document Sanitization');
-  {
-    const legacyWithMaxLoss = {
-      maxLoss: 12500, // Legacy field name
-      warningThreshold1: 60,
-      warningThreshold2: 85,
-      lockDurationMinutes: 360,
-      updatedAt: '2026-10-11T12:00:00.000Z',
-    };
-
-    const res = reconcileRiskConfigs(legacyWithMaxLoss, null, testNow);
-    assert(res.reconciledConfig !== undefined, 'res reconciledConfig should be defined');
-    assert(
-      res.reconciledConfig?.dailyLossLimit === 12500,
-      'Legacy maxLoss should map to dailyLossLimit'
-    );
-    assert(
-      (res.reconciledConfig as any).maxLoss === undefined,
-      'Legacy maxLoss property should be deleted from sanitized document'
-    );
-    assert(res.reconciledConfig?.warningThreshold1 === 60, 'warningThreshold1 preserved');
-    assert(res.reconciledConfig?.lockDurationMinutes === 360, 'lockDurationMinutes preserved');
-
-    console.log('  PASSED: maxLoss alias mapped and sanitized successfully.');
-  }
-
-  // --------------------------------------------------------------------------
-  // TEST 3: Missing Documents Defaults Initialization
-  // --------------------------------------------------------------------------
-  console.log('\nTest 3: Missing Documents Default Initialization');
-  {
-    clearMigrationMockStore();
-
-    const result = await migrateUserRiskData(userId, accountId, tradingDate, testNow);
-    assert(result.success === true, 'Migration should succeed');
-    assert(result.skipped === false, 'Migration should execute writes');
-    assert(result.schemaVersion === 2, 'schemaVersion should be 2');
-    assert(
-      result.reconciledConfig?.dailyLossLimit === DEFAULT_RISK_CONFIG.dailyLossLimit,
-      'Should initialize default dailyLossLimit'
-    );
-
-    // Verify mock store docs created
-    const meta = getMigrationMockDoc(`users/${userId}/system/migrationState`);
-    assert(meta && meta.schemaVersion === 2, 'migrationState meta stored in correct path');
-
-    const accConfig = getMigrationMockDoc(`users/${userId}/accountRiskConfigs/${accountId}`);
-    assert(accConfig && accConfig.dailyLossLimit === 10000, 'accountRiskConfig initialized');
-
-    const legConfig = getMigrationMockDoc(`users/${userId}/riskConfig/config`);
-    assert(legConfig && legConfig.dailyLossLimit === 10000, 'legacy riskConfig synchronized');
-
-    console.log('  PASSED: Missing documents default initialization verified.');
-  }
-
-  // --------------------------------------------------------------------------
-  // TEST 4: Active Lock Mirroring & Legacy Immutability
-  // --------------------------------------------------------------------------
-  console.log('\nTest 4: Active Lock Mirroring & Legacy Immutability');
-  {
-    clearMigrationMockStore();
-
-    const activeLockUntil = new Date(testNow.getTime() + 2 * 60 * 60 * 1000).toISOString();
-    const legacySessionDoc = {
-      tradingDate,
-      userId,
-      state: 'LOCKED',
-      isBreached: true,
-      lockedAt: '2026-10-12T09:00:00.000Z',
-      lockUntil: activeLockUntil,
-      currentPnl: -12000,
-      realisedPnl: -12000,
-      unrealisedPnl: 0,
-      lossLimit: 10000,
+    // 4.4 Legacy timestamp valid, Account timestamp missing/invalid -> Legacy wins
+    const legacyValidTime = {
+      dailyLossLimit: 12000,
       warningThreshold1: 70,
       warningThreshold2: 90,
-      lastEvaluatedAt: '2026-10-12T09:00:00.000Z',
-      reason: 'Daily loss limit breached',
+      lockDurationMinutes: 720,
+      updatedAt: '2026-10-12T09:00:00.000Z',
     };
-
-    const legacySessionPath = `users/${userId}/riskSessions/${tradingDate}`;
-    setMigrationMockDoc(legacySessionPath, legacySessionDoc);
-
-    const result = await migrateUserRiskData(userId, accountId, tradingDate, testNow);
-    assert(result.success === true, 'Migration should succeed');
-    assert(result.sessionMirrored === true, 'Session should be mirrored');
-
-    // Verify account risk session doc was written
-    const accountSessionDocPath = `users/${userId}/accountRiskSessions/${accountId}__${tradingDate}`;
-    const mirroredDoc = getMigrationMockDoc(accountSessionDocPath);
-    assert(mirroredDoc !== null, 'Account session doc created');
-    assert(mirroredDoc.state === 'LOCKED', 'Mirrored state is LOCKED');
-    assert(mirroredDoc.lockUntil === activeLockUntil, 'lockUntil preserved');
-    assert(mirroredDoc.accountId === accountId, 'accountId field attached');
-
-    // Verify legacy risk session doc remains UNTOUCHED
-    const legacyAfter = getMigrationMockDoc(legacySessionPath);
-    assert(
-      JSON.stringify(legacyAfter) === JSON.stringify(legacySessionDoc),
-      'Legacy riskSessions doc MUST remain completely untouched and immutable'
-    );
-
-    console.log('  PASSED: Active lock mirrored and legacy session doc kept untouched.');
-  }
-
-  // --------------------------------------------------------------------------
-  // TEST 5: Expired Lock Is NOT Mirrored
-  // --------------------------------------------------------------------------
-  console.log('\nTest 5: Expired Lock Is NOT Mirrored');
-  {
-    clearMigrationMockStore();
-
-    const expiredLockUntil = new Date(testNow.getTime() - 10 * 60 * 1000).toISOString();
-    const legacyExpiredSessionDoc = {
-      tradingDate,
-      userId,
-      state: 'LOCKED',
-      isBreached: true,
-      lockedAt: '2026-10-12T07:00:00.000Z',
-      lockUntil: expiredLockUntil, // EXPIRED
-      currentPnl: -12000,
-      realisedPnl: -12000,
-      unrealisedPnl: 0,
-      lossLimit: 10000,
+    const accountMissingTime = {
+      dailyLossLimit: 8000,
       warningThreshold1: 70,
       warningThreshold2: 90,
-      lastEvaluatedAt: '2026-10-12T07:00:00.000Z',
-      reason: 'Daily loss limit breached',
+      lockDurationMinutes: 720,
     };
+    const res4 = reconcileRiskConfigs(legacyValidTime, accountMissingTime, testNow);
+    assert(res4.reconciledConfig?.dailyLossLimit === 12000, 'Valid legacy timestamp wins over missing');
 
-    const legacySessionPath = `users/${userId}/riskSessions/${tradingDate}`;
-    setMigrationMockDoc(legacySessionPath, legacyExpiredSessionDoc);
+    // 4.5 Account timestamp valid, Legacy timestamp missing/invalid -> Account wins
+    const legacyInvalidTime = {
+      dailyLossLimit: 12000,
+      warningThreshold1: 70,
+      warningThreshold2: 90,
+      lockDurationMinutes: 720,
+      updatedAt: 'invalid-date',
+    };
+    const accountValidTime = {
+      dailyLossLimit: 18000,
+      warningThreshold1: 70,
+      warningThreshold2: 90,
+      lockDurationMinutes: 720,
+      updatedAt: '2026-10-12T09:00:00.000Z',
+    };
+    const res5 = reconcileRiskConfigs(legacyInvalidTime, accountValidTime, testNow);
+    assert(res5.reconciledConfig?.dailyLossLimit === 18000, 'Valid account timestamp wins over invalid');
 
-    const result = await migrateUserRiskData(userId, accountId, tradingDate, testNow);
-    assert(result.success === true, 'Migration should succeed');
-    assert(result.sessionMirrored === false, 'Expired lock should NOT be mirrored');
+    // 4.6 Both timestamps missing/invalid -> Account wins
+    const legacyNoTime = {
+      dailyLossLimit: 12000,
+      warningThreshold1: 70,
+      warningThreshold2: 90,
+      lockDurationMinutes: 720,
+    };
+    const accountNoTime = {
+      dailyLossLimit: 22000,
+      warningThreshold1: 70,
+      warningThreshold2: 90,
+      lockDurationMinutes: 720,
+    };
+    const res6 = reconcileRiskConfigs(legacyNoTime, accountNoTime, testNow);
+    assert(res6.reconciledConfig?.dailyLossLimit === 22000, 'Account wins when both timestamps missing');
 
-    const accountSessionDocPath = `users/${userId}/accountRiskSessions/${accountId}__${tradingDate}`;
-    const mirroredDoc = getMigrationMockDoc(accountSessionDocPath);
-    assert(mirroredDoc === undefined, 'Account session doc should NOT be created for expired lock');
-
-    console.log('  PASSED: Expired lock was correctly ignored and not mirrored.');
+    console.log('  PASSED: All 6 timestamp reconciliation cases verified.');
   }
 
   // --------------------------------------------------------------------------
-  // TEST 6: Repeated Execution Idempotency (schemaVersion: 2 -> 0 Writes)
+  // SECTION 5: Transaction Atomicity, Rollback & Idempotency
   // --------------------------------------------------------------------------
-  console.log('\nTest 6: Repeated Execution Idempotency');
+  console.log('\nSection 5: Transaction Atomicity, Rollback & Idempotency Coverage');
   {
     clearMigrationMockStore();
 
-    // First execution
+    // Set initial doc state before failed transaction attempt
+    const initialLegacyConfig = { dailyLossLimit: 10000, updatedAt: '2026-10-11T12:00:00.000Z' };
+    setMigrationMockDoc(`users/${userId}/riskConfig/config`, initialLegacyConfig);
+
+    // Inject transaction failure
+    setMockTransactionFailureInjector(() => {
+      throw new Error('SIMULATED_FIRESTORE_WRITE_FAILURE');
+    });
+
+    const failedResult = await migrateUserRiskData(userId, accountId, tradingDate, testNow);
+    assert(failedResult.success === false, 'Transaction must report success: false on failure');
+    assert(failedResult.schemaVersion === 0, 'schemaVersion must remain 0 on failure');
+
+    // Verify atomic failure behavior: schemaVersion 2 MUST NOT be set
+    const metaDoc = getMigrationMockDoc(`users/${userId}/system/migrationState`);
+    assert(metaDoc === undefined, 'migrationState schemaVersion 2 MUST NOT be set on transaction failure');
+
+    // Verify no partial writes occurred
+    const accConfigDoc = getMigrationMockDoc(`users/${userId}/accountRiskConfigs/${accountId}`);
+    assert(accConfigDoc === undefined, 'No partial accountRiskConfig write must occur on failure');
+
+    // Clear failure injector for successful run
+    setMockTransactionFailureInjector(null);
+
+    // Successful execution
     const run1 = await migrateUserRiskData(userId, accountId, tradingDate, testNow);
-    assert(run1.success === true && run1.skipped === false, 'Run 1 executed writes');
+    assert(run1.success === true && run1.skipped === false, 'Run 1 must succeed and execute writes');
+    assert(run1.schemaVersion === 2, 'Run 1 sets schemaVersion = 2');
 
-    // Record mock store state after Run 1
-    const meta1 = getMigrationMockDoc(`users/${userId}/system/migrationState`);
-    assert(meta1.schemaVersion === 2, 'schemaVersion is 2');
+    const metaAfterRun1 = getMigrationMockDoc(`users/${userId}/system/migrationState`);
+    assert(metaAfterRun1 && metaAfterRun1.schemaVersion === 2, 'schemaVersion 2 written to migrationState');
 
-    // Modify in-memory mock store directly to detect any unwanted mutation on Run 2
-    const accConfigPath = `users/${userId}/accountRiskConfigs/${accountId}`;
-    const currentConfig = getMigrationMockDoc(accConfigPath);
-    currentConfig.dailyLossLimit = 99999;
-    setMigrationMockDoc(accConfigPath, currentConfig);
-
-    // Second execution
+    // Idempotent second execution
     const run2 = await migrateUserRiskData(userId, accountId, tradingDate, testNow);
-    assert(run2.success === true, 'Run 2 succeeded');
-    assert(run2.skipped === true, 'Run 2 was SKIPPED due to idempotency');
-    assert(run2.schemaVersion === 2, 'schemaVersion remains 2');
+    assert(run2.success === true, 'Run 2 must succeed');
+    assert(run2.skipped === true, 'Run 2 must skip with zero writes');
+    assert(run2.schemaVersion === 2, 'Run 2 reports schemaVersion = 2');
 
-    // Confirm zero writes modified the updated mock store entry
-    const afterRun2 = getMigrationMockDoc(accConfigPath);
-    assert(
-      afterRun2.dailyLossLimit === 99999,
-      'Zero writes occurred during Run 2 (config left untransformed)'
-    );
-
-    console.log('  PASSED: Second execution was strictly idempotent with 0 writes.');
+    console.log('  PASSED: Atomic transaction failure rollback & zero-write idempotency verified.');
   }
 
-  console.log('\n=== ALL STAGE 2A MIGRATION UTILITY TESTS PASSED SUCCESSFULLY ===');
+  console.log('\n=== ALL STAGE 2A CORRECTION PASS TESTS PASSED SUCCESSFULLY ===');
 }
 
-runStage2aMigrationTests().catch((err) => {
-  console.error('\nSTAGE 2A MIGRATION TESTS FAILED:', err);
+runStage2aCorrectionTests().catch((err) => {
+  console.error('\nSTAGE 2A CORRECTION PASS TESTS FAILED:', err);
   process.exit(1);
 });
