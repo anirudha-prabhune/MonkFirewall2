@@ -89,7 +89,48 @@ async function runStage2aCorrectionTests() {
       'Invalid non-null lockUntil must NOT be treated as active'
     );
 
-    console.log('  PASSED: All 4 lock expiry conditions verified.');
+    // 1.5 Matching tradingDate -> Active
+    assert(
+      checkIsLockActive(futureSession, testNow, '2026-10-12') === true,
+      'Matching tradingDate must be active'
+    );
+
+    // 1.6 Mismatched tradingDate -> Inactive
+    assert(
+      checkIsLockActive(futureSession, testNow, '2026-10-13') === false,
+      'Mismatched tradingDate must NOT be treated as active'
+    );
+
+    // 1.7 Missing session tradingDate -> Active for expected tradingDate
+    const missingDateSession = {
+      ...futureSession,
+      tradingDate: undefined as any,
+    };
+    assert(
+      checkIsLockActive(missingDateSession, testNow, '2026-10-12') === true,
+      'Missing session tradingDate should be active for expected date'
+    );
+
+    // 1.8 Mismatched legacy session in evaluateLockMirroring -> NOT mirrored
+    const mismatchedLegacySession = {
+      ...futureSession,
+      tradingDate: '2026-10-11', // Mismatched date
+    };
+    const mirrorEvalRes = evaluateLockMirroring(
+      mismatchedLegacySession,
+      null,
+      userId,
+      accountId,
+      '2026-10-12', // Target date being migrated
+      DEFAULT_RISK_CONFIG,
+      testNow
+    );
+    assert(
+      mirrorEvalRes.shouldMirror === false,
+      'Mismatched legacy session date must NOT be mirrored'
+    );
+
+    console.log('  PASSED: All 8 lock expiry & date matching conditions verified.');
   }
 
   // --------------------------------------------------------------------------

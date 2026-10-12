@@ -389,13 +389,24 @@ export function reconcileRiskConfigs(
 
 /**
  * Checks whether a risk session lock is active under exact Risk Engine lock-expiry semantics:
- * 1. Must be locked (`state === 'LOCKED'` or `isBreached === true`).
- * 2. Missing or null `lockUntil` means indefinite active lock.
- * 3. An invalid non-null `lockUntil` (e.g. `'invalid-date'`) is NOT active.
- * 4. Valid date string is active if `now.getTime() < lockUntilMs`.
+ * 1. Requires session tradingDate to match expectedTradingDate (if supplied).
+ * 2. Must be locked (`state === 'LOCKED'` or `isBreached === true`).
+ * 3. Missing or null `lockUntil` means indefinite active lock.
+ * 4. An invalid non-null `lockUntil` (e.g. `'invalid-date'`) is NOT active.
+ * 5. Valid date string is active if `now.getTime() < lockUntilMs`.
  */
-export function checkIsLockActive(session: RiskSession | null, now: Date): boolean {
+export function checkIsLockActive(
+  session: RiskSession | null,
+  now: Date,
+  expectedTradingDate?: string
+): boolean {
   if (!session) return false;
+
+  // Enforce same-trading-date matching consistent with Risk Engine
+  if (expectedTradingDate && session.tradingDate && session.tradingDate !== expectedTradingDate) {
+    return false;
+  }
+
   const isLocked = session.state === 'LOCKED' || session.isBreached === true;
   if (!isLocked) return false;
 
@@ -418,7 +429,7 @@ export function checkIsLockActive(session: RiskSession | null, now: Date): boole
 
 /**
  * Determines whether the legacy risk session lock is active and should be mirrored.
- * Preserves the legacy session's existing fields and values verbatim when mirroring without fabricating fallbacks.
+ * Requires same tradingDate matching and preserves legacy session fields verbatim.
  */
 export function evaluateLockMirroring(
   legacySession: RiskSession | null,
@@ -433,15 +444,15 @@ export function evaluateLockMirroring(
     return { shouldMirror: false };
   }
 
-  const isLegacyActive = checkIsLockActive(legacySession, now);
+  const isLegacyActive = checkIsLockActive(legacySession, now, tradingDate);
   if (!isLegacyActive) {
     return { shouldMirror: false };
   }
 
-  // Legacy lock is ACTIVE.
-  // Check if existing account session is already active:
-  if (existingAccountSession && checkIsLockActive(existingAccountSession, now)) {
-    // Existing account session is already active — preserve it without overwriting
+  // Legacy lock is ACTIVE on tradingDate.
+  // Check if existing account session is already active on tradingDate:
+  if (existingAccountSession && checkIsLockActive(existingAccountSession, now, tradingDate)) {
+    // Existing account session is already active on tradingDate — preserve without overwriting
     return { shouldMirror: false };
   }
 
