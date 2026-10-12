@@ -38,8 +38,10 @@ export interface IsolatedTestToken {
 
 /**
  * Creates a single-use authorization token for isolated unit testing.
- * Strictly verifies caller authenticity via stack frame inspection and environment.
- * Cannot be called from production, CLI, or non-test files.
+ * Strictly verifies caller authenticity:
+ * 1. NODE_ENV must be 'test' (never production).
+ * 2. Immediate caller frame must strictly originate from /tests/ and cannot be application code.
+ * 3. Call chain must not contain application code (/server/ or /src/).
  */
 export function createIsolatedTestToken(): IsolatedTestToken {
   if (typeof process === 'undefined') {
@@ -52,16 +54,44 @@ export function createIsolatedTestToken(): IsolatedTestToken {
     throw new Error('ISOLATED_TEST_TOKEN_FORBIDDEN: Test token can only be minted when NODE_ENV=test.');
   }
 
-  // Caller stack frame inspection: must originate directly from tests/
+  // Caller stack frame inspection: immediate caller must be in /tests/, and no application code in call chain
   const stack = new Error().stack || '';
   const lines = stack.split('\n');
-  const callerLine = lines[2] || lines[1] || '';
-  const isFromTestFile =
-    (callerLine.includes('/tests/') || callerLine.includes('\\tests\\')) &&
-    !callerLine.includes('run-stage2a-migration');
+  let callerIndex = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].includes('createIsolatedTestToken')) {
+      callerIndex = i + 1;
+      break;
+    }
+  }
+  if (callerIndex === -1 || callerIndex >= lines.length) {
+    callerIndex = 2;
+  }
 
-  if (!isFromTestFile) {
-    throw new Error('ISOLATED_TEST_TOKEN_FORBIDDEN: Isolated test token can only be created from test files inside /tests/.');
+  const immediateCallerFrame = lines[callerIndex] || '';
+  const isImmediateTestFile =
+    (immediateCallerFrame.includes('/tests/') || immediateCallerFrame.includes('\\tests\\')) &&
+    !immediateCallerFrame.includes('run-stage2a-migration');
+
+  if (!isImmediateTestFile) {
+    throw new Error(
+      `ISOLATED_TEST_TOKEN_FORBIDDEN: Immediate caller must be in /tests/. Found: ${immediateCallerFrame.trim()}`
+    );
+  }
+
+  // Enforce no application code (/server/ or /src/) in the entire ancestor call chain
+  for (let i = callerIndex; i < lines.length; i++) {
+    const frame = lines[i];
+    if (
+      frame.includes('/server/') ||
+      frame.includes('\\server\\') ||
+      frame.includes('/src/') ||
+      frame.includes('\\src\\')
+    ) {
+      throw new Error(
+        `ISOLATED_TEST_TOKEN_FORBIDDEN: Call chain contains application code: ${frame.trim()}`
+      );
+    }
   }
 
   const token: IsolatedTestToken = Object.freeze({
@@ -301,19 +331,51 @@ export async function runAdminMigrationRunnerForIsolatedTesting(
     };
   }
 
-  // 3. Caller stack inspection: call site must be within /tests/
+  // 3. Caller stack inspection: immediate caller must be in /tests/, and no application code in call chain
   const stack = new Error().stack || '';
-  const isFromTestFile =
-    (stack.includes('/tests/') || stack.includes('\\tests\\')) &&
-    !stack.includes('node_modules');
-  if (!isFromTestFile) {
+  const lines = stack.split('\n');
+  let callerIndex = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].includes('runAdminMigrationRunnerForIsolatedTesting')) {
+      callerIndex = i + 1;
+      break;
+    }
+  }
+  if (callerIndex === -1 || callerIndex >= lines.length) {
+    callerIndex = 2;
+  }
+
+  const immediateCallerFrame = lines[callerIndex] || '';
+  const isImmediateTestFile =
+    (immediateCallerFrame.includes('/tests/') || immediateCallerFrame.includes('\\tests\\')) &&
+    !immediateCallerFrame.includes('run-stage2a-migration');
+
+  if (!isImmediateTestFile) {
     return {
       success: false,
       schemaVersion: 0,
       errors: [
-        'INVALID_TEST_CALLER: runAdminMigrationRunnerForIsolatedTesting can only be invoked from test suites in /tests/.',
+        `INVALID_TEST_CALLER: Immediate caller of runAdminMigrationRunnerForIsolatedTesting must be in /tests/. Found: ${immediateCallerFrame.trim()}`,
       ],
     };
+  }
+
+  for (let i = callerIndex; i < lines.length; i++) {
+    const frame = lines[i];
+    if (
+      frame.includes('/server/') ||
+      frame.includes('\\server\\') ||
+      frame.includes('/src/') ||
+      frame.includes('\\src\\')
+    ) {
+      return {
+        success: false,
+        schemaVersion: 0,
+        errors: [
+          `INVALID_TEST_CALLER: Call chain contains application code: ${frame.trim()}`,
+        ],
+      };
+    }
   }
 
   // 4. One-way burn in private module state (immutable to caller modification)

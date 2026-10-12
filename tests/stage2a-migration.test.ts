@@ -952,7 +952,40 @@ async function runStage2aSafetyCorrectionTests() {
     }
     assert(mintFailed, 'Cannot mint test token in production environment');
 
-    console.log('  PASSED: Isolated test token security (forgery, single-use, production blocking) verified.');
+    // 23.5: Legitimate indirect call through test helper within /tests/ succeeds
+    async function testHelperRunner(opts: any) {
+      const helperToken = createIsolatedTestToken();
+      return runAdminMigrationRunnerForIsolatedTesting(opts, helperToken);
+    }
+    const helperRes = await testHelperRunner({
+      userId,
+      accountId,
+      tradingDate,
+      now: testNow,
+      confirmWrite: true,
+      backupDir: './test_backups',
+    });
+    assert(!helperRes.dryRun && (helperRes as any).success === true, 'Indirect call through test helper within /tests/ succeeds');
+
+    // 23.6: Non-test caller outside /tests/ strictly rejected
+    const { execSync } = await import('child_process');
+    let nonTestCallerRejected = false;
+    try {
+      execSync(
+        `npx tsx -e "import { createIsolatedTestToken } from './scripts/run-stage2a-migration'; process.env.NODE_ENV = 'test'; createIsolatedTestToken();"`,
+        { stdio: 'pipe' }
+      );
+    } catch (err: any) {
+      nonTestCallerRejected = true;
+      const stderr = err.stderr ? err.stderr.toString() : '';
+      assert(
+        stderr.includes('ISOLATED_TEST_TOKEN_FORBIDDEN') && stderr.includes('Immediate caller must be in /tests/'),
+        'Non-test caller rejected by immediate caller stack check'
+      );
+    }
+    assert(nonTestCallerRejected, 'Calling createIsolatedTestToken from outside /tests/ must fail closed');
+
+    console.log('  PASSED: Isolated test token security (forgery, single-use, production blocking, helper delegation, and non-test rejection) verified.');
   }
 
   console.log('\n=== ALL STAGE 2A SAFETY CORRECTION & ADMIN RUNNER TESTS PASSED SUCCESSFULLY ===');
