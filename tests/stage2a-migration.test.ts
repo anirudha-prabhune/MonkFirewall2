@@ -101,14 +101,18 @@ async function runStage2aCorrectionTests() {
       'Mismatched tradingDate must NOT be treated as active'
     );
 
-    // 1.7 Missing session tradingDate -> Active for expected tradingDate
+    // 1.7 Missing session tradingDate -> Inactive when expectedTradingDate is supplied
     const missingDateSession = {
       ...futureSession,
       tradingDate: undefined as any,
     };
     assert(
-      checkIsLockActive(missingDateSession, testNow, '2026-10-12') === true,
-      'Missing session tradingDate should be active for expected date'
+      checkIsLockActive(missingDateSession, testNow, '2026-10-12') === false,
+      'Missing session tradingDate must be inactive when expectedTradingDate is supplied'
+    );
+    assert(
+      checkIsLockActive(missingDateSession, testNow) === true,
+      'Missing session tradingDate remains active when no expected date is supplied'
     );
 
     // 1.8 Mismatched legacy session in evaluateLockMirroring -> NOT mirrored
@@ -130,7 +134,26 @@ async function runStage2aCorrectionTests() {
       'Mismatched legacy session date must NOT be mirrored'
     );
 
-    console.log('  PASSED: All 8 lock expiry & date matching conditions verified.');
+    // 1.9 Missing date legacy session in evaluateLockMirroring -> NOT mirrored
+    const missingDateLegacySession = {
+      ...futureSession,
+      tradingDate: undefined as any,
+    };
+    const missingDateMirrorRes = evaluateLockMirroring(
+      missingDateLegacySession,
+      null,
+      userId,
+      accountId,
+      '2026-10-12',
+      DEFAULT_RISK_CONFIG,
+      testNow
+    );
+    assert(
+      missingDateMirrorRes.shouldMirror === false,
+      'Legacy session with missing tradingDate must NOT be mirrored when target date is supplied'
+    );
+
+    console.log('  PASSED: All 9 lock expiry & strict date matching conditions verified.');
   }
 
   // --------------------------------------------------------------------------

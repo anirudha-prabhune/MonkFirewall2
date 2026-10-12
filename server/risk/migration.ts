@@ -402,8 +402,9 @@ export function checkIsLockActive(
 ): boolean {
   if (!session) return false;
 
-  // Enforce same-trading-date matching consistent with Risk Engine
-  if (expectedTradingDate && session.tradingDate && session.tradingDate !== expectedTradingDate) {
+  // When expectedTradingDate is supplied, require session.tradingDate === expectedTradingDate.
+  // Rejects both mismatched and missing session dates.
+  if (expectedTradingDate !== undefined && session.tradingDate !== expectedTradingDate) {
     return false;
   }
 
@@ -463,7 +464,7 @@ export function evaluateLockMirroring(
     ...legacySession,
     userId,
     accountId,
-    tradingDate: legacySession.tradingDate || tradingDate,
+    tradingDate: legacySession.tradingDate,
     updatedAt: now.toISOString(),
   };
 
