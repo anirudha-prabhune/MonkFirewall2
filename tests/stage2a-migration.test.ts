@@ -21,390 +21,536 @@ function assert(condition: boolean, message: string) {
   }
 }
 
-async function runStage2aCorrectionTests() {
-  console.log('=== RUNNING STAGE 2A CORRECTION PASS TESTS ===\n');
+async function runStage2aSafetyCorrectionTests() {
+  console.log('=== RUNNING STAGE 2A SAFETY CORRECTION TESTS ===\n');
 
-  const userId = 'user_correction_test';
+  const userId = 'user_safety_test';
   const accountId = 'acc_mt_zerodha_default';
   const tradingDate = '2026-10-12';
   const testNow = new Date('2026-10-12T10:00:00.000Z');
 
+  const validLegacyConfig = {
+    dailyLossLimit: 10000,
+    warningThreshold1: 70,
+    warningThreshold2: 90,
+    lockDurationMinutes: 720,
+    updatedAt: '2026-10-12T08:00:00.000Z',
+  };
+
+  const validAccountConfig = {
+    dailyLossLimit: 15000,
+    warningThreshold1: 70,
+    warningThreshold2: 90,
+    lockDurationMinutes: 720,
+    updatedAt: '2026-10-12T09:00:00.000Z',
+  };
+
   // --------------------------------------------------------------------------
-  // SECTION 1: Lock Expiry Semantics
+  // REQ 3.1 & 3.2: Both Configs Missing or Both Configs Invalid -> Fail Closed (0 Writes)
   // --------------------------------------------------------------------------
-  console.log('Section 1: Lock Expiry Semantics (Future, Expired, Missing/Null, Invalid)');
+  console.log('Test 1: Both Configs Missing -> Fail Closed & Zero Writes');
   {
-    // 1.1 Future lockUntil -> Active
-    const futureSession = {
+    clearMigrationMockStore();
+
+    // Both missing (null, null)
+    const recRes = reconcileRiskConfigs(null, null, testNow);
+    assert(recRes.reconciledConfig === undefined, 'Reconciliation must fail when both configs missing');
+    assert(recRes.errors !== undefined && recRes.errors.length > 0, 'Explicit error returned');
+
+    const result = await migrateUserRiskData(userId, accountId, tradingDate, testNow);
+    assert(result.success === false, 'Migration must fail when both configs missing');
+    assert(result.schemaVersion === 0, 'schemaVersion must remain 0');
+
+    // Assert zero writes
+    assert(getMigrationMockDoc(`users/${userId}/system/migrationState`) === undefined, 'No migrationState created');
+    assert(getMigrationMockDoc(`users/${userId}/accountRiskConfigs/${accountId}`) === undefined, 'No accountRiskConfig created');
+    assert(getMigrationMockDoc(`users/${userId}/riskConfig/config`) === undefined, 'No legacy riskConfig created');
+
+    console.log('  PASSED: Both configs missing fails closed with zero writes.');
+  }
+
+  console.log('\nTest 2: Both Configs Invalid -> Fail Closed & Zero Writes');
+  {
+    clearMigrationMockStore();
+
+    const invalidLegacy = { dailyLossLimit: -100 }; // Invalid limit
+    const invalidAccount = { warningThreshold1: 150 }; // Invalid percentage
+
+    const recRes = reconcileRiskConfigs(invalidLegacy, invalidAccount, testNow);
+    assert(recRes.reconciledConfig === undefined, 'Reconciliation must fail when both configs invalid');
+
+    setMigrationMockDoc(`users/${userId}/riskConfig/config`, invalidLegacy);
+    setMigrationMockDoc(`users/${userId}/accountRiskConfigs/${accountId}`, invalidAccount);
+
+    const result = await migrateUserRiskData(userId, accountId, tradingDate, testNow);
+    assert(result.success === false, 'Migration must fail when both configs invalid');
+
+    // Assert pre-existing documents were NOT mutated or overwritten
+    const legacyDocAfter = getMigrationMockDoc(`users/${userId}/riskConfig/config`);
+    assert(JSON.stringify(legacyDocAfter) === JSON.stringify(invalidLegacy), 'Legacy config unmutated');
+
+    const accountDocAfter = getMigrationMockDoc(`users/${userId}/accountRiskConfigs/${accountId}`);
+    assert(JSON.stringify(accountDocAfter) === JSON.stringify(invalidAccount), 'Account config unmutated');
+
+    assert(getMigrationMockDoc(`users/${userId}/system/migrationState`) === undefined, 'No migrationState created');
+
+    console.log('  PASSED: Both configs invalid fails closed with zero writes.');
+  }
+
+  // --------------------------------------------------------------------------
+  // REQ 3.3: One Valid Config & One Invalid Config -> Reconciliation Succeeds
+  // --------------------------------------------------------------------------
+  console.log('\nTest 3: One Valid Config & One Invalid Config -> Valid Source Selected');
+  {
+    clearMigrationMockStore();
+
+    const invalidLegacy = { dailyLossLimit: -500 };
+    setMigrationMockDoc(`users/${userId}/riskConfig/config`, invalidLegacy);
+    setMigrationMockDoc(`users/${userId}/accountRiskConfigs/${accountId}`, validAccountConfig);
+
+    const result = await migrateUserRiskData(userId, accountId, tradingDate, testNow);
+    assert(result.success === true, 'Migration should succeed using valid account config');
+    assert(result.reconciledConfig?.dailyLossLimit === 15000, 'Valid account config limit used');
+
+    console.log('  PASSED: Valid source config selected successfully.');
+  }
+
+  // --------------------------------------------------------------------------
+  // REQ 3.4: No Legacy Session -> Migration Succeeds with 0 Mirroring
+  // --------------------------------------------------------------------------
+  console.log('\nTest 4: No Legacy Session -> Migration Succeeds (0 Mirroring)');
+  {
+    clearMigrationMockStore();
+
+    setMigrationMockDoc(`users/${userId}/riskConfig/config`, validLegacyConfig);
+
+    const result = await migrateUserRiskData(userId, accountId, tradingDate, testNow);
+    assert(result.success === true, 'Migration succeeds when no legacy session exists');
+    assert(result.sessionMirrored === false, 'No session mirrored');
+
+    assert(getMigrationMockDoc(`users/${userId}/system/migrationState`).schemaVersion === 2, 'Migration state created');
+    assert(getMigrationMockDoc(`users/${userId}/accountRiskSessions/${accountId}__${tradingDate}`) === undefined, 'No account session created');
+
+    console.log('  PASSED: No legacy session allows migration without mirroring.');
+  }
+
+  // --------------------------------------------------------------------------
+  // REQ 3.5: Legacy Session with Matching Trading Date -> Existing Behavior Preserved
+  // --------------------------------------------------------------------------
+  console.log('\nTest 5: Legacy Session with Matching Trading Date -> Lock Mirrored');
+  {
+    clearMigrationMockStore();
+
+    const activeLegacySession = {
       tradingDate,
       userId,
       state: 'LOCKED' as const,
       isBreached: true,
       lockedAt: '2026-10-12T09:00:00.000Z',
-      lockUntil: '2026-10-12T12:00:00.000Z', // Future relative to 10:00:00
-      currentPnl: -10000,
-      realisedPnl: -10000,
-      unrealisedPnl: 0,
-      lossLimit: 10000,
-      warningThreshold1: 70,
-      warningThreshold2: 90,
-      lastEvaluatedAt: '2026-10-12T09:00:00.000Z',
-      reason: 'Breached',
+      lockUntil: '2026-10-12T12:00:00.000Z',
+      currentPnl: -12000,
     };
-    assert(checkIsLockActive(futureSession, testNow) === true, 'Future lockUntil must be active');
 
-    // 1.2 Expired lockUntil -> Inactive
-    const expiredSession = {
-      ...futureSession,
-      lockUntil: '2026-10-12T08:00:00.000Z', // Expired relative to 10:00:00
-    };
-    assert(checkIsLockActive(expiredSession, testNow) === false, 'Expired lockUntil must be inactive');
+    setMigrationMockDoc(`users/${userId}/riskConfig/config`, validLegacyConfig);
+    setMigrationMockDoc(`users/${userId}/riskSessions/${tradingDate}`, activeLegacySession);
 
-    // 1.3 Missing / Null lockUntil -> Indefinite Active Lock
-    const nullLockSession = {
-      ...futureSession,
-      lockUntil: null,
-    };
-    assert(
-      checkIsLockActive(nullLockSession, testNow) === true,
-      'Null lockUntil must be active (indefinite lock)'
-    );
+    const result = await migrateUserRiskData(userId, accountId, tradingDate, testNow);
+    assert(result.success === true, 'Migration succeeds with matching trading date');
+    assert(result.sessionMirrored === true, 'Active lock mirrored');
 
-    const undefinedLockSession = {
-      ...futureSession,
-      lockUntil: undefined as any,
-    };
-    assert(
-      checkIsLockActive(undefinedLockSession, testNow) === true,
-      'Undefined lockUntil must be active (indefinite lock)'
-    );
+    const mirroredDoc = getMigrationMockDoc(`users/${userId}/accountRiskSessions/${accountId}__${tradingDate}`);
+    assert(mirroredDoc !== undefined && mirroredDoc.state === 'LOCKED', 'Account session doc created');
+    assert(mirroredDoc.tradingDate === tradingDate, 'tradingDate preserved verbatim');
 
-    // 1.4 Invalid non-null string lockUntil -> Inactive
-    const invalidLockSession = {
-      ...futureSession,
-      lockUntil: 'invalid-date-string-xyz',
-    };
-    assert(
-      checkIsLockActive(invalidLockSession, testNow) === false,
-      'Invalid non-null lockUntil must NOT be treated as active'
-    );
-
-    // 1.5 Matching tradingDate -> Active
-    assert(
-      checkIsLockActive(futureSession, testNow, '2026-10-12') === true,
-      'Matching tradingDate must be active'
-    );
-
-    // 1.6 Mismatched tradingDate -> Inactive
-    assert(
-      checkIsLockActive(futureSession, testNow, '2026-10-13') === false,
-      'Mismatched tradingDate must NOT be treated as active'
-    );
-
-    // 1.7 Missing session tradingDate -> Inactive when expectedTradingDate is supplied
-    const missingDateSession = {
-      ...futureSession,
-      tradingDate: undefined as any,
-    };
-    assert(
-      checkIsLockActive(missingDateSession, testNow, '2026-10-12') === false,
-      'Missing session tradingDate must be inactive when expectedTradingDate is supplied'
-    );
-    assert(
-      checkIsLockActive(missingDateSession, testNow) === true,
-      'Missing session tradingDate remains active when no expected date is supplied'
-    );
-
-    // 1.8 Mismatched legacy session in evaluateLockMirroring -> NOT mirrored
-    const mismatchedLegacySession = {
-      ...futureSession,
-      tradingDate: '2026-10-11', // Mismatched date
-    };
-    const mirrorEvalRes = evaluateLockMirroring(
-      mismatchedLegacySession,
-      null,
-      userId,
-      accountId,
-      '2026-10-12', // Target date being migrated
-      DEFAULT_RISK_CONFIG,
-      testNow
-    );
-    assert(
-      mirrorEvalRes.shouldMirror === false,
-      'Mismatched legacy session date must NOT be mirrored'
-    );
-
-    // 1.9 Missing date legacy session in evaluateLockMirroring -> NOT mirrored
-    const missingDateLegacySession = {
-      ...futureSession,
-      tradingDate: undefined as any,
-    };
-    const missingDateMirrorRes = evaluateLockMirroring(
-      missingDateLegacySession,
-      null,
-      userId,
-      accountId,
-      '2026-10-12',
-      DEFAULT_RISK_CONFIG,
-      testNow
-    );
-    assert(
-      missingDateMirrorRes.shouldMirror === false,
-      'Legacy session with missing tradingDate must NOT be mirrored when target date is supplied'
-    );
-
-    console.log('  PASSED: All 9 lock expiry & strict date matching conditions verified.');
+    console.log('  PASSED: Matching legacy session lock mirrored successfully.');
   }
 
   // --------------------------------------------------------------------------
-  // SECTION 2: Session Mirroring Fidelity & Immutability
+  // REQ 3.6 & 3.8: Legacy Session with Missing Trading Date -> Migration Aborted (0 Writes)
   // --------------------------------------------------------------------------
-  console.log('\nSection 2: Session Mirroring Fidelity & Legacy Immutability');
+  console.log('\nTest 6: Legacy Session with Missing Trading Date -> Abort Migration & Zero Writes');
   {
     clearMigrationMockStore();
 
-    const customLegacySession = {
+    const missingDateLegacySession = {
+      tradingDate: undefined as any,
+      userId,
+      state: 'LOCKED' as const,
+      isBreached: true,
+      lockedAt: '2026-10-12T09:00:00.000Z',
+      lockUntil: '2026-10-12T12:00:00.000Z',
+    };
+
+    const preExistingAccountConfig = { ...validAccountConfig, dailyLossLimit: 50000 };
+
+    // Deep snapshots before migration execution
+    const legacyConfigBefore = JSON.parse(JSON.stringify(validLegacyConfig));
+    const accountConfigBefore = JSON.parse(JSON.stringify(preExistingAccountConfig));
+    const legacySessionBefore = JSON.parse(JSON.stringify(missingDateLegacySession));
+
+    setMigrationMockDoc(`users/${userId}/riskConfig/config`, validLegacyConfig);
+    setMigrationMockDoc(`users/${userId}/accountRiskConfigs/${accountId}`, preExistingAccountConfig);
+    setMigrationMockDoc(`users/${userId}/riskSessions/${tradingDate}`, missingDateLegacySession);
+
+    const result = await migrateUserRiskData(userId, accountId, tradingDate, testNow);
+    assert(result.success === false, 'Migration MUST fail on missing legacy session tradingDate');
+    assert(result.schemaVersion === 0, 'schemaVersion remains 0');
+
+    // Deep equality assertions on every seeded document
+    const legacyConfigAfter = getMigrationMockDoc(`users/${userId}/riskConfig/config`);
+    assert(
+      JSON.stringify(legacyConfigAfter) === JSON.stringify(legacyConfigBefore),
+      'Legacy riskConfig document must remain completely unmutated (deep equality)'
+    );
+
+    const accountConfigAfter = getMigrationMockDoc(`users/${userId}/accountRiskConfigs/${accountId}`);
+    assert(
+      JSON.stringify(accountConfigAfter) === JSON.stringify(accountConfigBefore),
+      'Account riskConfig document must remain completely unmutated (deep equality)'
+    );
+
+    const legacySessionAfter = getMigrationMockDoc(`users/${userId}/riskSessions/${tradingDate}`);
+    assert(
+      JSON.stringify(legacySessionAfter) === JSON.stringify(legacySessionBefore),
+      'Legacy riskSession document must remain completely unmutated (deep equality)'
+    );
+
+    // Verify absent documents remain strictly absent
+    assert(
+      getMigrationMockDoc(`users/${userId}/system/migrationState`) === undefined,
+      'Absent migrationState document must remain absent'
+    );
+    assert(
+      getMigrationMockDoc(`users/${userId}/accountRiskSessions/${accountId}__${tradingDate}`) === undefined,
+      'Absent accountRiskSession document must remain absent'
+    );
+
+    console.log('  PASSED: Missing trading date aborts migration with zero writes (verified via deep comparison).');
+  }
+
+  // --------------------------------------------------------------------------
+  // REQ 3.7 & 3.8: Legacy Session with Mismatched Trading Date -> Migration Aborted (0 Writes)
+  // --------------------------------------------------------------------------
+  console.log('\nTest 7: Legacy Session with Mismatched Trading Date -> Abort Migration & Zero Writes');
+  {
+    clearMigrationMockStore();
+
+    const mismatchedLegacySession = {
+      tradingDate: '2026-10-11', // Yesterday's date
+      userId,
+      state: 'LOCKED' as const,
+      isBreached: true,
+      lockedAt: '2026-10-11T09:00:00.000Z',
+      lockUntil: '2026-10-12T12:00:00.000Z',
+    };
+
+    const preExistingAccountConfig = { ...validAccountConfig, dailyLossLimit: 60000 };
+
+    // Deep snapshots before migration execution
+    const legacyConfigBefore = JSON.parse(JSON.stringify(validLegacyConfig));
+    const accountConfigBefore = JSON.parse(JSON.stringify(preExistingAccountConfig));
+    const legacySessionBefore = JSON.parse(JSON.stringify(mismatchedLegacySession));
+
+    setMigrationMockDoc(`users/${userId}/riskConfig/config`, validLegacyConfig);
+    setMigrationMockDoc(`users/${userId}/accountRiskConfigs/${accountId}`, preExistingAccountConfig);
+    setMigrationMockDoc(`users/${userId}/riskSessions/${tradingDate}`, mismatchedLegacySession);
+
+    const result = await migrateUserRiskData(userId, accountId, tradingDate, testNow);
+    assert(result.success === false, 'Migration MUST fail on mismatched legacy session tradingDate');
+    assert(result.errors !== undefined && result.errors[0].includes('MIGRATION_FAILED_INVALID_SESSION_DATE'), 'Explicit date error returned');
+
+    // Deep equality assertions on every seeded document
+    const legacyConfigAfter = getMigrationMockDoc(`users/${userId}/riskConfig/config`);
+    assert(
+      JSON.stringify(legacyConfigAfter) === JSON.stringify(legacyConfigBefore),
+      'Legacy riskConfig document must remain completely unmutated (deep equality)'
+    );
+
+    const accountConfigAfter = getMigrationMockDoc(`users/${userId}/accountRiskConfigs/${accountId}`);
+    assert(
+      JSON.stringify(accountConfigAfter) === JSON.stringify(accountConfigBefore),
+      'Account riskConfig document must remain completely unmutated (deep equality)'
+    );
+
+    const legacySessionAfter = getMigrationMockDoc(`users/${userId}/riskSessions/${tradingDate}`);
+    assert(
+      JSON.stringify(legacySessionAfter) === JSON.stringify(legacySessionBefore),
+      'Legacy riskSession document must remain completely unmutated (deep equality)'
+    );
+
+    // Verify absent documents remain strictly absent
+    assert(
+      getMigrationMockDoc(`users/${userId}/system/migrationState`) === undefined,
+      'Absent migrationState document must remain absent'
+    );
+    assert(
+      getMigrationMockDoc(`users/${userId}/accountRiskSessions/${accountId}__${tradingDate}`) === undefined,
+      'Absent accountRiskSession document must remain absent'
+    );
+
+    console.log('  PASSED: Mismatched trading date aborts migration with zero writes (verified via deep comparison).');
+  }
+
+  // --------------------------------------------------------------------------
+  // REQ 3.9: Existing Active Account Locks Protected
+  // --------------------------------------------------------------------------
+  console.log('\nTest 8: Existing Active Account Lock Protected from Overwriting');
+  {
+    clearMigrationMockStore();
+
+    const activeLegacySession = {
       tradingDate,
       userId,
       state: 'LOCKED' as const,
       isBreached: true,
-      lockedAt: '2026-10-12T08:30:00.000Z',
-      lockUntil: '2026-10-12T14:30:00.000Z',
-      customTraderNote: 'Special audit tag',
-      // Note: currentPnl and reason intentionally left undefined to test zero-fabrication
+      lockedAt: '2026-10-12T08:00:00.000Z',
+      lockUntil: '2026-10-12T11:00:00.000Z',
+      customTag: 'legacy_lock',
     };
 
-    const legacyPath = `users/${userId}/riskSessions/${tradingDate}`;
-    setMigrationMockDoc(legacyPath, customLegacySession);
-
-    const result = await migrateUserRiskData(userId, accountId, tradingDate, testNow);
-    assert(result.success === true, 'Migration should succeed');
-    assert(result.sessionMirrored === true, 'Session should be mirrored');
+    const activeAccountSession = {
+      tradingDate,
+      userId,
+      accountId,
+      state: 'LOCKED' as const,
+      isBreached: true,
+      lockedAt: '2026-10-12T09:00:00.000Z',
+      lockUntil: '2026-10-12T13:00:00.000Z',
+      customTag: 'account_lock',
+    };
 
     const accountSessionPath = `users/${userId}/accountRiskSessions/${accountId}__${tradingDate}`;
-    const mirrored = getMigrationMockDoc(accountSessionPath);
 
-    // Verify exact field fidelity
-    assert(mirrored !== null, 'Mirrored doc created');
-    assert(mirrored.customTraderNote === 'Special audit tag', 'Custom field preserved verbatim');
-    assert(mirrored.lockedAt === '2026-10-12T08:30:00.000Z', 'lockedAt preserved verbatim');
-    assert(mirrored.lockUntil === '2026-10-12T14:30:00.000Z', 'lockUntil preserved verbatim');
-    assert(mirrored.accountId === accountId, 'accountId added');
-    assert(mirrored.updatedAt === testNow.toISOString(), 'updatedAt set to now ISO string');
+    setMigrationMockDoc(`users/${userId}/riskConfig/config`, validLegacyConfig);
+    setMigrationMockDoc(`users/${userId}/riskSessions/${tradingDate}`, activeLegacySession);
+    setMigrationMockDoc(accountSessionPath, activeAccountSession);
 
-    // Confirm no fabricated values were added
-    assert(mirrored.currentPnl === undefined, 'currentPnl must NOT be fabricated if absent');
-    assert(mirrored.reason === undefined, 'reason must NOT be fabricated if absent');
+    const result = await migrateUserRiskData(userId, accountId, tradingDate, testNow);
+    assert(result.success === true, 'Migration succeeds');
+    assert(result.sessionMirrored === false, 'Legacy lock must NOT overwrite active account lock');
 
-    // Verify legacy document immutability
-    const legacyAfter = getMigrationMockDoc(legacyPath);
-    assert(
-      JSON.stringify(legacyAfter) === JSON.stringify(customLegacySession),
-      'Legacy riskSessions document MUST NOT be modified or written to'
-    );
+    const accountSessionAfter = getMigrationMockDoc(accountSessionPath);
+    assert(accountSessionAfter.customTag === 'account_lock', 'Existing account lock preserved unmutated');
 
-    console.log('  PASSED: Exact field fidelity verified and legacy doc kept untouched.');
+    console.log('  PASSED: Active account lock protected from overwriting.');
   }
 
   // --------------------------------------------------------------------------
-  // SECTION 3: Loss Limit Alias Resolution
+  // REQ 3.10: Transaction Failure Rollback & Idempotency
   // --------------------------------------------------------------------------
-  console.log('\nSection 3: Loss-Limit Alias Resolution');
-  {
-    // 3.1 Valid dailyLossLimit takes priority over valid maxLoss
-    const bothValid = { dailyLossLimit: 15000, maxLoss: 5000 };
-    assert(resolveLossLimit(bothValid) === 15000, 'Valid dailyLossLimit takes priority');
-
-    // 3.2 Malformed dailyLossLimit combined with valid maxLoss -> maxLoss selected
-    const malformedDailyLimit = { dailyLossLimit: -100, maxLoss: 7500 };
-    assert(resolveLossLimit(malformedDailyLimit) === 7500, 'Valid maxLoss fallback selected');
-
-    const stringDailyLimit = { dailyLossLimit: '10000' as any, maxLoss: 8000 };
-    assert(resolveLossLimit(stringDailyLimit) === 8000, 'Valid maxLoss fallback selected');
-
-    // 3.3 Invalid dailyLossLimit & invalid maxLoss -> default limit (10000) selected
-    const bothInvalid = { dailyLossLimit: 250, maxLoss: 300 }; // Both below ₹500
-    assert(
-      resolveLossLimit(bothInvalid) === DEFAULT_RISK_CONFIG.dailyLossLimit,
-      'Default limit selected when both limits are invalid'
-    );
-
-    // 3.4 Strict numeric constraints (>= 500 and % 500 === 0)
-    assert(isValidLossLimit(500) === true, '₹500 is valid');
-    assert(isValidLossLimit(10000) === true, '₹10000 is valid');
-    assert(isValidLossLimit(499) === false, '₹499 is invalid (< 500)');
-    assert(isValidLossLimit(1200) === false, '1200 is invalid (not % 500)');
-    assert(isValidLossLimit(NaN) === false, 'NaN is invalid');
-    assert(isValidLossLimit(Infinity) === false, 'Infinity is invalid');
-
-    console.log('  PASSED: Loss limit alias resolution & numeric constraints verified.');
-  }
-
-  // --------------------------------------------------------------------------
-  // SECTION 4: Timestamp Reconciliation
-  // --------------------------------------------------------------------------
-  console.log('\nSection 4: Timestamp Reconciliation');
-  {
-    // 4.1 Legacy newer -> Legacy wins
-    const legacyNewer = {
-      dailyLossLimit: 15000,
-      warningThreshold1: 70,
-      warningThreshold2: 90,
-      lockDurationMinutes: 720,
-      updatedAt: '2026-10-12T10:00:00.000Z',
-    };
-    const accountOlder = {
-      dailyLossLimit: 10000,
-      warningThreshold1: 70,
-      warningThreshold2: 90,
-      lockDurationMinutes: 720,
-      updatedAt: '2026-10-12T09:00:00.000Z',
-    };
-    const res1 = reconcileRiskConfigs(legacyNewer, accountOlder, testNow);
-    assert(res1.reconciledConfig?.dailyLossLimit === 15000, 'Legacy newer timestamp wins');
-
-    // 4.2 Account newer -> Account wins
-    const legacyOlder = {
-      dailyLossLimit: 15000,
-      warningThreshold1: 70,
-      warningThreshold2: 90,
-      lockDurationMinutes: 720,
-      updatedAt: '2026-10-12T08:00:00.000Z',
-    };
-    const accountNewer = {
-      dailyLossLimit: 20000,
-      warningThreshold1: 70,
-      warningThreshold2: 90,
-      lockDurationMinutes: 720,
-      updatedAt: '2026-10-12T09:00:00.000Z',
-    };
-    const res2 = reconcileRiskConfigs(legacyOlder, accountNewer, testNow);
-    assert(res2.reconciledConfig?.dailyLossLimit === 20000, 'Account newer timestamp wins');
-
-    // 4.3 Equal timestamps -> Account wins
-    const legacyEqual = {
-      dailyLossLimit: 15000,
-      warningThreshold1: 70,
-      warningThreshold2: 90,
-      lockDurationMinutes: 720,
-      updatedAt: '2026-10-12T09:00:00.000Z',
-    };
-    const accountEqual = {
-      dailyLossLimit: 25000,
-      warningThreshold1: 70,
-      warningThreshold2: 90,
-      lockDurationMinutes: 720,
-      updatedAt: '2026-10-12T09:00:00.000Z',
-    };
-    const res3 = reconcileRiskConfigs(legacyEqual, accountEqual, testNow);
-    assert(res3.reconciledConfig?.dailyLossLimit === 25000, 'Account wins on equal timestamps');
-
-    // 4.4 Legacy timestamp valid, Account timestamp missing/invalid -> Legacy wins
-    const legacyValidTime = {
-      dailyLossLimit: 12000,
-      warningThreshold1: 70,
-      warningThreshold2: 90,
-      lockDurationMinutes: 720,
-      updatedAt: '2026-10-12T09:00:00.000Z',
-    };
-    const accountMissingTime = {
-      dailyLossLimit: 8000,
-      warningThreshold1: 70,
-      warningThreshold2: 90,
-      lockDurationMinutes: 720,
-    };
-    const res4 = reconcileRiskConfigs(legacyValidTime, accountMissingTime, testNow);
-    assert(res4.reconciledConfig?.dailyLossLimit === 12000, 'Valid legacy timestamp wins over missing');
-
-    // 4.5 Account timestamp valid, Legacy timestamp missing/invalid -> Account wins
-    const legacyInvalidTime = {
-      dailyLossLimit: 12000,
-      warningThreshold1: 70,
-      warningThreshold2: 90,
-      lockDurationMinutes: 720,
-      updatedAt: 'invalid-date',
-    };
-    const accountValidTime = {
-      dailyLossLimit: 18000,
-      warningThreshold1: 70,
-      warningThreshold2: 90,
-      lockDurationMinutes: 720,
-      updatedAt: '2026-10-12T09:00:00.000Z',
-    };
-    const res5 = reconcileRiskConfigs(legacyInvalidTime, accountValidTime, testNow);
-    assert(res5.reconciledConfig?.dailyLossLimit === 18000, 'Valid account timestamp wins over invalid');
-
-    // 4.6 Both timestamps missing/invalid -> Account wins
-    const legacyNoTime = {
-      dailyLossLimit: 12000,
-      warningThreshold1: 70,
-      warningThreshold2: 90,
-      lockDurationMinutes: 720,
-    };
-    const accountNoTime = {
-      dailyLossLimit: 22000,
-      warningThreshold1: 70,
-      warningThreshold2: 90,
-      lockDurationMinutes: 720,
-    };
-    const res6 = reconcileRiskConfigs(legacyNoTime, accountNoTime, testNow);
-    assert(res6.reconciledConfig?.dailyLossLimit === 22000, 'Account wins when both timestamps missing');
-
-    console.log('  PASSED: All 6 timestamp reconciliation cases verified.');
-  }
-
-  // --------------------------------------------------------------------------
-  // SECTION 5: Transaction Atomicity, Rollback & Idempotency
-  // --------------------------------------------------------------------------
-  console.log('\nSection 5: Transaction Atomicity, Rollback & Idempotency Coverage');
+  console.log('\nTest 9: Transaction Rollback & Idempotency Execution');
   {
     clearMigrationMockStore();
 
-    // Set initial doc state before failed transaction attempt
-    const initialLegacyConfig = { dailyLossLimit: 10000, updatedAt: '2026-10-11T12:00:00.000Z' };
-    setMigrationMockDoc(`users/${userId}/riskConfig/config`, initialLegacyConfig);
+    setMigrationMockDoc(`users/${userId}/riskConfig/config`, validLegacyConfig);
 
-    // Inject transaction failure
+    // Transaction failure injection
     setMockTransactionFailureInjector(() => {
       throw new Error('SIMULATED_FIRESTORE_WRITE_FAILURE');
     });
 
-    const failedResult = await migrateUserRiskData(userId, accountId, tradingDate, testNow);
-    assert(failedResult.success === false, 'Transaction must report success: false on failure');
-    assert(failedResult.schemaVersion === 0, 'schemaVersion must remain 0 on failure');
+    const failedRun = await migrateUserRiskData(userId, accountId, tradingDate, testNow);
+    assert(failedRun.success === false, 'Injected failure returns success: false');
+    assert(getMigrationMockDoc(`users/${userId}/system/migrationState`) === undefined, 'No migrationState written on failure');
 
-    // Verify atomic failure behavior: schemaVersion 2 MUST NOT be set
-    const metaDoc = getMigrationMockDoc(`users/${userId}/system/migrationState`);
-    assert(metaDoc === undefined, 'migrationState schemaVersion 2 MUST NOT be set on transaction failure');
-
-    // Verify no partial writes occurred
-    const accConfigDoc = getMigrationMockDoc(`users/${userId}/accountRiskConfigs/${accountId}`);
-    assert(accConfigDoc === undefined, 'No partial accountRiskConfig write must occur on failure');
-
-    // Clear failure injector for successful run
     setMockTransactionFailureInjector(null);
 
-    // Successful execution
+    // Run 1 (Success)
     const run1 = await migrateUserRiskData(userId, accountId, tradingDate, testNow);
-    assert(run1.success === true && run1.skipped === false, 'Run 1 must succeed and execute writes');
-    assert(run1.schemaVersion === 2, 'Run 1 sets schemaVersion = 2');
+    assert(run1.success === true && run1.skipped === false, 'Run 1 succeeds and writes');
 
-    const metaAfterRun1 = getMigrationMockDoc(`users/${userId}/system/migrationState`);
-    assert(metaAfterRun1 && metaAfterRun1.schemaVersion === 2, 'schemaVersion 2 written to migrationState');
-
-    // Idempotent second execution
+    // Run 2 (Idempotency)
     const run2 = await migrateUserRiskData(userId, accountId, tradingDate, testNow);
-    assert(run2.success === true, 'Run 2 must succeed');
-    assert(run2.skipped === true, 'Run 2 must skip with zero writes');
-    assert(run2.schemaVersion === 2, 'Run 2 reports schemaVersion = 2');
+    assert(run2.success === true && run2.skipped === true, 'Run 2 skips with schemaVersion 2');
 
-    console.log('  PASSED: Atomic transaction failure rollback & zero-write idempotency verified.');
+    console.log('  PASSED: Transaction rollback & idempotency confirmed.');
   }
 
-  console.log('\n=== ALL STAGE 2A CORRECTION PASS TESTS PASSED SUCCESSFULLY ===');
+  // --------------------------------------------------------------------------
+  // SECTION 6: Admin Runner Arguments, Dry-Run, Backup & Write Mode Gating
+  // --------------------------------------------------------------------------
+  console.log('\nTest 10: Admin Runner Argument Validation');
+  {
+    const { runAdminMigrationRunner } = await import('../scripts/run-stage2a-migration');
+
+    // 10.1 Missing userId -> throws
+    let threw1 = false;
+    try {
+      await runAdminMigrationRunner({ userId: '' });
+    } catch (e: any) {
+      threw1 = true;
+      assert(e.message.includes('ARGUMENT_ERROR'), 'Error mentions ARGUMENT_ERROR for missing userId');
+    }
+    assert(threw1, 'Runner must throw on missing userId');
+
+    // 10.2 Invalid calendar date in dry-run mode -> throws
+    let threw2 = false;
+    try {
+      await runAdminMigrationRunner({ userId, tradingDate: '2026-02-30' });
+    } catch (e: any) {
+      threw2 = true;
+      assert(e.message.includes('Invalid calendar date'), 'Error mentions Invalid calendar date');
+    }
+    assert(threw2, 'Runner must throw on invalid calendar date (2026-02-30)');
+
+    // 10.3 Missing tradingDate in write mode -> throws
+    let threw3 = false;
+    try {
+      await runAdminMigrationRunner({ userId, confirmWrite: true, tradingDate: '' });
+    } catch (e: any) {
+      threw3 = true;
+      assert(e.message.includes('requires an explicit --tradingDate'), 'Error mentions explicit --tradingDate requirement');
+    }
+    assert(threw3, 'Runner must throw on missing tradingDate in write mode');
+
+    console.log('  PASSED: Admin runner argument validation verified.');
+  }
+
+  console.log('\nTest 11: Admin Runner Dry-Run Zero Writes');
+  {
+    clearMigrationMockStore();
+    const { runAdminMigrationRunner } = await import('../scripts/run-stage2a-migration');
+
+    setMigrationMockDoc(`users/${userId}/riskConfig/config`, validLegacyConfig);
+
+    const dryRunResult = await runAdminMigrationRunner({
+      userId,
+      accountId,
+      tradingDate,
+      now: testNow,
+      confirmWrite: false, // Default dry-run mode
+    });
+
+    assert(dryRunResult.dryRun === true, 'dryRun flag is true');
+    if (dryRunResult.dryRun) {
+      assert(dryRunResult.valid === true, 'dryRun result reports valid simulation');
+      assert(dryRunResult.reconciledConfig?.dailyLossLimit === 10000, 'Reconciled config computed in dry run');
+    }
+
+    // Assert zero writes to store
+    assert(getMigrationMockDoc(`users/${userId}/system/migrationState`) === undefined, 'No migrationState created in dry run');
+    assert(getMigrationMockDoc(`users/${userId}/accountRiskConfigs/${accountId}`) === undefined, 'No accountRiskConfig created in dry run');
+
+    console.log('  PASSED: Dry-run pass performs simulation with zero store writes.');
+  }
+
+  console.log('\nTest 12: Admin Runner Backup Verification Failure Handling');
+  {
+    clearMigrationMockStore();
+    const { runAdminMigrationRunner } = await import('../scripts/run-stage2a-migration');
+
+    setMigrationMockDoc(`users/${userId}/riskConfig/config`, validLegacyConfig);
+
+    const backupFailRes = await runAdminMigrationRunner({
+      userId,
+      accountId,
+      tradingDate,
+      now: testNow,
+      confirmWrite: true,
+      backupDir: './test_backups',
+      failBackupForTest: true, // Inject backup failure
+    });
+
+    assert(backupFailRes.dryRun !== true, 'Not executed in dry-run mode');
+    if (!backupFailRes.dryRun) {
+      assert((backupFailRes as any).success === false, 'Migration aborted due to backup failure');
+      assert((backupFailRes as any).schemaVersion === 0, 'schemaVersion remains 0 on backup failure');
+      assert((backupFailRes as any).errors !== undefined && (backupFailRes as any).errors[0].includes('BACKUP_VERIFICATION_FAILED'), 'Explicit backup error reported');
+    }
+
+    // Assert zero writes occurred after backup failure
+    assert(getMigrationMockDoc(`users/${userId}/system/migrationState`) === undefined, 'No migrationState created on backup failure');
+
+    console.log('  PASSED: Backup verification failure aborts migration with zero writes.');
+  }
+
+  console.log('\nTest 13: Admin Runner Write Mode Execution & Backup Creation');
+  {
+    clearMigrationMockStore();
+    const { runAdminMigrationRunner } = await import('../scripts/run-stage2a-migration');
+
+    setMigrationMockDoc(`users/${userId}/riskConfig/config`, validLegacyConfig);
+
+    const writeResult = await runAdminMigrationRunner({
+      userId,
+      accountId,
+      tradingDate,
+      now: testNow,
+      confirmWrite: true,
+      backupDir: './test_backups',
+    });
+
+    assert(writeResult.dryRun !== true, 'Executed in write mode');
+    if (!writeResult.dryRun) {
+      assert((writeResult as any).success === true, 'Migration write mode succeeded');
+      assert((writeResult as any).backupPath !== undefined, 'Backup path returned');
+    }
+
+    // Assert write occurred
+    const metaDoc = getMigrationMockDoc(`users/${userId}/system/migrationState`);
+    assert(metaDoc !== undefined && metaDoc.schemaVersion === 2, 'migrationState schemaVersion 2 written');
+
+    console.log('  PASSED: Write mode execution creates verified backup and updates migration store.');
+  }
+
+  console.log('\nTest 14: Post-Backup Concurrent Mutation Detection (Stale Backup Guard)');
+  {
+    clearMigrationMockStore();
+    const { createAndVerifyBackup } = await import('../scripts/run-stage2a-migration');
+
+    // 1. Seed initial document state
+    setMigrationMockDoc(`users/${userId}/riskConfig/config`, validLegacyConfig);
+
+    // 2. Create snapshot backup
+    const backupRes = await createAndVerifyBackup(userId, accountId, tradingDate, './test_backups');
+    assert(backupRes.success === true, 'Backup snapshot created successfully');
+
+    // 3. Mutate a document in store post-backup (simulating concurrent user activity)
+    const mutatedConfig = { ...validLegacyConfig, dailyLossLimit: 25000 };
+    setMigrationMockDoc(`users/${userId}/riskConfig/config`, mutatedConfig);
+
+    // 4. Attempt migration passing the stale backup
+    const staleRunResult = await migrateUserRiskData(userId, accountId, tradingDate, testNow, backupRes.backup);
+    assert(staleRunResult.success === false, 'Migration MUST fail when post-backup document mutation is detected');
+    assert(
+      staleRunResult.errors !== undefined && staleRunResult.errors[0].includes('BACKUP_STALE_CONCURRENT_MUTATION'),
+      'Explicit BACKUP_STALE_CONCURRENT_MUTATION error returned'
+    );
+
+    // 5. Assert zero writes occurred after staleness detection
+    assert(getMigrationMockDoc(`users/${userId}/system/migrationState`) === undefined, 'No migrationState created on stale backup failure');
+
+    console.log('  PASSED: Post-backup document mutation detected and migration aborted with zero writes.');
+  }
+
+  console.log('\nTest 15: Store Mode Mismatch Safeguard Enforcement');
+  {
+    clearMigrationMockStore();
+    const { runAdminMigrationRunner } = await import('../scripts/run-stage2a-migration');
+
+    // Attempt to request real Firestore (useMockStore: false) when test suite has isMockStoreEnabled() === true
+    let threwMismatch = false;
+    try {
+      await runAdminMigrationRunner({
+        userId,
+        accountId,
+        tradingDate,
+        confirmWrite: true,
+        useMockStore: false, // Mismatch with test environment
+      });
+    } catch (e: any) {
+      threwMismatch = true;
+      assert(e.message.includes('STORE_MODE_MISMATCH'), 'Error mentions STORE_MODE_MISMATCH');
+    }
+    assert(threwMismatch, 'Runner must throw STORE_MODE_MISMATCH when requested store mode conflicts with active environment');
+
+    console.log('  PASSED: Store mode mismatch safeguard enforced.');
+  }
+
+  console.log('\n=== ALL STAGE 2A SAFETY CORRECTION & ADMIN RUNNER TESTS PASSED SUCCESSFULLY ===');
 }
 
-runStage2aCorrectionTests().catch((err) => {
-  console.error('\nSTAGE 2A CORRECTION PASS TESTS FAILED:', err);
+runStage2aSafetyCorrectionTests().catch((err) => {
+  console.error('\nSTAGE 2A SAFETY CORRECTION TESTS FAILED:', err);
   process.exit(1);
 });

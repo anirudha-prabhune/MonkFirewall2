@@ -13,6 +13,13 @@ export interface MigrationResult {
   errors?: string[];
 }
 
+export interface LockMirroringResult {
+  valid: boolean;
+  shouldMirror: boolean;
+  mirroredSession?: Record<string, any>;
+  error?: string;
+}
+
 // In-memory store for unit testing when Firestore Admin SDK is not active or mock store is enabled
 const migrationMockStore = new Map<string, any>();
 let mockTransactionFailureInjector: (() => void) | null = null;
@@ -35,22 +42,53 @@ export function setMockTransactionFailureInjector(fn: (() => void) | null): void
 }
 
 /**
- * Stage 2A — Authoritative Risk Data Migration Utility (Corrected Pass)
+ * Stage 2A — Authoritative Risk Data Migration Utility (Fail-Closed Safety Pass)
  *
  * Responsibilities:
  * 1. Single atomic transaction reading all required docs before issuing writes.
  * 2. Migration completion metadata stored ONLY in `users/{userId}/system/migrationState` (schemaVersion: 2).
- * 3. Reconciles legacy vs account-level RiskConfigs using original timestamp precedence and maxLoss alias fallback.
+ * 3. Reconciles legacy vs account-level RiskConfigs. FAILS CLOSED with 0 writes if both configs are missing or invalid.
  * 4. Runs canonical validation (validateRiskConfig) and sanitizes documents before writing.
  * 5. Preserves `users/{userId}/riskSessions/{tradingDate}` completely unchanged and untouched.
- * 6. Mirrors active legacy locks to `users/{userId}/accountRiskSessions/{accountId}__{tradingDate}` preserving field values verbatim without fabricated fallbacks.
- * 7. Strictly idempotent: schemaVersion >= 2 results in 0 writes.
+ * 6. Mirrors active legacy locks to `users/{userId}/accountRiskSessions/{accountId}__{tradingDate}` preserving field values verbatim.
+ * 7. ABORTS ENTIRE MIGRATION WITH 0 WRITES if a present legacy session has a missing or mismatched tradingDate.
+ * 8. Strictly idempotent: schemaVersion >= 2 results in 0 writes.
  */
+/**
+ * Compares a live document snapshot against a pre-migration backup payload.
+ * Aborts migration if any document existence or content was modified post-backup.
+ */
+export function checkBackupDocumentStaleness(
+  docPath: string,
+  liveData: any,
+  liveExists: boolean,
+  expectedBackup?: any
+): string | null {
+  if (!expectedBackup || !Array.isArray(expectedBackup.documents)) return null;
+  const backupEntry = expectedBackup.documents.find((d: any) => d.path === docPath);
+  if (!backupEntry) return null;
+
+  if (backupEntry.exists !== liveExists) {
+    return `BACKUP_STALE_CONCURRENT_MUTATION: Document '${docPath}' existence changed from ${backupEntry.exists} at backup time to ${liveExists} at transaction execution time. Aborting migration writes.`;
+  }
+
+  if (liveExists) {
+    const backupStr = JSON.stringify(backupEntry.data || null);
+    const liveStr = JSON.stringify(liveData || null);
+    if (backupStr !== liveStr) {
+      return `BACKUP_STALE_CONCURRENT_MUTATION: Document '${docPath}' content was modified after backup creation. Aborting migration writes.`;
+    }
+  }
+
+  return null;
+}
+
 export async function migrateUserRiskData(
   userId: string,
   accountId = 'acc_mt_zerodha_default',
   tradingDate?: string,
-  now: Date = new Date()
+  now: Date = new Date(),
+  expectedBackup?: any
 ): Promise<MigrationResult> {
   if (!userId || !userId.trim()) {
     return { success: false, schemaVersion: 0, errors: ['userId is required'] };
@@ -95,6 +133,24 @@ export async function migrateUserRiskData(
           tx.get(accountSessionRef),
         ]);
 
+        // Backup Staleness Guard: Check for concurrent mutations post-backup
+        if (expectedBackup) {
+          const checkEntries = [
+            { path: migrationDocPath, data: migrationSnap.exists ? migrationSnap.data() : null, exists: migrationSnap.exists },
+            { path: legacyConfigDocPath, data: legacyConfigSnap.exists ? legacyConfigSnap.data() : null, exists: legacyConfigSnap.exists },
+            { path: accountConfigDocPath, data: accountConfigSnap.exists ? accountConfigSnap.data() : null, exists: accountConfigSnap.exists },
+            { path: legacySessionDocPath, data: legacySessionSnap.exists ? legacySessionSnap.data() : null, exists: legacySessionSnap.exists },
+            { path: accountSessionDocPath, data: accountSessionSnap.exists ? accountSessionSnap.data() : null, exists: accountSessionSnap.exists },
+          ];
+
+          for (const entry of checkEntries) {
+            const staleErr = checkBackupDocumentStaleness(entry.path, entry.data, entry.exists, expectedBackup);
+            if (staleErr) {
+              return { success: false, schemaVersion: 0, errors: [staleErr] };
+            }
+          }
+        }
+
         // Idempotency check: schemaVersion >= 2
         if (migrationSnap.exists) {
           const migData = migrationSnap.data();
@@ -108,7 +164,7 @@ export async function migrateUserRiskData(
           }
         }
 
-        // STEP 2: RECONCILE CONFIGURATIONS
+        // STEP 2: RECONCILE CONFIGURATIONS (FAILS CLOSED IF BOTH ARE MISSING / INVALID)
         const legacyRaw = legacyConfigSnap.exists ? legacyConfigSnap.data() : null;
         const accountRaw = accountConfigSnap.exists ? accountConfigSnap.data() : null;
 
@@ -117,7 +173,7 @@ export async function migrateUserRiskData(
           return {
             success: false,
             schemaVersion: 0,
-            errors: errors || ['Configuration reconciliation failed'],
+            errors: errors || ['Configuration reconciliation failed: both configs missing or invalid.'],
           };
         }
 
@@ -129,7 +185,7 @@ export async function migrateUserRiskData(
           ? (accountSessionSnap.data() as RiskSession)
           : null;
 
-        const { shouldMirror, mirroredSession } = evaluateLockMirroring(
+        const mirrorResult = evaluateLockMirroring(
           legacySession,
           existingAccountSession,
           cleanUserId,
@@ -138,6 +194,17 @@ export async function migrateUserRiskData(
           reconciledConfig,
           now
         );
+
+        if (!mirrorResult.valid) {
+          return {
+            success: false,
+            schemaVersion: 0,
+            errors: [mirrorResult.error || 'Legacy session date validation failed.'],
+          };
+        }
+
+        const shouldMirror = mirrorResult.shouldMirror;
+        const mirroredSession = mirrorResult.mirroredSession;
 
         // STEP 4: ISSUE WRITES (ALL READS COMPLETED BEFORE ANY WRITE)
         tx.set(accountConfigRef, reconciledConfig);
@@ -193,18 +260,36 @@ export async function migrateUserRiskData(
   const legacySession = migrationMockStore.get(legacySessionDocPath) as RiskSession | null;
   const existingAccountSession = migrationMockStore.get(accountSessionDocPath) as RiskSession | null;
 
-  // STEP 2: RECONCILE CONFIGURATIONS
+  // Backup Staleness Guard in Mock Execution
+  if (expectedBackup) {
+    const checkEntries = [
+      { path: migrationDocPath, data: migrationData, exists: migrationData !== undefined && migrationData !== null },
+      { path: legacyConfigDocPath, data: legacyRaw, exists: legacyRaw !== undefined && legacyRaw !== null },
+      { path: accountConfigDocPath, data: accountRaw, exists: accountRaw !== undefined && accountRaw !== null },
+      { path: legacySessionDocPath, data: legacySession, exists: legacySession !== undefined && legacySession !== null },
+      { path: accountSessionDocPath, data: existingAccountSession, exists: existingAccountSession !== undefined && existingAccountSession !== null },
+    ];
+
+    for (const entry of checkEntries) {
+      const staleErr = checkBackupDocumentStaleness(entry.path, entry.data, entry.exists, expectedBackup);
+      if (staleErr) {
+        return { success: false, schemaVersion: 0, errors: [staleErr] };
+      }
+    }
+  }
+
+  // STEP 2: RECONCILE CONFIGURATIONS (FAILS CLOSED IF BOTH ARE MISSING / INVALID)
   const { reconciledConfig, errors } = reconcileRiskConfigs(legacyRaw, accountRaw, now);
   if (!reconciledConfig) {
     return {
       success: false,
       schemaVersion: 0,
-      errors: errors || ['Configuration reconciliation failed'],
+      errors: errors || ['Configuration reconciliation failed: both configs missing or invalid.'],
     };
   }
 
-  // STEP 3: EVALUATE LOCK MIRRORING
-  const { shouldMirror, mirroredSession } = evaluateLockMirroring(
+  // STEP 3: EVALUATE LOCK MIRRORING (ABORTS MIGRATION IF LEGACY SESSION HAS MISMATCHED/MISSING DATE)
+  const mirrorResult = evaluateLockMirroring(
     legacySession,
     existingAccountSession,
     cleanUserId,
@@ -213,6 +298,17 @@ export async function migrateUserRiskData(
     reconciledConfig,
     now
   );
+
+  if (!mirrorResult.valid) {
+    return {
+      success: false,
+      schemaVersion: 0,
+      errors: [mirrorResult.error || 'Legacy session date validation failed.'],
+    };
+  }
+
+  const shouldMirror = mirrorResult.shouldMirror;
+  const mirroredSession = mirrorResult.mirroredSession;
 
   // STEP 4: STAGE ALL PROPOSED WRITES IN A TRANSACTION STAGING MAP
   const stagedWrites = new Map<string, any>();
@@ -323,6 +419,7 @@ export function parseRawTimestamp(raw: any): number | null {
  * 3. Timestamp precedence: Highest valid original `updatedAt` wins.
  * 4. Equal or missing timestamps: Account-level config takes precedence.
  * 5. Sanitize document completely before returning.
+ * 6. FAIL CLOSED: If both legacy and account configs are missing or invalid, return failure error without writing defaults.
  */
 export function reconcileRiskConfigs(
   legacyRaw: any,
@@ -366,10 +463,11 @@ export function reconcileRiskConfigs(
   } else if (validLegacyConfig) {
     chosen = validLegacyConfig;
   } else {
-    // Neither exists or both invalid -> baseline default config
-    chosen = {
-      ...DEFAULT_RISK_CONFIG,
-      updatedAt: now.toISOString(),
+    // Neither config exists or both configs are invalid -> FAIL CLOSED!
+    return {
+      errors: [
+        'MIGRATION_FAILED_NO_VALID_CONFIG: Both legacy and account-level risk configurations are missing or invalid.',
+      ],
     };
   }
 
@@ -389,7 +487,7 @@ export function reconcileRiskConfigs(
 
 /**
  * Checks whether a risk session lock is active under exact Risk Engine lock-expiry semantics:
- * 1. Requires session tradingDate to match expectedTradingDate (if supplied).
+ * 1. When expectedTradingDate is supplied, require session.tradingDate === expectedTradingDate.
  * 2. Must be locked (`state === 'LOCKED'` or `isBreached === true`).
  * 3. Missing or null `lockUntil` means indefinite active lock.
  * 4. An invalid non-null `lockUntil` (e.g. `'invalid-date'`) is NOT active.
@@ -430,7 +528,9 @@ export function checkIsLockActive(
 
 /**
  * Determines whether the legacy risk session lock is active and should be mirrored.
- * Requires same tradingDate matching and preserves legacy session fields verbatim.
+ * Case A: No legacy session exists -> valid, do not mirror.
+ * Case B: Legacy session exists with matching tradingDate -> evaluate lock eligibility.
+ * Case C: Legacy session exists with missing or mismatched tradingDate -> ABORT ENTIRE MIGRATION!
  */
 export function evaluateLockMirroring(
   legacySession: RiskSession | null,
@@ -440,21 +540,32 @@ export function evaluateLockMirroring(
   tradingDate: string,
   reconciledConfig: RiskConfig,
   now: Date
-): { shouldMirror: boolean; mirroredSession?: Record<string, any> } {
+): LockMirroringResult {
+  // Case A: No legacy session exists -> valid, do not mirror
   if (!legacySession) {
-    return { shouldMirror: false };
+    return { valid: true, shouldMirror: false };
   }
 
+  // Case C: Legacy session exists but its tradingDate is missing or mismatched -> ABORT MIGRATION!
+  if (!legacySession.tradingDate || legacySession.tradingDate !== tradingDate) {
+    return {
+      valid: false,
+      shouldMirror: false,
+      error: `MIGRATION_FAILED_INVALID_SESSION_DATE: Legacy risk session tradingDate '${legacySession.tradingDate}' does not match target trading date '${tradingDate}'.`,
+    };
+  }
+
+  // Case B: Legacy session exists and tradingDate matches target date.
   const isLegacyActive = checkIsLockActive(legacySession, now, tradingDate);
   if (!isLegacyActive) {
-    return { shouldMirror: false };
+    return { valid: true, shouldMirror: false };
   }
 
   // Legacy lock is ACTIVE on tradingDate.
   // Check if existing account session is already active on tradingDate:
   if (existingAccountSession && checkIsLockActive(existingAccountSession, now, tradingDate)) {
     // Existing account session is already active on tradingDate — preserve without overwriting
-    return { shouldMirror: false };
+    return { valid: true, shouldMirror: false };
   }
 
   // Preserve the legacy session's existing fields and values verbatim when mirroring!
@@ -468,5 +579,5 @@ export function evaluateLockMirroring(
     updatedAt: now.toISOString(),
   };
 
-  return { shouldMirror: true, mirroredSession };
+  return { valid: true, shouldMirror: true, mirroredSession };
 }
