@@ -14,6 +14,7 @@ import { enableMockStoreForTesting } from '../server/brokers/zerodha/sessionStor
 import { DEFAULT_RISK_CONFIG } from '../src/types/risk';
 
 enableMockStoreForTesting(true);
+process.env.NODE_ENV = 'test';
 
 function assert(condition: boolean, message: string) {
   if (!condition) {
@@ -675,6 +676,132 @@ async function runStage2aSafetyCorrectionTests() {
     assert(getMigrationMockDoc(`users/${userId}/system/migrationState`) === undefined, 'Zero writes on malformed backup');
 
     console.log('  PASSED: Malformed backup paths (missing, duplicate, wrong) fail closed before writes.');
+  }
+
+  console.log('\nTest 19: Production Environment (NODE_ENV=production) Rejects allowMockForTesting with Zero Writes');
+  {
+    clearMigrationMockStore();
+    const { runAdminMigrationRunner } = await import('../scripts/run-stage2a-migration');
+
+    setMigrationMockDoc(`users/${userId}/riskConfig/config`, validLegacyConfig);
+    const originalNodeEnv = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'production';
+
+    try {
+      const res = await runAdminMigrationRunner({
+        userId,
+        accountId,
+        tradingDate,
+        now: testNow,
+        confirmWrite: true,
+        allowMockForTesting: true, // Attempt bypass in production
+      });
+
+      assert(res.dryRun !== true, 'Executed in write mode attempt');
+      if (!res.dryRun) {
+        assert(res.success === false, 'Production write mode MUST fail closed even if allowMockForTesting is set');
+        assert(
+          res.errors !== undefined && res.errors[0].includes('ALLOW_MOCK_TESTING_FORBIDDEN'),
+          'Explicit ALLOW_MOCK_TESTING_FORBIDDEN error returned'
+        );
+      }
+      assert(
+        getMigrationMockDoc(`users/${userId}/system/migrationState`) === undefined,
+        'Zero writes: no migrationState written in production despite allowMockForTesting flag'
+      );
+    } finally {
+      process.env.NODE_ENV = originalNodeEnv;
+    }
+
+    console.log('  PASSED: Production environment strictly rejects allowMockForTesting with zero writes.');
+  }
+
+  console.log('\nTest 20: Non-Test Environment (NODE_ENV undefined/development) Rejects allowMockForTesting with Zero Writes');
+  {
+    clearMigrationMockStore();
+    const { runAdminMigrationRunner } = await import('../scripts/run-stage2a-migration');
+
+    setMigrationMockDoc(`users/${userId}/riskConfig/config`, validLegacyConfig);
+    const originalNodeEnv = process.env.NODE_ENV;
+    delete (process.env as any).NODE_ENV;
+
+    try {
+      const res = await runAdminMigrationRunner({
+        userId,
+        accountId,
+        tradingDate,
+        now: testNow,
+        confirmWrite: true,
+        allowMockForTesting: true, // Attempt bypass in non-test env
+      });
+
+      assert(res.dryRun !== true, 'Executed in write mode attempt');
+      if (!res.dryRun) {
+        assert(res.success === false, 'Non-test environment MUST fail closed even if allowMockForTesting is set');
+        assert(
+          res.errors !== undefined && res.errors[0].includes('ALLOW_MOCK_TESTING_FORBIDDEN'),
+          'Explicit ALLOW_MOCK_TESTING_FORBIDDEN error returned'
+        );
+      }
+      assert(
+        getMigrationMockDoc(`users/${userId}/system/migrationState`) === undefined,
+        'Zero writes: no migrationState written in non-test env despite allowMockForTesting flag'
+      );
+    } finally {
+      process.env.NODE_ENV = originalNodeEnv;
+    }
+
+    console.log('  PASSED: Non-test environment strictly rejects allowMockForTesting with zero writes.');
+  }
+
+  console.log('\nTest 21: CLI Mode Flags Reject allowMockForTesting in Both Runner and Subprocess Execution');
+  {
+    clearMigrationMockStore();
+    const { runAdminMigrationRunner } = await import('../scripts/run-stage2a-migration');
+    const { execSync } = await import('child_process');
+
+    // 21.1: Programmatic CLI flag rejection
+    const programmaticCliRes = await runAdminMigrationRunner({
+      userId,
+      accountId,
+      tradingDate,
+      now: testNow,
+      confirmWrite: true,
+      allowMockForTesting: true,
+      isCli: true,
+    });
+
+    assert(programmaticCliRes.dryRun !== true, 'Executed in write mode attempt');
+    if (!programmaticCliRes.dryRun) {
+      assert(programmaticCliRes.success === false, 'CLI execution MUST fail closed with allowMockForTesting');
+      assert(
+        programmaticCliRes.errors !== undefined && programmaticCliRes.errors[0].includes('ALLOW_MOCK_TESTING_FORBIDDEN'),
+        'Explicit ALLOW_MOCK_TESTING_FORBIDDEN error returned'
+      );
+    }
+    assert(
+      getMigrationMockDoc(`users/${userId}/system/migrationState`) === undefined,
+      'Zero writes: no migrationState written under CLI execution'
+    );
+
+    // 21.2: Direct CLI subprocess execution rejection
+    let cliFailedAsExpected = false;
+    try {
+      execSync(
+        'npx tsx scripts/run-stage2a-migration.ts --userId=test_user --confirmWrite=true --allowMockForTesting=true',
+        { stdio: 'pipe' }
+      );
+    } catch (err: any) {
+      cliFailedAsExpected = true;
+      const stderr = err.stderr ? err.stderr.toString() : '';
+      assert(
+        stderr.includes('CLI_ERROR') && stderr.includes('forbidden in CLI execution'),
+        'CLI output explicitly reports mock testing flags forbidden'
+      );
+    }
+    assert(cliFailedAsExpected, 'CLI subprocess execution with --allowMockForTesting must exit with non-zero status');
+
+    console.log('  PASSED: CLI execution strictly rejects allowMockForTesting and exits without writes.');
   }
 
   console.log('\n=== ALL STAGE 2A SAFETY CORRECTION & ADMIN RUNNER TESTS PASSED SUCCESSFULLY ===');

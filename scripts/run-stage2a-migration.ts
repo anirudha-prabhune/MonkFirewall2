@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
 import { getAdminFirestore, isMockStoreEnabled } from '../server/brokers/zerodha/sessionStore';
 import {
   migrateUserRiskData,
@@ -19,9 +20,41 @@ export interface AdminRunnerOptions {
   dryRun?: boolean;
   useMockStore?: boolean;
   allowMockForTesting?: boolean; // Explicit test-only override for isolated unit testing
+  isCli?: boolean;
   now?: Date;
   backupDir?: string;
   failBackupForTest?: boolean;
+}
+
+/**
+ * Verifies that the current execution is strictly inside an isolated test runner environment.
+ * Rejects production, non-test environments, and direct CLI script execution.
+ */
+export function isIsolatedTestEnvironment(): boolean {
+  if (typeof process === 'undefined') return false;
+
+  // Production environment is NEVER an isolated test environment
+  if (process.env.NODE_ENV === 'production') {
+    return false;
+  }
+
+  // NODE_ENV must be explicitly 'test'
+  if (process.env.NODE_ENV !== 'test') {
+    return false;
+  }
+
+  // Direct CLI invocation of the migration runner script is NEVER an isolated test environment
+  const scriptPath = fileURLToPath(import.meta.url);
+  if (
+    process.argv[1] &&
+    (process.argv[1] === scriptPath ||
+      process.argv[1].endsWith('run-stage2a-migration.ts') ||
+      process.argv[1].endsWith('run-stage2a-migration'))
+  ) {
+    return false;
+  }
+
+  return true;
 }
 
 export interface DocumentBackupEntry {
@@ -275,12 +308,28 @@ export async function runAdminMigrationRunner(options: AdminRunnerOptions): Prom
     );
   }
 
+  // Security Guard: allowMockForTesting is strictly forbidden in CLI and production execution.
+  // It may ONLY be utilized in an explicitly isolated test environment (NODE_ENV === 'test').
+  if (options.allowMockForTesting) {
+    if (options.isCli || !isIsolatedTestEnvironment()) {
+      return {
+        success: false,
+        schemaVersion: 0,
+        errors: [
+          'ALLOW_MOCK_TESTING_FORBIDDEN: allowMockForTesting bypass is strictly forbidden in CLI and production execution. Mock writes can only be enabled in an explicitly isolated test environment (NODE_ENV === "test").',
+        ],
+      };
+    }
+  }
+
   // Fail-Closed Store Guard:
   // In write mode, require real Firestore to be initialized and mock mode to be disabled.
   // Never silently fall back to mock storage.
-  // Isolated mock testing is allowed ONLY through explicit options.allowMockForTesting === true.
+  // Isolated mock testing is allowed ONLY through explicit options.allowMockForTesting === true within an isolated test environment.
   if (isWriteMode) {
-    if (isMock && !options.allowMockForTesting) {
+    const isTestBypassActive = Boolean(options.allowMockForTesting && !options.isCli && isIsolatedTestEnvironment());
+
+    if (isMock && !isTestBypassActive) {
       return {
         success: false,
         schemaVersion: 0,
@@ -328,14 +377,21 @@ export async function runAdminMigrationRunner(options: AdminRunnerOptions): Prom
   };
 }
 
-import { fileURLToPath } from 'url';
-
 // CLI entry point execution when run directly via tsx (guarded against module import)
-if (process.argv[1] && process.argv[1] === fileURLToPath(import.meta.url)) {
+if (
+  process.argv[1] &&
+  (process.argv[1] === fileURLToPath(import.meta.url) ||
+    process.argv[1].endsWith('run-stage2a-migration.ts') ||
+    process.argv[1].endsWith('run-stage2a-migration'))
+) {
   const args = process.argv.slice(2);
-  const options: AdminRunnerOptions = {};
+  const options: AdminRunnerOptions = { isCli: true };
 
   for (const arg of args) {
+    if (arg.startsWith('--allowMockForTesting') || arg.startsWith('--allowMock') || arg.startsWith('--useMock')) {
+      console.error(`CLI_ERROR: Mock testing flags (${arg}) are strictly forbidden in CLI execution.`);
+      process.exit(1);
+    }
     if (arg.startsWith('--userId=')) options.userId = arg.split('=')[1];
     if (arg.startsWith('--accountId=')) options.accountId = arg.split('=')[1];
     if (arg.startsWith('--tradingDate=')) options.tradingDate = arg.split('=')[1];
