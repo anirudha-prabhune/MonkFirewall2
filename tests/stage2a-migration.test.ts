@@ -23,7 +23,7 @@ function cleanupTestBackups() {
   }
 }
 
-function assert(condition: boolean, message: string) {
+function assert(condition: boolean, message: string): asserts condition {
   if (!condition) {
     throw new Error(`ASSERTION FAILED: ${message}`);
   }
@@ -446,29 +446,25 @@ async function runStage2aSafetyCorrectionTests() {
   console.log('\nTest 12: Admin Runner Backup Verification Failure Handling');
   {
     clearMigrationMockStore();
-    const { runAdminMigrationRunnerForIsolatedTesting, createIsolatedTestToken } = await import('../scripts/run-stage2a-migration');
+    const { runStage2aMigrationTestHarness } = await import('./helpers/testMigrationRunner');
 
     setMigrationMockDoc(`users/${userId}/riskConfig/config`, validLegacyConfig);
-    const testToken = createIsolatedTestToken();
 
-    const backupFailRes = await runAdminMigrationRunnerForIsolatedTesting(
-      {
-        userId,
-        accountId,
-        tradingDate,
-        now: testNow,
-        confirmWrite: true,
-        backupDir: './test_backups',
-        failBackupForTest: true, // Inject backup failure
-      },
-      testToken
-    );
+    const backupFailRes = await runStage2aMigrationTestHarness({
+      userId,
+      accountId,
+      tradingDate,
+      now: testNow,
+      confirmWrite: true,
+      backupDir: './test_backups',
+      failBackupForTest: true, // Inject backup failure
+    });
 
     assert(backupFailRes.dryRun !== true, 'Not executed in dry-run mode');
     if (!backupFailRes.dryRun) {
-      assert((backupFailRes as any).success === false, 'Migration aborted due to backup failure');
-      assert((backupFailRes as any).schemaVersion === 0, 'schemaVersion remains 0 on backup failure');
-      assert((backupFailRes as any).errors !== undefined && (backupFailRes as any).errors[0].includes('BACKUP_VERIFICATION_FAILED'), 'Explicit backup error reported');
+      assert(backupFailRes.success === false, 'Migration aborted due to backup failure');
+      assert(backupFailRes.schemaVersion === 0, 'schemaVersion remains 0 on backup failure');
+      assert(backupFailRes.errors !== undefined && backupFailRes.errors[0].includes('BACKUP_VERIFICATION_FAILED'), 'Explicit backup error reported');
     }
 
     // Assert zero writes occurred after backup failure
@@ -480,27 +476,23 @@ async function runStage2aSafetyCorrectionTests() {
   console.log('\nTest 13: Admin Runner Write Mode Execution & Backup Creation');
   {
     clearMigrationMockStore();
-    const { runAdminMigrationRunnerForIsolatedTesting, createIsolatedTestToken } = await import('../scripts/run-stage2a-migration');
+    const { runStage2aMigrationTestHarness } = await import('./helpers/testMigrationRunner');
 
     setMigrationMockDoc(`users/${userId}/riskConfig/config`, validLegacyConfig);
-    const testToken = createIsolatedTestToken();
 
-    const writeResult = await runAdminMigrationRunnerForIsolatedTesting(
-      {
-        userId,
-        accountId,
-        tradingDate,
-        now: testNow,
-        confirmWrite: true,
-        backupDir: './test_backups',
-      },
-      testToken
-    );
+    const writeResult = await runStage2aMigrationTestHarness({
+      userId,
+      accountId,
+      tradingDate,
+      now: testNow,
+      confirmWrite: true,
+      backupDir: './test_backups',
+    });
 
     assert(writeResult.dryRun !== true, 'Executed in write mode');
     if (!writeResult.dryRun) {
-      assert((writeResult as any).success === true, 'Migration write mode succeeded');
-      assert((writeResult as any).backupPath !== undefined, 'Backup path returned');
+      assert(writeResult.success === true, 'Migration write mode succeeded');
+      assert(writeResult.backupPath !== undefined, 'Backup path returned');
     }
 
     // Assert write occurred
@@ -513,13 +505,19 @@ async function runStage2aSafetyCorrectionTests() {
   console.log('\nTest 14: Post-Backup Concurrent Mutation Detection (Stale Backup Guard)');
   {
     clearMigrationMockStore();
+    const { createAndVerifyMockBackup } = await import('./helpers/testMigrationRunner');
     const { createAndVerifyBackup } = await import('../scripts/run-stage2a-migration');
 
     // 1. Seed initial document state
     setMigrationMockDoc(`users/${userId}/riskConfig/config`, validLegacyConfig);
 
-    // 2. Create snapshot backup
-    const backupRes = await createAndVerifyBackup(userId, accountId, tradingDate, './test_backups');
+    // Verify production createAndVerifyBackup fails closed when mock store is enabled
+    const prodBackupRes = await createAndVerifyBackup(userId, accountId, tradingDate, './test_backups');
+    assert(prodBackupRes.success === false, 'Production createAndVerifyBackup must fail closed when mock store is active');
+    assert(prodBackupRes.error !== undefined && prodBackupRes.error.includes('REAL_FIRESTORE_REQUIRED'), 'Reports REAL_FIRESTORE_REQUIRED');
+
+    // 2. Create snapshot backup via test harness
+    const backupRes = await createAndVerifyMockBackup(userId, accountId, tradingDate, './test_backups');
     assert(backupRes.success === true, 'Backup snapshot created successfully');
 
     // 3. Mutate a document in store post-backup (simulating concurrent user activity)
@@ -852,112 +850,89 @@ async function runStage2aSafetyCorrectionTests() {
     console.log('  PASSED: Ordinary programmatic caller strictly blocked from mock writes even when NODE_ENV=test.');
   }
 
-  console.log('\nTest 23: Isolated Test Token Security & Tamper Proofing');
+  console.log('\nTest 23: Structural Isolation Verification & Regression Suite');
   {
     clearMigrationMockStore();
-    const {
-      runAdminMigrationRunnerForIsolatedTesting,
-      createIsolatedTestToken,
-    } = await import('../scripts/run-stage2a-migration');
+    const migrationModule = await import('../scripts/run-stage2a-migration');
+    const { runStage2aMigrationTestHarness, createAndVerifyMockBackup } = await import('./helpers/testMigrationRunner');
+    const { execSync } = await import('child_process');
 
-    // 23.1: Forged token (not minted by createIsolatedTestToken) fails closed
-    const forgedToken = { id: 'forged_token', consumed: false } as any;
-    const forgedRes = await runAdminMigrationRunnerForIsolatedTesting(
-      {
-        userId,
-        accountId,
-        tradingDate,
-        now: testNow,
-        confirmWrite: true,
-      },
-      forgedToken
+    setMigrationMockDoc(`users/${userId}/riskConfig/config`, validLegacyConfig);
+
+    // 23.1: Verify test-bypass symbols are completely removed from scripts/run-stage2a-migration.ts
+    assert(
+      (migrationModule as any).createIsolatedTestToken === undefined,
+      'createIsolatedTestToken must NOT exist on scripts/run-stage2a-migration'
     );
-    assert(forgedRes.dryRun !== true, 'Executed in write mode');
-    if (!forgedRes.dryRun) {
-      assert(forgedRes.success === false, 'Forged token must fail closed');
+    assert(
+      (migrationModule as any).runAdminMigrationRunnerForIsolatedTesting === undefined,
+      'runAdminMigrationRunnerForIsolatedTesting must NOT exist on scripts/run-stage2a-migration'
+    );
+    assert(
+      (migrationModule as any).isIsolatedTestEnvironment === undefined,
+      'isIsolatedTestEnvironment must NOT exist on scripts/run-stage2a-migration'
+    );
+
+    // 23.2: Calling production runner in write mode when mock store is active fails closed with REAL_FIRESTORE_REQUIRED
+    const prodWriteRes = await migrationModule.runAdminMigrationRunner({
+      userId,
+      accountId,
+      tradingDate,
+      now: testNow,
+      confirmWrite: true,
+    });
+    assert(!prodWriteRes.dryRun, 'Executed in write mode attempt');
+    assert(prodWriteRes.success === false, 'Production runner must fail closed when mock store is enabled');
+    assert(
+      prodWriteRes.errors !== undefined && prodWriteRes.errors[0].includes('REAL_FIRESTORE_REQUIRED'),
+      'Production runner reports REAL_FIRESTORE_REQUIRED'
+    );
+    assert(
+      getMigrationMockDoc(`users/${userId}/system/migrationState`) === undefined,
+      'Zero writes: production runner cannot perform writes to mock store'
+    );
+
+    // 23.3: Passing allowMockForTesting to production runner is strictly rejected
+    const bypassRes = await migrationModule.runAdminMigrationRunner({
+      userId,
+      accountId,
+      tradingDate,
+      now: testNow,
+      confirmWrite: true,
+      allowMockForTesting: true,
+    } as any);
+    assert(!bypassRes.dryRun, 'Executed in write mode attempt');
+    assert(bypassRes.success === false, 'Production runner must reject allowMockForTesting');
+    assert(
+      bypassRes.errors !== undefined && bypassRes.errors[0].includes('PROGRAMMATIC_BYPASS_FORBIDDEN'),
+      'Production runner reports PROGRAMMATIC_BYPASS_FORBIDDEN'
+    );
+    assert(
+      getMigrationMockDoc(`users/${userId}/system/migrationState`) === undefined,
+      'Zero writes: allowMockForTesting produces zero writes'
+    );
+
+    // 23.4: CLI subprocess strictly rejects mock flags
+    let cliMockBlocked = false;
+    try {
+      execSync(
+        'npx tsx scripts/run-stage2a-migration.ts --userId=test_user --confirmWrite=true --allowMockForTesting=true',
+        { stdio: 'pipe' }
+      );
+    } catch (err: any) {
+      cliMockBlocked = true;
+      const stderr = err.stderr ? err.stderr.toString() : '';
       assert(
-        forgedRes.errors !== undefined && forgedRes.errors[0].includes('INVALID_TEST_TOKEN'),
-        'INVALID_TEST_TOKEN error returned'
+        stderr.includes('CLI_ERROR') && stderr.includes('forbidden in CLI execution'),
+        'CLI output explicitly reports mock testing flags forbidden'
       );
     }
+    assert(cliMockBlocked, 'CLI subprocess execution with mock flag must exit with non-zero status');
 
-    // 23.2: Reused token fails closed (single-use burned)
+    // 23.5: Isolated test harness CAN execute migration write behavior against mock store
+    clearMigrationMockStore();
     setMigrationMockDoc(`users/${userId}/riskConfig/config`, validLegacyConfig);
-    const validToken = createIsolatedTestToken();
-    const firstRun = await runAdminMigrationRunnerForIsolatedTesting(
-      {
-        userId,
-        accountId,
-        tradingDate,
-        now: testNow,
-        confirmWrite: true,
-        backupDir: './test_backups',
-      },
-      validToken
-    );
-    // Attempt to tamper with the token's exposed fields to bypass replay guard
-    try {
-      (validToken as any).consumed = false;
-      (validToken as any).id = 'new_tampered_id';
-    } catch {
-      // In strict mode Object.freeze throws, which also prevents mutation
-    }
-
-    // Attempt reuse of same token after tampering
-    const reusedRun = await runAdminMigrationRunnerForIsolatedTesting(
-      {
-        userId,
-        accountId,
-        tradingDate,
-        now: testNow,
-        confirmWrite: true,
-      },
-      validToken
-    );
-    assert(!reusedRun.dryRun && (reusedRun as any).success === false, 'Reused token must fail closed even after tampering');
-    assert(
-      !reusedRun.dryRun && (reusedRun as any).errors !== undefined && (reusedRun as any).errors[0].includes('TOKEN_ALREADY_CONSUMED'),
-      'TOKEN_ALREADY_CONSUMED error returned on replayed token'
-    );
-
-    // 23.3: Cloned token object fails closed (not in issued WeakSet)
-    const clonedToken = { ...validToken } as any;
-    const clonedRun = await runAdminMigrationRunnerForIsolatedTesting(
-      {
-        userId,
-        accountId,
-        tradingDate,
-        now: testNow,
-        confirmWrite: true,
-      },
-      clonedToken
-    );
-    assert(!clonedRun.dryRun && (clonedRun as any).success === false, 'Cloned token must fail closed');
-    assert(
-      !clonedRun.dryRun && (clonedRun as any).errors !== undefined && (clonedRun as any).errors[0].includes('INVALID_TEST_TOKEN'),
-      'INVALID_TEST_TOKEN error returned on cloned token'
-    );
-
-    // 23.4: Cannot mint test token in production
-    const origEnv = process.env.NODE_ENV;
-    process.env.NODE_ENV = 'production';
-    let mintFailed = false;
-    try {
-      createIsolatedTestToken();
-    } catch (e: any) {
-      mintFailed = true;
-      assert(e.message.includes('ISOLATED_TEST_TOKEN_FORBIDDEN'), 'Error mentions ISOLATED_TEST_TOKEN_FORBIDDEN');
-    } finally {
-      process.env.NODE_ENV = origEnv;
-    }
-    assert(mintFailed, 'Cannot mint test token in production environment');
-
-    // 23.5: Legitimate indirect call through test helper within /tests/ succeeds
-    async function testHelperRunner(opts: any) {
-      const helperToken = createIsolatedTestToken();
-      return runAdminMigrationRunnerForIsolatedTesting(opts, helperToken);
-    }
-    const helperRes = await testHelperRunner({
+    const harnessWriteRes = await runStage2aMigrationTestHarness({
       userId,
       accountId,
       tradingDate,
@@ -965,139 +940,29 @@ async function runStage2aSafetyCorrectionTests() {
       confirmWrite: true,
       backupDir: './test_backups',
     });
-    assert(!helperRes.dryRun && (helperRes as any).success === true, 'Indirect call through test helper within /tests/ succeeds');
+    assert(!harnessWriteRes.dryRun, 'Executed in write mode');
+    assert(harnessWriteRes.success === true, 'Test harness successfully executed migration');
+    assert(harnessWriteRes.backupPath !== undefined, 'Backup path returned');
+    assert(
+      getMigrationMockDoc(`users/${userId}/system/migrationState`)?.schemaVersion === 2,
+      'Test harness wrote schemaVersion 2 to mock store'
+    );
 
-    // 23.6: Non-test caller outside /tests/ strictly rejected
-    const { execSync } = await import('child_process');
-    let nonTestCallerRejected = false;
-    try {
-      execSync(
-        `npx tsx -e "import { createIsolatedTestToken } from './scripts/run-stage2a-migration'; process.env.NODE_ENV = 'test'; createIsolatedTestToken();"`,
-        { stdio: 'pipe' }
-      );
-    } catch (err: any) {
-      nonTestCallerRejected = true;
-      const stderr = err.stderr ? err.stderr.toString() : '';
-      assert(
-        stderr.includes('ISOLATED_TEST_TOKEN_FORBIDDEN') && stderr.includes('Immediate caller must be in /tests/'),
-        'Non-test caller rejected by immediate caller stack check'
-      );
-    }
-    assert(nonTestCallerRejected, 'Calling createIsolatedTestToken from outside /tests/ must fail closed');
-
-    // 23.7: Real threat regression — Code outside /tests/ (e.g. application code in /server/) invokes a test helper to mint/use bypass -> FAILS CLOSED with zero writes
+    // 23.6: Isolated test harness detects concurrent mutation and fails closed
     clearMigrationMockStore();
     setMigrationMockDoc(`users/${userId}/riskConfig/config`, validLegacyConfig);
-
-    // Test helpers defined within /tests/
-    function helperMintTokenInTests() {
-      return createIsolatedTestToken();
-    }
-    async function helperRunMigrationInTests(opts: any, token: any) {
-      return runAdminMigrationRunnerForIsolatedTesting(opts, token);
-    }
-
-    // Rogue caller originating from application code (/server/)
-    const rogueServerCaller = new Function(
-      'helper',
-      'opts',
-      'token',
-      '//# sourceURL=/server/risk/rogueApplicationCaller.ts\nreturn helper(opts, token);'
-    );
-
-    // 23.7a: Invoking test helper to mint token from application code in /server/ fails closed
-    let rogueMintBlocked = false;
-    try {
-      rogueServerCaller(helperMintTokenInTests);
-    } catch (err: any) {
-      rogueMintBlocked = true;
-      assert(
-        err.message.includes('ISOLATED_TEST_TOKEN_FORBIDDEN') &&
-        err.message.includes('Call chain contains application code'),
-        'Attempt to mint test token via test helper from /server/ code strictly rejected'
-      );
-    }
-    assert(rogueMintBlocked, 'Rogue caller outside /tests/ invoking test helper to mint token must fail closed');
-
-    // 23.7b: Invoking test helper to run migration from /server/ fails closed
-    const preMintedToken = createIsolatedTestToken();
-    const rogueRunnerRes = await rogueServerCaller(
-      helperRunMigrationInTests,
-      {
-        userId,
-        accountId,
-        tradingDate,
-        now: testNow,
-        confirmWrite: true,
-        backupDir: './test_backups',
-      },
-      preMintedToken
-    );
-    assert(!rogueRunnerRes.dryRun, 'Executed in write mode attempt');
-    assert(rogueRunnerRes.success === false, 'Rogue application caller must fail closed even when delegating through test helper');
+    const freshBackup = await createAndVerifyMockBackup(userId, accountId, tradingDate, './test_backups');
+    assert(freshBackup.success === true, 'Fresh mock backup created');
+    // Mutate after backup
+    setMigrationMockDoc(`users/${userId}/riskConfig/config`, { ...validLegacyConfig, dailyLossLimit: 99999 });
+    const staleHarnessRes = await migrateUserRiskData(userId, accountId, tradingDate, testNow, freshBackup.backup);
+    assert(staleHarnessRes.success === false, 'Test harness migration aborted on concurrent mutation');
     assert(
-      rogueRunnerRes.errors !== undefined &&
-      rogueRunnerRes.errors[0].includes('INVALID_TEST_CALLER') &&
-      rogueRunnerRes.errors[0].includes('Call chain contains application code'),
-      'Runner reports INVALID_TEST_CALLER due to application code in call chain'
+      staleHarnessRes.errors !== undefined && staleHarnessRes.errors[0].includes('BACKUP_STALE_CONCURRENT_MUTATION'),
+      'Test harness reports BACKUP_STALE_CONCURRENT_MUTATION'
     );
 
-    // 23.7c: Verify ZERO mock writes occurred
-    assert(
-      getMigrationMockDoc(`users/${userId}/system/migrationState`) === undefined,
-      'Zero writes: rogue caller outside /tests/ invoking test helper resulted in ZERO mock writes'
-    );
-
-    // 23.8: Fail-closed verification when stack frame cannot be identified/parsed (removal of callerIndex = 2 fallbacks)
-    const origPrepareStackTrace = Error.prepareStackTrace;
-    try {
-      Error.prepareStackTrace = () => '';
-      let mintWithoutStackBlocked = false;
-      try {
-        createIsolatedTestToken();
-      } catch (err: any) {
-        mintWithoutStackBlocked = true;
-        assert(
-          err.message.includes('ISOLATED_TEST_TOKEN_FORBIDDEN') &&
-          err.message.includes('Unable to verify caller stack frame'),
-          'createIsolatedTestToken fails closed when stack frame cannot be parsed'
-        );
-      }
-      assert(mintWithoutStackBlocked, 'createIsolatedTestToken without identifiable stack frame must fail closed');
-    } finally {
-      Error.prepareStackTrace = origPrepareStackTrace;
-    }
-
-    const tokenForStackTest = createIsolatedTestToken();
-    try {
-      Error.prepareStackTrace = () => '';
-      const runnerResNoStack = await runAdminMigrationRunnerForIsolatedTesting(
-        {
-          userId,
-          accountId,
-          tradingDate,
-          now: testNow,
-          confirmWrite: true,
-        },
-        tokenForStackTest
-      );
-      assert(!runnerResNoStack.dryRun && runnerResNoStack.success === false, 'Runner must fail closed when stack cannot be verified');
-      assert(
-        runnerResNoStack.errors !== undefined &&
-        runnerResNoStack.errors[0].includes('INVALID_TEST_CALLER') &&
-        runnerResNoStack.errors[0].includes('Unable to verify caller stack frame'),
-        'Runner reports INVALID_TEST_CALLER when stack frame is unidentifiable'
-      );
-    } finally {
-      Error.prepareStackTrace = origPrepareStackTrace;
-    }
-
-    assert(
-      getMigrationMockDoc(`users/${userId}/system/migrationState`) === undefined,
-      'Zero writes: unparseable stack attempts resulted in zero mock writes'
-    );
-
-    console.log('  PASSED: Isolated test token security (forgery, single-use, production blocking, helper delegation, rogue /server/ caller rejection, and unparseable stack fail-closed) verified.');
+    console.log('  PASSED: Structural isolation verified (production runner strictly blocks mock writes; test harness reliably exercises migration lifecycle).');
   }
 
   console.log('\n=== ALL STAGE 2A SAFETY CORRECTION & ADMIN RUNNER TESTS PASSED SUCCESSFULLY ===');

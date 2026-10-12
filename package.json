@@ -3,6 +3,17 @@
   "private": true,
   "version": "0.0.0",
   "type": "module",
+  "files": [
+    "dist",
+    "server",
+    "scripts",
+    "firebase-applet-config.json",
+    "firebase-blueprint.json",
+    "firestore.rules",
+    "metadata.json",
+    "index.html",
+    "README.md"
+  ],
   "scripts": {
     "dev": "vite --port=3000 --host=0.0.0.0",
     "build": "vite build",

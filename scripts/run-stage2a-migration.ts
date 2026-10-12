@@ -25,116 +25,6 @@ export interface AdminRunnerOptions {
   failBackupForTest?: boolean;
 }
 
-const ISOLATED_TEST_SYMBOL = Symbol('STAGE2A_ISOLATED_TEST_TOKEN');
-
-// Private module state for single-use token lifecycle
-const issuedTestTokens = new WeakSet<object>();
-const consumedTestTokens = new WeakSet<object>();
-
-export interface IsolatedTestToken {
-  readonly [ISOLATED_TEST_SYMBOL]: true;
-  readonly id: string;
-}
-
-/**
- * Creates a single-use authorization token for isolated unit testing.
- * Strictly verifies caller authenticity:
- * 1. NODE_ENV must be 'test' (never production).
- * 2. Immediate caller frame must strictly originate from /tests/ and cannot be application code.
- * 3. Call chain must not contain application code (/server/ or /src/).
- */
-export function createIsolatedTestToken(): IsolatedTestToken {
-  if (typeof process === 'undefined') {
-    throw new Error('ISOLATED_TEST_TOKEN_FORBIDDEN: process is undefined.');
-  }
-  if (process.env.NODE_ENV === 'production') {
-    throw new Error('ISOLATED_TEST_TOKEN_FORBIDDEN: Cannot mint test token in production environment.');
-  }
-  if (process.env.NODE_ENV !== 'test') {
-    throw new Error('ISOLATED_TEST_TOKEN_FORBIDDEN: Test token can only be minted when NODE_ENV=test.');
-  }
-
-  // Caller stack frame inspection: immediate caller must be in /tests/, and no application code in call chain
-  const stack = new Error().stack || '';
-  const lines = stack.split('\n');
-  let callerIndex = -1;
-  for (let i = 0; i < lines.length; i++) {
-    if (lines[i].includes('createIsolatedTestToken')) {
-      callerIndex = i + 1;
-      break;
-    }
-  }
-  if (callerIndex === -1 || callerIndex >= lines.length || !lines[callerIndex]?.trim()) {
-    throw new Error('ISOLATED_TEST_TOKEN_FORBIDDEN: Unable to verify caller stack frame.');
-  }
-
-  const immediateCallerFrame = lines[callerIndex] || '';
-  const isImmediateTestFile =
-    (immediateCallerFrame.includes('/tests/') || immediateCallerFrame.includes('\\tests\\')) &&
-    !immediateCallerFrame.includes('run-stage2a-migration');
-
-  if (!isImmediateTestFile) {
-    throw new Error(
-      `ISOLATED_TEST_TOKEN_FORBIDDEN: Immediate caller must be in /tests/. Found: ${immediateCallerFrame.trim()}`
-    );
-  }
-
-  // Enforce no application code (/server/ or /src/) in the entire ancestor call chain
-  for (let i = callerIndex; i < lines.length; i++) {
-    const frame = lines[i];
-    if (
-      frame.includes('/server/') ||
-      frame.includes('\\server\\') ||
-      frame.includes('/src/') ||
-      frame.includes('\\src\\')
-    ) {
-      throw new Error(
-        `ISOLATED_TEST_TOKEN_FORBIDDEN: Call chain contains application code: ${frame.trim()}`
-      );
-    }
-  }
-
-  const token: IsolatedTestToken = Object.freeze({
-    [ISOLATED_TEST_SYMBOL]: true as const,
-    id: `token_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`,
-  });
-
-  issuedTestTokens.add(token);
-
-  return token;
-}
-
-/**
- * Verifies that the current execution is strictly inside an isolated test runner environment.
- * Rejects production, non-test environments, and direct CLI script execution.
- */
-export function isIsolatedTestEnvironment(): boolean {
-  if (typeof process === 'undefined') return false;
-
-  // Production environment is NEVER an isolated test environment
-  if (process.env.NODE_ENV === 'production') {
-    return false;
-  }
-
-  // NODE_ENV must be explicitly 'test'
-  if (process.env.NODE_ENV !== 'test') {
-    return false;
-  }
-
-  // Direct CLI invocation of the migration runner script is NEVER an isolated test environment
-  const scriptPath = fileURLToPath(import.meta.url);
-  if (
-    process.argv[1] &&
-    (process.argv[1] === scriptPath ||
-      process.argv[1].endsWith('run-stage2a-migration.ts') ||
-      process.argv[1].endsWith('run-stage2a-migration'))
-  ) {
-    return false;
-  }
-
-  return true;
-}
-
 export interface DocumentBackupEntry {
   path: string;
   exists: boolean;
@@ -180,8 +70,8 @@ export function isValidCalendarDate(dateStr?: string): boolean {
 }
 
 /**
- * Creates and verifies a 5-document pre-migration snapshot backup.
- * Includes absent-document markers (`exists: false`, `data: null`).
+ * Creates and verifies a 5-document pre-migration snapshot backup from real Firestore.
+ * Strictly requires real Firestore connection; rejects mock store mode.
  * Strictly verifies each of the exact five required paths is present exactly once.
  */
 export async function createAndVerifyBackup(
@@ -205,27 +95,26 @@ export async function createAndVerifyBackup(
 
   const adminDb = getAdminFirestore();
   const isMock = isMockStoreEnabled();
+
+  if (!adminDb || isMock) {
+    return {
+      success: false,
+      error: 'REAL_FIRESTORE_REQUIRED: Real Firestore Admin SDK must be active and mock mode disabled to create a backup.',
+    };
+  }
+
   const docs: DocumentBackupEntry[] = [];
 
   for (const docPath of paths) {
-    if (adminDb && !isMock) {
-      try {
-        const snap = await adminDb.doc(docPath).get();
-        docs.push({
-          path: docPath,
-          exists: snap.exists,
-          data: snap.exists ? snap.data() : null,
-        });
-      } catch (err: any) {
-        return { success: false, error: `FIRESTORE_BACKUP_READ_ERROR on ${docPath}: ${err?.message || String(err)}` };
-      }
-    } else {
-      const mockData = getMigrationMockDoc(docPath);
+    try {
+      const snap = await adminDb.doc(docPath).get();
       docs.push({
         path: docPath,
-        exists: mockData !== undefined && mockData !== null,
-        data: mockData !== undefined && mockData !== null ? JSON.parse(JSON.stringify(mockData)) : null,
+        exists: snap.exists,
+        data: snap.exists ? snap.data() : null,
       });
+    } catch (err: any) {
+      return { success: false, error: `FIRESTORE_BACKUP_READ_ERROR on ${docPath}: ${err?.message || String(err)}` };
     }
   }
 
@@ -275,128 +164,21 @@ export async function createAndVerifyBackup(
 
 /**
  * Stage 2A Administrative Migration Runner
- * Public entry point for administrative migration execution.
- * Mock write bypass is strictly forbidden for ordinary programmatic callers, even when NODE_ENV=test.
+ * Production/CLI runner entry point for administrative migration execution.
+ * Strictly real-Firestore-only for writes. Mock write operations are strictly blocked.
  */
 export async function runAdminMigrationRunner(options: AdminRunnerOptions): Promise<AdminRunnerResult> {
-  // Programmatic Bypass Guard:
-  // allowMockForTesting is strictly forbidden for all ordinary programmatic callers,
-  // even when NODE_ENV === 'test'.
+  // Reject any attempt to pass allowMockForTesting or similar bypass options
   if ((options as any).allowMockForTesting !== undefined) {
     return {
       success: false,
       schemaVersion: 0,
       errors: [
-        'PROGRAMMATIC_BYPASS_FORBIDDEN: allowMockForTesting override is not accessible to programmatic callers. Mock writes cannot be enabled through this option, even when NODE_ENV=test.',
+        'PROGRAMMATIC_BYPASS_FORBIDDEN: allowMockForTesting is not supported. Production migration runner does not support mock writes.',
       ],
     };
   }
 
-  return executeRunnerInternal(options, { isAuthorizedTestBypass: false });
-}
-
-/**
- * Test-isolated execution entry point for unit testing write mode with mock store.
- * Requires a valid, unconsumed IsolatedTestToken minted by createIsolatedTestToken().
- * Rejects ordinary programmatic callers, production, and CLI execution.
- */
-export async function runAdminMigrationRunnerForIsolatedTesting(
-  options: AdminRunnerOptions,
-  testToken: IsolatedTestToken
-): Promise<AdminRunnerResult> {
-  // 1. Verify token authenticity using private module state
-  if (
-    !testToken ||
-    typeof testToken !== 'object' ||
-    !issuedTestTokens.has(testToken) ||
-    (testToken as any)[ISOLATED_TEST_SYMBOL] !== true
-  ) {
-    return {
-      success: false,
-      schemaVersion: 0,
-      errors: [
-        'INVALID_TEST_TOKEN: Isolated test execution requires a valid IsolatedTestToken minted via createIsolatedTestToken().',
-      ],
-    };
-  }
-
-  // 2. Verify token is unconsumed using private module state (one-way consumption)
-  if (consumedTestTokens.has(testToken)) {
-    return {
-      success: false,
-      schemaVersion: 0,
-      errors: [
-        'TOKEN_ALREADY_CONSUMED: IsolatedTestToken is single-use and has already been consumed.',
-      ],
-    };
-  }
-
-  // 3. Caller stack inspection: immediate caller must be in /tests/, and no application code in call chain
-  const stack = new Error().stack || '';
-  const lines = stack.split('\n');
-  let callerIndex = -1;
-  for (let i = 0; i < lines.length; i++) {
-    if (lines[i].includes('runAdminMigrationRunnerForIsolatedTesting')) {
-      callerIndex = i + 1;
-      break;
-    }
-  }
-  if (callerIndex === -1 || callerIndex >= lines.length || !lines[callerIndex]?.trim()) {
-    return {
-      success: false,
-      schemaVersion: 0,
-      errors: [
-        'INVALID_TEST_CALLER: Unable to verify caller stack frame.',
-      ],
-    };
-  }
-
-  const immediateCallerFrame = lines[callerIndex] || '';
-  const isImmediateTestFile =
-    (immediateCallerFrame.includes('/tests/') || immediateCallerFrame.includes('\\tests\\')) &&
-    !immediateCallerFrame.includes('run-stage2a-migration');
-
-  if (!isImmediateTestFile) {
-    return {
-      success: false,
-      schemaVersion: 0,
-      errors: [
-        `INVALID_TEST_CALLER: Immediate caller of runAdminMigrationRunnerForIsolatedTesting must be in /tests/. Found: ${immediateCallerFrame.trim()}`,
-      ],
-    };
-  }
-
-  for (let i = callerIndex; i < lines.length; i++) {
-    const frame = lines[i];
-    if (
-      frame.includes('/server/') ||
-      frame.includes('\\server\\') ||
-      frame.includes('/src/') ||
-      frame.includes('\\src\\')
-    ) {
-      return {
-        success: false,
-        schemaVersion: 0,
-        errors: [
-          `INVALID_TEST_CALLER: Call chain contains application code: ${frame.trim()}`,
-        ],
-      };
-    }
-  }
-
-  // 4. One-way burn in private module state (immutable to caller modification)
-  consumedTestTokens.add(testToken);
-
-  return executeRunnerInternal(options, { isAuthorizedTestBypass: true });
-}
-
-/**
- * Internal execution kernel shared by public runner and authenticated test runner.
- */
-async function executeRunnerInternal(
-  options: AdminRunnerOptions,
-  { isAuthorizedTestBypass }: { isAuthorizedTestBypass: boolean }
-): Promise<AdminRunnerResult> {
   const now = options.now || new Date();
 
   // 1. Argument Validation
@@ -426,11 +208,43 @@ async function executeRunnerInternal(
 
   const effectiveTradingDate = options.tradingDate ? options.tradingDate.trim() : getTradingDateKolkata(now);
 
+  const adminDb = getAdminFirestore();
+  const isMock = isMockStoreEnabled();
+
+  // Store Mode Safeguard: Verify requested store mode aligns with active environment store mode
+  if (options.useMockStore !== undefined && options.useMockStore !== isMock) {
+    throw new Error(
+      `STORE_MODE_MISMATCH: Requested useMockStore=${options.useMockStore} but active system store mode is isMockStoreEnabled()=${isMock}. Execution blocked to prevent routing mismatch.`
+    );
+  }
+
+  // Fail-Closed Store Guard:
+  // In write mode, require real Firestore to be initialized and mock mode to be disabled.
+  // Never silently fall back to mock storage.
+  if (isWriteMode) {
+    if (isMock) {
+      return {
+        success: false,
+        schemaVersion: 0,
+        errors: [
+          'REAL_FIRESTORE_REQUIRED: Write mode requires mock store to be disabled (isMockStoreEnabled() === false). Mock store execution in write mode is strictly blocked in production.',
+        ],
+      };
+    }
+
+    if (!adminDb) {
+      return {
+        success: false,
+        schemaVersion: 0,
+        errors: [
+          'REAL_FIRESTORE_REQUIRED: Real Firestore Admin SDK is not initialized. Write mode cannot proceed without an active Firestore connection.',
+        ],
+      };
+    }
+  }
+
   // 2. DRY-RUN PASS (Default mode)
   if (!isWriteMode) {
-    const adminDb = getAdminFirestore();
-    const isMock = isMockStoreEnabled();
-
     let legacyRaw: any = null;
     let accountRaw: any = null;
     let legacySession: RiskSession | null = null;
@@ -448,6 +262,7 @@ async function executeRunnerInternal(
         adminDb.doc(legacySessionDocPath).get(),
         adminDb.doc(accountSessionDocPath).get(),
       ]);
+
       legacyRaw = legacyConfigSnap.exists ? legacyConfigSnap.data() : null;
       accountRaw = accountConfigSnap.exists ? accountConfigSnap.data() : null;
       legacySession = legacySessionSnap.exists ? (legacySessionSnap.data() as RiskSession) : null;
@@ -459,86 +274,43 @@ async function executeRunnerInternal(
       existingAccountSession = getMigrationMockDoc(accountSessionDocPath) || null;
     }
 
-    const { reconciledConfig, errors: configErrors } = reconcileRiskConfigs(legacyRaw, accountRaw, now);
-    if (!reconciledConfig) {
+    const configResult = reconcileRiskConfigs(legacyRaw, accountRaw, now);
+    if (!configResult.reconciledConfig) {
       return {
         dryRun: true,
         valid: false,
-        errors: configErrors || ['Configuration reconciliation failed.'],
+        errors: configResult.errors || ['Both legacy and account configs are missing or invalid.'],
       };
     }
 
-    const mirrorResult = evaluateLockMirroring(
+    const lockResult = evaluateLockMirroring(
       legacySession,
       existingAccountSession,
       cleanUserId,
       accountId,
       effectiveTradingDate,
-      reconciledConfig,
+      configResult.reconciledConfig,
       now
     );
-
-    if (!mirrorResult.valid) {
+    if (!lockResult.valid) {
       return {
         dryRun: true,
         valid: false,
-        reconciledConfig,
-        errors: [mirrorResult.error || 'Legacy session date validation failed.'],
+        reconciledConfig: configResult.reconciledConfig,
+        errors: [`LOCK_MIRRORING_FAILED: ${lockResult.error}`],
       };
     }
 
     return {
       dryRun: true,
       valid: true,
-      reconciledConfig,
-      shouldMirror: mirrorResult.shouldMirror,
-      mirroredSession: mirrorResult.mirroredSession,
+      reconciledConfig: configResult.reconciledConfig,
+      shouldMirror: lockResult.shouldMirror,
+      mirroredSession: lockResult.mirroredSession,
     };
   }
 
-  const adminDb = getAdminFirestore();
-  const isMock = isMockStoreEnabled();
-
-  // Store Mode Safeguard: Verify requested store mode aligns with active environment store mode
-  if (options.useMockStore !== undefined && options.useMockStore !== isMock) {
-    throw new Error(
-      `STORE_MODE_MISMATCH: Requested useMockStore=${options.useMockStore} but active system store mode is isMockStoreEnabled()=${isMock}. Execution blocked to prevent routing mismatch.`
-    );
-  }
-
-  // Fail-Closed Store Guard:
-  // In write mode, require real Firestore to be initialized and mock mode to be disabled.
-  // Never silently fall back to mock storage.
-  // Isolated mock testing is allowed ONLY through authorized test bypass within an isolated test environment.
-  if (isWriteMode) {
-    const isTestBypassActive = Boolean(
-      isAuthorizedTestBypass &&
-      !options.isCli &&
-      isIsolatedTestEnvironment()
-    );
-
-    if (isMock && !isTestBypassActive) {
-      return {
-        success: false,
-        schemaVersion: 0,
-        errors: [
-          'REAL_FIRESTORE_REQUIRED: Write mode requires mock store to be disabled (isMockStoreEnabled() === false). Mock store execution in write mode is blocked in production to prevent silent mock fallback.',
-        ],
-      };
-    }
-
-    if (!isMock && !adminDb) {
-      return {
-        success: false,
-        schemaVersion: 0,
-        errors: [
-          'REAL_FIRESTORE_REQUIRED: Real Firestore Admin SDK is not initialized. Write mode cannot proceed without an active Firestore connection.',
-        ],
-      };
-    }
-  }
-
-  // 3. WRITE MODE (Requires Backup Verification First)
+  // 3. WRITE MODE (Requires Real Firestore Backup Verification First)
   const backupRes = await createAndVerifyBackup(
     cleanUserId,
     accountId,
@@ -555,7 +327,7 @@ async function executeRunnerInternal(
     };
   }
 
-  // Execute existing migration function directly, passing expectedBackup to enforce post-backup staleness guard
+  // Execute migration directly, passing expectedBackup to enforce post-backup staleness guard
   const migrationRes = await migrateUserRiskData(cleanUserId, accountId, effectiveTradingDate, now, backupRes.backup);
 
   return {
