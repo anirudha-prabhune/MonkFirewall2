@@ -16,7 +16,7 @@ import { RiskConfig } from '../types/risk';
 import { saveRiskConfig } from '../services/riskConfigService';
 import { useAuth } from '../context/AuthContext';
 import { formatINR } from '../utils/formatters';
-import { validateRiskConfig } from '../../server/risk/validation';
+import { validateRiskConfig } from '../utils/validation';
 
 interface RiskConfigEditorProps {
   initialConfig: RiskConfig;

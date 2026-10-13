@@ -24,6 +24,8 @@ export const DEFAULT_RISK_CONFIG: RiskConfig = {
   enabled: true,
 };
 
+export const DEFAULT_ACCOUNT_ID = 'acc_mt_zerodha_default';
+
 export interface RiskSession {
   tradingDate: string; // YYYY-MM-DD in Asia/Kolkata
   userId: string;

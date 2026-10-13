@@ -26,9 +26,13 @@ import { ShadowRiskService } from './shadowRiskService';
  * - Excludes all broker secrets from logs
  */
 
+export const DEFAULT_ACCOUNT_ID = 'acc_mt_zerodha_default';
+
 interface UserRiskState {
   config: RiskConfig;
+  accountConfigs: Map<string, RiskConfig>; // accountId -> RiskConfig
   sessions: Map<string, RiskSession>; // tradingDate -> RiskSession
+  accountSessions: Map<string, RiskSession>; // `${accountId}__${tradingDate}` -> RiskSession
   events: RiskEvent[];
   loadedFromFirestore?: boolean;
 }
@@ -36,12 +40,42 @@ interface UserRiskState {
 export class ServerRiskStore {
   private static userStates = new Map<string, UserRiskState>();
 
+  /**
+   * Resolves the authoritative account ID for a user.
+   * If explicit accountId is provided, returns it.
+   * Otherwise inspects users/{userId}/system/migrationState.
+   * If migrationState exists and specifies accountId, uses that.
+   * Falls back to DEFAULT_ACCOUNT_ID ('acc_mt_zerodha_default').
+   */
+  public static async resolveAccountId(userId: string, accountId?: string): Promise<string> {
+    if (accountId && typeof accountId === 'string' && accountId.trim().length > 0) {
+      return accountId.trim();
+    }
+    const adminDb = getAdminFirestore();
+    if (adminDb) {
+      try {
+        const snap = await adminDb.doc(`users/${userId}/system/migrationState`).get();
+        if (snap.exists) {
+          const data = snap.data();
+          if (data && typeof data.accountId === 'string' && data.accountId.trim().length > 0) {
+            return data.accountId.trim();
+          }
+        }
+      } catch (err) {
+        console.warn(`[RiskStore] Failed to resolve migrationState for user ${userId}, falling back to default:`, err);
+      }
+    }
+    return DEFAULT_ACCOUNT_ID;
+  }
+
   private static getOrCreateUserState(userId: string): UserRiskState {
     let state = this.userStates.get(userId);
     if (!state) {
       state = {
         config: { ...DEFAULT_RISK_CONFIG, updatedAt: new Date().toISOString() },
+        accountConfigs: new Map(),
         sessions: new Map(),
+        accountSessions: new Map(),
         events: [],
         loadedFromFirestore: false,
       };
@@ -50,8 +84,16 @@ export class ServerRiskStore {
     return state;
   }
 
-  public static async getConfig(userId: string): Promise<RiskConfig> {
+  public static async getConfig(userId: string, accountId?: string): Promise<RiskConfig> {
     const userState = this.getOrCreateUserState(userId);
+    const resolvedAccountId = await this.resolveAccountId(userId, accountId);
+    
+    // Check in-memory account config cache first
+    const cachedAccountConfig = userState.accountConfigs.get(resolvedAccountId);
+    if (cachedAccountConfig) {
+      return { ...cachedAccountConfig };
+    }
+
     if (!userState.loadedFromFirestore) {
       const adminDb = getAdminFirestore();
       const isProduction = process.env.NODE_ENV === 'production';
@@ -63,13 +105,26 @@ export class ServerRiskStore {
 
       if (adminDb) {
         try {
-          const docRef = adminDb.doc(`users/${userId}/riskConfig/config`);
-          const snap = await docRef.get();
-          if (snap.exists) {
-            const raw = snap.data();
+          // Read account config first, fallback to legacy config path
+          const accountDocRef = adminDb.doc(`users/${userId}/accountRiskConfigs/${resolvedAccountId}`);
+          const legacyDocRef = adminDb.doc(`users/${userId}/riskConfig/config`);
+          const [accountSnap, legacySnap] = await Promise.all([accountDocRef.get(), legacyDocRef.get()]);
+
+          if (accountSnap.exists) {
+            const raw = accountSnap.data();
+            const validation = validateRiskConfig(raw);
+            if (validation.valid && validation.sanitized) {
+              userState.accountConfigs.set(resolvedAccountId, validation.sanitized);
+              if (resolvedAccountId === DEFAULT_ACCOUNT_ID) {
+                userState.config = validation.sanitized;
+              }
+            }
+          } else if (resolvedAccountId === DEFAULT_ACCOUNT_ID && legacySnap.exists) {
+            const raw = legacySnap.data();
             const validation = validateRiskConfig(raw);
             if (validation.valid && validation.sanitized) {
               userState.config = validation.sanitized;
+              userState.accountConfigs.set(resolvedAccountId, validation.sanitized);
             }
           }
           userState.loadedFromFirestore = true;
@@ -85,12 +140,15 @@ export class ServerRiskStore {
         userState.loadedFromFirestore = true;
       }
     }
-    return { ...userState.config };
+
+    const effectiveConfig = userState.accountConfigs.get(resolvedAccountId) || userState.config;
+    return { ...effectiveConfig };
   }
 
   public static async saveConfig(
     userId: string,
-    rawInput: any
+    rawInput: any,
+    accountId?: string
   ): Promise<{ success: boolean; config?: RiskConfig; errors?: string[]; code?: string }> {
     const validation = validateRiskConfig(rawInput);
     if (!validation.valid || !validation.sanitized) {
@@ -99,24 +157,42 @@ export class ServerRiskStore {
     }
 
     const userState = this.getOrCreateUserState(userId);
-    const currentConfig = userState.config;
+    const resolvedAccountId = await this.resolveAccountId(userId, accountId);
+    const currentConfig = userState.accountConfigs.get(resolvedAccountId) || userState.config;
     const sanitized = validation.sanitized;
 
     // Phase 11C: LOCKED Config Immutability Guard
     const today = getTradingDateKolkata(new Date());
-    let activeSession = userState.sessions.get(today) || Array.from(userState.sessions.values()).find((s) => s.state === 'LOCKED');
+    const accountSessionKey = `${resolvedAccountId}__${today}`;
+    let activeSession =
+      userState.accountSessions.get(accountSessionKey) ||
+      Array.from(userState.accountSessions.entries()).find(
+        ([key, s]) => key.startsWith(`${resolvedAccountId}__`) && s.state === 'LOCKED'
+      )?.[1] ||
+      (resolvedAccountId === DEFAULT_ACCOUNT_ID
+        ? userState.sessions.get(today) || Array.from(userState.sessions.values()).find((s) => s.state === 'LOCKED')
+        : null);
 
-    // If no in-memory locked session exists yet, evaluate live shadow state or Firestore
+    // If no in-memory locked session exists yet, evaluate live shadow state or Firestore for this specific account
     if (!activeSession || activeSession.state !== 'LOCKED') {
       const adminDb = getAdminFirestore();
       if (adminDb) {
         try {
-          const snap = await adminDb.doc(`users/${userId}/riskSessions/${today}`).get();
-          if (snap.exists) {
-            const firestoreSession = snap.data() as RiskSession;
-            if (firestoreSession && firestoreSession.state === 'LOCKED') {
-              activeSession = firestoreSession;
-              userState.sessions.set(today, activeSession);
+          const accountSnap = await adminDb.doc(`users/${userId}/accountRiskSessions/${accountSessionKey}`).get();
+          if (accountSnap.exists) {
+            const snapSession = accountSnap.data() as RiskSession;
+            if (snapSession && snapSession.state === 'LOCKED') {
+              activeSession = snapSession;
+              userState.accountSessions.set(accountSessionKey, activeSession);
+            }
+          } else if (resolvedAccountId === DEFAULT_ACCOUNT_ID) {
+            const legacySnap = await adminDb.doc(`users/${userId}/riskSessions/${today}`).get();
+            if (legacySnap.exists) {
+              const legacySession = legacySnap.data() as RiskSession;
+              if (legacySession && legacySession.state === 'LOCKED') {
+                activeSession = legacySession;
+                userState.sessions.set(today, activeSession);
+              }
             }
           }
         } catch {}
@@ -158,6 +234,8 @@ export class ServerRiskStore {
       isLocked &&
       (!activeSession?.lockUntil || new Date(activeSession.lockUntil).getTime() > Date.now());
 
+    console.log(`[DEBUG saveConfig] userId=${userId} accountId=${resolvedAccountId} isLocked=${isLocked} isLockActive=${isLockActive} activeSessionState=${activeSession?.state} currentLimit=${currentConfig?.dailyLossLimit} sanitizedLimit=${sanitized.dailyLossLimit}`);
+
     if (isLockActive) {
       const isLimitAttempted = sanitized.dailyLossLimit !== currentConfig.dailyLossLimit;
       const isLockoutAttempted =
@@ -186,10 +264,16 @@ export class ServerRiskStore {
 
     if (adminDb) {
       try {
-        const docRef = adminDb.doc(`users/${userId}/riskConfig/config`);
-        await docRef.set(sanitized, { merge: true });
+        const batch = adminDb.batch();
+        const accountConfigDocRef = adminDb.doc(`users/${userId}/accountRiskConfigs/${resolvedAccountId}`);
+        const legacyDocRef = adminDb.doc(`users/${userId}/riskConfig/config`);
+
+        batch.set(accountConfigDocRef, sanitized, { merge: true });
+        batch.set(legacyDocRef, sanitized, { merge: true });
+
+        await batch.commit();
       } catch (err) {
-        console.error(`[RiskStore] saveConfig to Firestore failed:`, err);
+        console.error(`[RiskStore] saveConfig dual-write to Firestore failed:`, err);
         throw new Error(
           `FIRESTORE_PERSISTENCE_FAILURE: Failed to persist riskConfig to Firestore: ${
             err instanceof Error ? err.message : String(err)
@@ -200,6 +284,7 @@ export class ServerRiskStore {
 
     // Mutate in-memory cache ONLY AFTER authoritative Firestore persistence succeeds
     userState.config = sanitized;
+    userState.accountConfigs.set(resolvedAccountId, sanitized);
     userState.loadedFromFirestore = true;
 
     const event: RiskEvent = {
@@ -215,11 +300,11 @@ export class ServerRiskStore {
     userState.events.push(event);
 
     console.log(
-      `[RiskStore] Config successfully updated for user ${userId}: Limit ₹${sanitized.dailyLossLimit}, Lock ${sanitized.lockDurationMinutes}m`
+      `[RiskStore] Config successfully updated for user ${userId} [account ${resolvedAccountId}]: Limit ₹${sanitized.dailyLossLimit}, Lock ${sanitized.lockDurationMinutes}m`
     );
 
     // If an active session is currently LOCKED, verify that the lock is preserved
-    const currentSession = userState.sessions.get(today);
+    const currentSession = userState.accountSessions.get(accountSessionKey) || userState.sessions.get(today);
     if (currentSession && currentSession.state === 'LOCKED') {
       console.log(
         `[RiskStore] Active lock preserved for user ${userId} on date ${today} until ${currentSession.lockUntil}`
@@ -231,16 +316,19 @@ export class ServerRiskStore {
 
   /**
    * Phase 5 Authoritative Risk Evaluation: Evaluates a PnlResult against the Risk Engine.
-   * Backed by Firestore ACID transactions with server-side concurrency serialization.
+   * Backed by Firestore ACID transactions with dual-write to accountRiskSessions and legacy riskSessions.
    */
   public static async evaluatePnlResult(
     userId: string,
     pnlResult: PnlResult,
     evaluationTime: Date = new Date(),
-    configOverride?: RiskConfig
+    configOverride?: RiskConfig,
+    accountId?: string
   ): Promise<RiskEvaluationResult> {
     const userState = this.getOrCreateUserState(userId);
     const tradingDate = pnlResult.tradingDate || getTradingDateKolkata(evaluationTime);
+    const resolvedAccountId = await this.resolveAccountId(userId, accountId);
+    const accountSessionKey = `${resolvedAccountId}__${tradingDate}`;
 
     // 1. Prioritize server-authoritative Firebase Admin SDK transaction
     const adminDb = getAdminFirestore();
@@ -253,22 +341,41 @@ export class ServerRiskStore {
 
     if (adminDb) {
       const sessionDocRef = adminDb.doc(`users/${userId}/riskSessions/${tradingDate}`);
+      const accountSessionDocRef = adminDb.doc(`users/${userId}/accountRiskSessions/${accountSessionKey}`);
       const configDocRef = adminDb.doc(`users/${userId}/riskConfig/config`);
+      const accountConfigDocRef = adminDb.doc(`users/${userId}/accountRiskConfigs/${resolvedAccountId}`);
 
       try {
         const txResult = await adminDb.runTransaction(async (transaction) => {
-          const [sessionSnap, configSnap] = await Promise.all([
+          const [sessionSnap, accountSessionSnap, configSnap, accountConfigSnap] = await Promise.all([
             transaction.get(sessionDocRef),
+            transaction.get(accountSessionDocRef),
             transaction.get(configDocRef),
+            transaction.get(accountConfigDocRef),
           ]);
 
-          const activeConfig: RiskConfig = configOverride || (configSnap.exists
-            ? (configSnap.data() as RiskConfig)
-            : userState.config);
+          let activeConfig: RiskConfig;
+          if (configOverride) {
+            activeConfig = configOverride;
+          } else if (accountConfigSnap.exists) {
+            activeConfig = accountConfigSnap.data() as RiskConfig;
+          } else if (configSnap.exists) {
+            activeConfig = configSnap.data() as RiskConfig;
+          } else {
+            activeConfig = userState.accountConfigs.get(resolvedAccountId) || userState.config;
+          }
 
-          const existingSession: RiskSession | null = sessionSnap.exists
-            ? (sessionSnap.data() as RiskSession)
-            : userState.sessions.get(tradingDate) || null;
+          let existingSession: RiskSession | null = null;
+          if (accountSessionSnap.exists) {
+            existingSession = accountSessionSnap.data() as RiskSession;
+          } else if (sessionSnap.exists) {
+            existingSession = sessionSnap.data() as RiskSession;
+          } else {
+            existingSession =
+              userState.accountSessions.get(accountSessionKey) ||
+              userState.sessions.get(tradingDate) ||
+              null;
+          }
 
           const evaluation = RiskEngine.evaluate({
             userId,
@@ -278,8 +385,13 @@ export class ServerRiskStore {
             evaluationTime,
           });
 
-          // Persist authoritative session in Firestore transaction
-          transaction.set(sessionDocRef, evaluation.session);
+          // Dual-write atomic transaction: write to account-level session.
+          // Dual-write to legacy session doc users/{userId}/riskSessions/{tradingDate}
+          // ONLY for the default Zerodha account (preserving legacy Zerodha invariants and isolation for non-default accounts).
+          transaction.set(accountSessionDocRef, evaluation.session);
+          if (resolvedAccountId === DEFAULT_ACCOUNT_ID) {
+            transaction.set(sessionDocRef, evaluation.session);
+          }
 
           // Record transition events in Firestore transaction
           for (const event of evaluation.transitionEvents) {
@@ -291,7 +403,10 @@ export class ServerRiskStore {
         });
 
         // Synchronize in-memory cache with committed transaction
-        userState.sessions.set(tradingDate, txResult.session);
+        userState.accountSessions.set(accountSessionKey, txResult.session);
+        if (resolvedAccountId === DEFAULT_ACCOUNT_ID) {
+          userState.sessions.set(tradingDate, txResult.session);
+        }
         for (const event of txResult.transitionEvents) {
           userState.events.push(event);
         }
@@ -307,8 +422,15 @@ export class ServerRiskStore {
     }
 
     // In-memory server-authoritative evaluation (strictly preserved for unit test runner / mock store)
-    const existingSession = userState.sessions.get(tradingDate) || null;
-    const activeConfig = configOverride || userState.config;
+    // Account isolation: use account-specific session; fallback to legacy session only for default account
+    const existingSession =
+      userState.accountSessions.get(accountSessionKey) ||
+      (resolvedAccountId === DEFAULT_ACCOUNT_ID ? userState.sessions.get(tradingDate) : null) ||
+      null;
+    const activeConfig =
+      configOverride ||
+      userState.accountConfigs.get(resolvedAccountId) ||
+      userState.config;
 
     const result = RiskEngine.evaluate({
       userId,
@@ -318,7 +440,10 @@ export class ServerRiskStore {
       evaluationTime,
     });
 
-    userState.sessions.set(tradingDate, result.session);
+    userState.accountSessions.set(accountSessionKey, result.session);
+    if (resolvedAccountId === DEFAULT_ACCOUNT_ID) {
+      userState.sessions.set(tradingDate, result.session);
+    }
 
     for (const event of result.transitionEvents) {
       userState.events.push(event);
@@ -335,12 +460,13 @@ export class ServerRiskStore {
    */
   public static async evaluateFromPositions(
     userId: string,
-    evaluationTime: Date = new Date()
+    evaluationTime: Date = new Date(),
+    accountId?: string
   ): Promise<RiskEvaluationResult> {
-    const config = await this.getConfig(userId);
+    const config = await this.getConfig(userId, accountId);
     const positions = await BrokerService.getNormalizedPositions();
     const pnlResult = PnlEngine.calculate(positions, config, evaluationTime);
-    return await this.evaluatePnlResult(userId, pnlResult, evaluationTime);
+    return await this.evaluatePnlResult(userId, pnlResult, evaluationTime, undefined, accountId);
   }
 
   /**
@@ -349,9 +475,10 @@ export class ServerRiskStore {
   public static async evaluatePnl(
     userId: string,
     pnl: number,
-    evaluationTime: Date = new Date()
+    evaluationTime: Date = new Date(),
+    accountId?: string
   ): Promise<RiskEvaluationResult> {
-    const config = await this.getConfig(userId);
+    const config = await this.getConfig(userId, accountId);
     const tradingDate = getTradingDateKolkata(evaluationTime);
     const syntheticPnlResult: PnlResult = {
       tradingDate,
@@ -368,13 +495,20 @@ export class ServerRiskStore {
       calculatedAt: evaluationTime.toISOString(),
     };
 
-    return await this.evaluatePnlResult(userId, syntheticPnlResult, evaluationTime);
+    return await this.evaluatePnlResult(userId, syntheticPnlResult, evaluationTime, undefined, accountId);
   }
 
-  public static async getSession(userId: string, tradingDate?: string): Promise<RiskSession> {
+  public static async getSession(
+    userId: string,
+    tradingDate?: string,
+    accountId?: string
+  ): Promise<RiskSession> {
     const userState = this.getOrCreateUserState(userId);
     const date = tradingDate || getTradingDateKolkata(new Date());
-    let session = userState.sessions.get(date);
+    const resolvedAccountId = await this.resolveAccountId(userId, accountId);
+    const accountSessionKey = `${resolvedAccountId}__${date}`;
+
+    let session = userState.accountSessions.get(accountSessionKey) || (resolvedAccountId === DEFAULT_ACCOUNT_ID ? userState.sessions.get(date) : undefined);
 
     if (!session) {
       // 1. Try to load from Firestore via Firebase Admin SDK
@@ -388,11 +522,23 @@ export class ServerRiskStore {
 
       if (adminDb) {
         try {
-          const docRef = adminDb.doc(`users/${userId}/riskSessions/${date}`);
-          const snap = await docRef.get();
-          if (snap.exists) {
-            session = snap.data() as RiskSession;
+          const accountDocRef = adminDb.doc(`users/${userId}/accountRiskSessions/${accountSessionKey}`);
+          const legacyDocRef = adminDb.doc(`users/${userId}/riskSessions/${date}`);
+          const [accountSnap, legacySnap] = await Promise.all([
+            accountDocRef.get(),
+            resolvedAccountId === DEFAULT_ACCOUNT_ID ? legacyDocRef.get() : Promise.resolve({ exists: false } as any)
+          ]);
+
+          if (accountSnap.exists) {
+            session = accountSnap.data() as RiskSession;
+            userState.accountSessions.set(accountSessionKey, session);
+            if (resolvedAccountId === DEFAULT_ACCOUNT_ID) {
+              userState.sessions.set(date, session);
+            }
+          } else if (resolvedAccountId === DEFAULT_ACCOUNT_ID && legacySnap.exists) {
+            session = legacySnap.data() as RiskSession;
             userState.sessions.set(date, session);
+            userState.accountSessions.set(accountSessionKey, session);
           }
         } catch (err) {
           console.error(`[RiskStore] getSession from Firestore failed for user ${userId}:`, err);
@@ -407,14 +553,18 @@ export class ServerRiskStore {
 
     if (!session) {
       // Evaluate from current positions
-      const evalResult = await this.evaluateFromPositions(userId, new Date());
+      const evalResult = await this.evaluateFromPositions(userId, new Date(), resolvedAccountId);
       session = evalResult.session;
     }
 
     return { ...session };
   }
 
-  public static async getLockStatus(userId: string): Promise<{
+  public static async getLockStatus(
+    userId: string,
+    accountId?: string,
+    tradingDate?: string
+  ): Promise<{
     state: string;
     locked: boolean;
     isBreached: boolean;
@@ -423,9 +573,11 @@ export class ServerRiskStore {
     lockUntil: string | null;
     remainingSeconds: number;
     reason: string | null;
+    accountId?: string;
   }> {
     const now = new Date();
-    const session = await this.getSession(userId);
+    const resolvedAccountId = await this.resolveAccountId(userId, accountId);
+    const session = await this.getSession(userId, tradingDate, resolvedAccountId);
     const isLocked = session.state === 'LOCKED';
 
     let remainingSeconds = 0;
@@ -443,6 +595,7 @@ export class ServerRiskStore {
       lockUntil: session.lockUntil,
       remainingSeconds,
       reason: session.reason,
+      accountId: resolvedAccountId,
     };
   }
 
@@ -500,23 +653,33 @@ export class ServerRiskStore {
   /**
    * Reset session back to baseline state (used for Demo Reset).
    */
-  public static async resetSession(userId: string): Promise<RiskSession> {
+  public static async resetSession(userId: string, accountId?: string): Promise<RiskSession> {
     const userState = this.getOrCreateUserState(userId);
     const today = getTradingDateKolkata(new Date());
+    const resolvedAccountId = await this.resolveAccountId(userId, accountId);
+    const accountSessionKey = `${resolvedAccountId}__${today}`;
+
     userState.sessions.delete(today);
+    userState.accountSessions.delete(accountSessionKey);
 
     const adminDb = getAdminFirestore();
     if (adminDb) {
       try {
+        const batch = adminDb.batch();
         const sessionDocRef = adminDb.doc(`users/${userId}/riskSessions/${today}`);
-        await sessionDocRef.delete();
+        const accountSessionDocRef = adminDb.doc(`users/${userId}/accountRiskSessions/${accountSessionKey}`);
+
+        batch.delete(sessionDocRef);
+        batch.delete(accountSessionDocRef);
+
+        await batch.commit();
       } catch (err) {
         console.error(`[RiskStore] resetSession Firestore delete failed:`, err);
         throw new Error(`FIRESTORE_PERSISTENCE_FAILURE: Failed to delete riskSession from Firestore: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
 
-    const evalResult = await this.evaluateFromPositions(userId, new Date());
+    const evalResult = await this.evaluateFromPositions(userId, new Date(), resolvedAccountId);
     return evalResult.session;
   }
 

@@ -23,6 +23,7 @@ import { RiskConfig, RiskSession } from '../types/risk';
 import { formatINR, getISTReadableDate, getISTTimestamp } from '../utils/formatters';
 import { useAuth } from '../context/AuthContext';
 import { subscribeRiskSession } from '../services/riskSessionService';
+import { getRiskConfig, subscribeRiskConfig } from '../services/riskConfigService';
 import { fetchFnoPositions, fetchBrokerStatus } from '../services/brokerPositionService';
 import { fetchGrossPnl } from '../services/pnlService';
 import {
@@ -37,6 +38,8 @@ import {
   disconnectZerodhaSession,
 } from '../services/liveBrokerService';
 import { getAuthHeaders } from '../services/firebase';
+import { getBrokerConnections } from '../services/brokerConnectionService';
+import { BrokerConnection } from '../types/broker';
 
 interface DashboardOverviewProps {
   riskConfig: RiskConfig;
@@ -103,6 +106,37 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
   // Positions display filter: hide zero-quantity closed positions by default
   const [showClosedPositions, setShowClosedPositions] = useState<boolean>(false);
 
+  // Multi-Account Selection & Account-Scoped Risk Configuration State
+  const [accountRiskConfig, setAccountRiskConfig] = useState<RiskConfig>(riskConfig);
+  const [accountsLoading, setAccountsLoading] = useState<boolean>(true);
+  const [connectedAccounts, setConnectedAccounts] = useState<Array<{ connectionId: string; connection: BrokerConnection }>>([]);
+  const [selectedAccountId, setSelectedAccountId] = useState<string>('acc_mt_zerodha_default');
+
+  const activeConfig = accountRiskConfig || riskConfig;
+
+  useEffect(() => {
+    if (!user) return;
+    setAccountsLoading(true);
+    getBrokerConnections(user.uid)
+      .then((accs) => {
+        setConnectedAccounts(accs);
+        if (accs.length > 0 && !accs.some((a) => a.connectionId === selectedAccountId)) {
+          setSelectedAccountId(accs[0].connectionId);
+        }
+      })
+      .catch(() => {
+        setConnectedAccounts([
+          {
+            connectionId: 'acc_mt_zerodha_default',
+            connection: { broker: 'zerodha', status: 'DISCONNECTED', userId: user.uid },
+          },
+        ]);
+      })
+      .finally(() => {
+        setAccountsLoading(false);
+      });
+  }, [user]);
+
   // IST Clock update loop
   useEffect(() => {
     const timer = setInterval(() => {
@@ -111,17 +145,34 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
     return () => clearInterval(timer);
   }, []);
 
-  // Subscribe to real-time Risk Session
+  // When selectedAccountId changes, fetch/subscribe to risk config and risk session for this account
   useEffect(() => {
     if (!user) return;
-    const unsubscribe = subscribeRiskSession(
+
+    getRiskConfig(user.uid, selectedAccountId)
+      .then((cfg) => setAccountRiskConfig(cfg))
+      .catch(() => setAccountRiskConfig(riskConfig));
+
+    const unsubConfig = subscribeRiskConfig(
+      user.uid,
+      (cfg) => setAccountRiskConfig(cfg),
+      undefined,
+      selectedAccountId
+    );
+
+    const unsubSession = subscribeRiskSession(
       user.uid,
       (updatedSession) => {
         setSession(updatedSession);
-      }
+      },
+      selectedAccountId
     );
-    return () => unsubscribe();
-  }, [user]);
+
+    return () => {
+      unsubConfig();
+      unsubSession();
+    };
+  }, [user, selectedAccountId]);
 
   // Load Positions and P&L
   const loadPositionsAndPnl = async () => {
@@ -296,11 +347,12 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
       const headers = await getAuthHeaders({
         'Content-Type': 'application/json',
         ...(user?.uid ? { 'x-user-id': user.uid } : {}),
+        'x-account-id': selectedAccountId,
       });
-      const res = await fetch('/api/risk/evaluate', {
+      const res = await fetch(`/api/risk/evaluate?accountId=${encodeURIComponent(selectedAccountId)}`, {
         method: 'POST',
         headers,
-        body: JSON.stringify({ pnl: targetPnl }),
+        body: JSON.stringify({ pnl: targetPnl, accountId: selectedAccountId }),
       });
       const data = await res.json();
       if (res.ok && data.session) {
@@ -323,11 +375,12 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
       const headers = await getAuthHeaders({
         'Content-Type': 'application/json',
         ...(user?.uid ? { 'x-user-id': user.uid } : {}),
+        'x-account-id': selectedAccountId,
       });
-      const res = await fetch('/api/risk/evaluate', {
+      const res = await fetch(`/api/risk/evaluate?accountId=${encodeURIComponent(selectedAccountId)}`, {
         method: 'POST',
         headers,
-        body: JSON.stringify({ reset: true }),
+        body: JSON.stringify({ reset: true, accountId: selectedAccountId }),
       });
       const data = await res.json();
       if (res.ok && data.session) {
@@ -352,7 +405,7 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
     const expiry = new Date(session.lockUntil).getTime();
     const diffMs = expiry - now;
 
-    if (riskConfig.lockDurationType === 'UNTIL_4PM') {
+    if (activeConfig.lockDurationType === 'UNTIL_4PM') {
       if (diffMs <= 0) return 'Lock ends at 04:00 PM IST';
       const minutes = Math.floor(diffMs / (1000 * 60));
       const hours = Math.floor(minutes / 60);
@@ -400,10 +453,10 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
     : (session.unrealisedPnl ?? (pnlResult?.unrealisedPnl ?? 0));
 
   const lossAmount = effectivePnl < 0 ? Math.abs(effectivePnl) : 0;
-  const lossUtilizedPercent = riskConfig.dailyLossLimit > 0
-    ? Math.min(100, Math.round((lossAmount / riskConfig.dailyLossLimit) * 100))
+  const lossUtilizedPercent = activeConfig.dailyLossLimit > 0
+    ? Math.min(100, Math.round((lossAmount / activeConfig.dailyLossLimit) * 100))
     : 0;
-  const remainingBuffer = Math.max(0, riskConfig.dailyLossLimit - lossAmount);
+  const remainingBuffer = Math.max(0, activeConfig.dailyLossLimit - lossAmount);
 
   // Filter zero-quantity closed positions by default, but show them if all positions are closed (squared-off)
   const openPositions = fnoPositions.filter((pos) => pos.quantity !== 0);
@@ -412,6 +465,43 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
 
   return (
     <div className="space-y-6">
+      {/* Account Selector Bar */}
+      <div className="bg-white dark:bg-[#1F2633] p-4 rounded-xl border border-[#98C1D9]/40 dark:border-[#3D4A5E] shadow-xs flex flex-col sm:flex-row items-center justify-between gap-4">
+        <div className="flex items-center space-x-3">
+          <div className="p-2.5 rounded-xl bg-[#3D5A80]/10 text-[#3D5A80] dark:text-[#98C1D9]">
+            <Layers className="w-5 h-5" />
+          </div>
+          <div>
+            <h3 className="text-xs font-bold uppercase tracking-wider text-[#293241] dark:text-[#E0FBFC]">
+              Active Trading Account
+            </h3>
+            <p className="text-[11px] text-[#5C6B7E] dark:text-[#98C1D9] font-mono">
+              Account ID: {selectedAccountId}
+            </p>
+          </div>
+        </div>
+        <div className="flex items-center space-x-3 w-full sm:w-auto">
+          {accountsLoading ? (
+            <div className="text-xs text-[#3D5A80] dark:text-[#98C1D9] flex items-center space-x-2 font-mono px-3 py-2">
+              <RefreshCw className="w-3.5 h-3.5 animate-spin text-[#EE6C4D]" />
+              <span>DISCOVERING ACCOUNTS...</span>
+            </div>
+          ) : (
+            <select
+              value={selectedAccountId}
+              onChange={(e) => setSelectedAccountId(e.target.value)}
+              className="w-full sm:w-64 text-xs font-medium px-3 py-2 rounded-lg bg-slate-50 dark:bg-[#19202B] border border-[#98C1D9]/40 dark:border-[#3D4A5E] text-[#293241] dark:text-[#E0FBFC] focus:outline-hidden focus:border-[#3D5A80] cursor-pointer"
+            >
+              {connectedAccounts.map((acc) => (
+                <option key={acc.connectionId} value={acc.connectionId}>
+                  {acc.connectionId} ({acc.connection.broker.toUpperCase()} - {acc.connection.status})
+                </option>
+              ))}
+            </select>
+          )}
+        </div>
+      </div>
+
       {/* Auth / Operational Notification Banner */}
       {kiteAuthMessage && (
         <div

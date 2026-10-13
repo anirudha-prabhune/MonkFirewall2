@@ -2,13 +2,14 @@ import { doc, getDoc, onSnapshot } from 'firebase/firestore';
 import { db, getAuthHeaders } from './firebase';
 import { RiskConfig, DEFAULT_RISK_CONFIG } from '../types/risk';
 import { handleFirestoreError, OperationType } from './firestoreErrors';
-import { validateRiskConfig } from '../../server/risk/validation';
+import { validateRiskConfig } from '../utils/validation';
 
 const LOCAL_STORAGE_KEY_PREFIX = 'trading_firewall_risk_config_';
 
-export async function getRiskConfig(userId: string): Promise<RiskConfig> {
+export async function getRiskConfig(userId: string, accountId?: string): Promise<RiskConfig> {
+  const cacheKey = accountId ? `${userId}_${accountId}` : userId;
   if (userId.startsWith('mock-')) {
-    const raw = localStorage.getItem(`${LOCAL_STORAGE_KEY_PREFIX}${userId}`);
+    const raw = localStorage.getItem(`${LOCAL_STORAGE_KEY_PREFIX}${cacheKey}`);
     if (raw) {
       try {
         const parsed = JSON.parse(raw);
@@ -22,14 +23,18 @@ export async function getRiskConfig(userId: string): Promise<RiskConfig> {
       ...DEFAULT_RISK_CONFIG,
       updatedAt: new Date().toISOString(),
     };
-    localStorage.setItem(`${LOCAL_STORAGE_KEY_PREFIX}${userId}`, JSON.stringify(initialConfig));
+    localStorage.setItem(`${LOCAL_STORAGE_KEY_PREFIX}${cacheKey}`, JSON.stringify(initialConfig));
     return initialConfig;
   }
 
-  // 1. Fetch via authenticated Server API
+  // 1. Fetch via authenticated Server API with accountId
   try {
-    const headers = await getAuthHeaders({ 'x-user-id': userId });
-    const res = await fetch('/api/risk/config', { headers });
+    const headers = await getAuthHeaders({
+      'x-user-id': userId,
+      ...(accountId ? { 'x-account-id': accountId } : {}),
+    });
+    const url = `/api/risk/config${accountId ? `?accountId=${encodeURIComponent(accountId)}` : ''}`;
+    const res = await fetch(url, { headers });
     if (res.ok) {
       const data = await res.json();
       const val = validateRiskConfig(data);
@@ -41,9 +46,9 @@ export async function getRiskConfig(userId: string): Promise<RiskConfig> {
     // Fallback to read-only Firestore snapshot
   }
 
-  const path = `users/${userId}/riskConfig/config`;
+  const path = accountId ? `users/${userId}/accountRiskConfigs/${accountId}` : `users/${userId}/riskConfig/config`;
   try {
-    const configDocRef = doc(db, 'users', userId, 'riskConfig', 'config');
+    const configDocRef = doc(db, 'users', userId, accountId ? 'accountRiskConfigs' : 'riskConfig', accountId || 'config');
     const snapshot = await getDoc(configDocRef);
 
     if (snapshot.exists()) {
@@ -69,10 +74,12 @@ export async function getRiskConfig(userId: string): Promise<RiskConfig> {
 
 export async function saveRiskConfig(
   userId: string,
-  newConfig: Partial<RiskConfig>
+  newConfig: Partial<RiskConfig>,
+  accountId?: string
 ): Promise<RiskConfig> {
+  const cacheKey = accountId ? `${userId}_${accountId}` : userId;
   if (userId.startsWith('mock-')) {
-    const current = await getRiskConfig(userId);
+    const current = await getRiskConfig(userId, accountId);
     const combined = {
       ...current,
       ...newConfig,
@@ -82,7 +89,7 @@ export async function saveRiskConfig(
       throw new Error(validation.errors.join(', '));
     }
     const sanitized = validation.sanitized;
-    localStorage.setItem(`${LOCAL_STORAGE_KEY_PREFIX}${userId}`, JSON.stringify(sanitized));
+    localStorage.setItem(`${LOCAL_STORAGE_KEY_PREFIX}${cacheKey}`, JSON.stringify(sanitized));
     window.dispatchEvent(new CustomEvent('sandbox-risk-config-updated', { detail: sanitized }));
     return sanitized;
   }
@@ -91,12 +98,14 @@ export async function saveRiskConfig(
   const headers = await getAuthHeaders({
     'Content-Type': 'application/json',
     'x-user-id': userId,
+    ...(accountId ? { 'x-account-id': accountId } : {}),
   });
 
-  const response = await fetch('/api/risk/config', {
+  const url = `/api/risk/config${accountId ? `?accountId=${encodeURIComponent(accountId)}` : ''}`;
+  const response = await fetch(url, {
     method: 'PUT',
     headers,
-    body: JSON.stringify(newConfig),
+    body: JSON.stringify({ ...newConfig, ...(accountId ? { accountId } : {}) }),
   });
 
   const data = await response.json();
@@ -113,41 +122,54 @@ export async function saveRiskConfig(
 export function subscribeRiskConfig(
   userId: string,
   onUpdate: (config: RiskConfig) => void,
-  onError?: (err: Error) => void
+  onError?: (err: Error) => void,
+  accountId?: string
 ): () => void {
   if (userId.startsWith('mock-')) {
-    getRiskConfig(userId).then(onUpdate);
+    getRiskConfig(userId, accountId).then(onUpdate);
     const listener = (e: Event) => {
-      const detail = (e as CustomEvent).detail as RiskConfig;
-      if (detail) onUpdate(detail);
+      getRiskConfig(userId, accountId).then(onUpdate);
     };
     window.addEventListener('sandbox-risk-config-updated', listener);
     return () => window.removeEventListener('sandbox-risk-config-updated', listener);
   }
 
-  const path = `users/${userId}/riskConfig/config`;
-  const configDocRef = doc(db, 'users', userId, 'riskConfig', 'config');
+  let active = true;
+  const poll = async () => {
+    if (!active) return;
+    try {
+      const cfg = await getRiskConfig(userId, accountId);
+      if (active) onUpdate(cfg);
+    } catch (err) {
+      if (onError && err instanceof Error) onError(err);
+    }
+  };
 
-  return onSnapshot(
+  poll();
+  const interval = setInterval(poll, 4000);
+
+  // Firestore realtime snapshot listener
+  const path = accountId ? `users/${userId}/accountRiskConfigs/${accountId}` : `users/${userId}/riskConfig/config`;
+  const configDocRef = doc(db, 'users', userId, accountId ? 'accountRiskConfigs' : 'riskConfig', accountId || 'config');
+  const unsubscribeFirestore = onSnapshot(
     configDocRef,
     (snapshot) => {
-      if (snapshot.exists()) {
+      if (snapshot.exists() && active) {
         const data = snapshot.data() as RiskConfig;
-        const val = validateRiskConfig(data);
-        if (val.valid && val.sanitized) {
-          onUpdate(val.sanitized);
-        } else {
-          onUpdate(DEFAULT_RISK_CONFIG);
+        const validation = validateRiskConfig(data);
+        if (validation.valid && validation.sanitized) {
+          onUpdate(validation.sanitized);
         }
-      } else {
-        onUpdate(DEFAULT_RISK_CONFIG);
       }
     },
     (error) => {
-      if (onError) {
-        onError(error);
-      }
-      handleFirestoreError(error, OperationType.GET, path);
+      if (onError) onError(error);
     }
   );
+
+  return () => {
+    active = false;
+    clearInterval(interval);
+    unsubscribeFirestore();
+  };
 }

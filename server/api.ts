@@ -10,6 +10,9 @@ import { MarketDataService } from './market/marketDataService';
 import { LivePnlValidationService } from './pnl/liveValidationService';
 import { ValidationSessionManager } from './pnl/validationSession';
 import { ZerodhaCredentialManager } from './brokers/zerodha/credentials';
+import { liveAngelOneAdapter } from './brokers/angelone/liveAdapter';
+import { AngelOneSessionStore } from './brokers/angelone/sessionStore';
+import { normalizePositions } from './brokers/normalize';
 import { ShadowRiskService } from './risk/shadowRiskService';
 import {
   LiveRiskRecorder,
@@ -358,6 +361,64 @@ apiRouter.get('/broker/live/positions', async (req: Request, res: Response) => {
   }
 });
 
+// ============================================================================
+// ANGEL ONE SMARTAPI ENDPOINTS (PHASE 1 MULTI-BROKER)
+// ============================================================================
+
+apiRouter.get('/broker/angelone/live/status', async (req: Request, res: Response) => {
+  try {
+    const userId = (req as any).userId || await authenticateRequest(req, res);
+    if (!userId) return;
+    const status = await liveAngelOneAdapter.getConnectionStatus(userId);
+    sendJson(res, status);
+  } catch (err) {
+    sendJson(res, { error: err instanceof Error ? err.message : 'Failed to retrieve Angel One status' }, 500);
+  }
+});
+
+apiRouter.get('/broker/angelone/live/positions', async (req: Request, res: Response) => {
+  try {
+    const userId = (req as any).userId || await authenticateRequest(req, res);
+    if (!userId) return;
+    const rawPositions = await liveAngelOneAdapter.getPositions(userId);
+    const instruments = await liveAngelOneAdapter.getInstruments(userId);
+    const instrumentMap = new Map<number, any>(instruments.map((i: any) => [i.instrumentToken, i]));
+    const normalized = normalizePositions(rawPositions, instrumentMap as any, 'ZERODHA_LIVE' as any);
+    sendJson(res, {
+      broker: 'angelone',
+      positionCount: normalized.length,
+      positions: normalized,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (err) {
+    sendJson(res, { error: err instanceof Error ? err.message : 'Failed to fetch Angel One positions' }, 500);
+  }
+});
+
+apiRouter.post('/broker/angelone/live/auth/session', async (req: Request, res: Response) => {
+  try {
+    const userId = (req as any).userId || await authenticateRequest(req, res);
+    if (!userId) return;
+    const accessToken = req.body?.accessToken || 'mock_angelone_token';
+    const clientCode = req.body?.clientCode;
+    const saved = await AngelOneSessionStore.saveSession(userId, accessToken, { clientCode });
+    sendJson(res, { success: true, ...saved });
+  } catch (err) {
+    sendJson(res, { error: err instanceof Error ? err.message : 'Failed to save Angel One session' }, 500);
+  }
+});
+
+apiRouter.post('/broker/angelone/live/auth/disconnect', async (req: Request, res: Response) => {
+  try {
+    const userId = (req as any).userId || await authenticateRequest(req, res);
+    if (!userId) return;
+    await AngelOneSessionStore.invalidateSession(userId);
+    sendJson(res, { success: true, status: 'AUTHENTICATION_REQUIRED', message: 'Angel One session invalidated.' });
+  } catch (err) {
+    sendJson(res, { error: err instanceof Error ? err.message : 'Failed to disconnect Angel One session' }, 500);
+  }
+});
+
 // GET /api/broker/live/market-data/status - Phase 7 Read-Only Market Data Feed Status
 apiRouter.get('/broker/live/market-data/status', async (req: Request, res: Response) => {
   try {
@@ -695,6 +756,7 @@ apiRouter.get('/risk', async (req: Request, res: Response) => {
   try {
     const userId = (req as any).userId || await authenticateRequest(req, res);
     if (!userId) return;
+    const accountId = (req.query?.accountId as string) || (req.headers['x-account-id'] as string) || undefined;
     if (!(await getLiveRiskStateRecordingEnabled(userId))) {
       const liveAdapter = BrokerService.getLiveAdapter();
       const connStatus = await liveAdapter.getConnectionStatus(userId);
@@ -719,7 +781,7 @@ apiRouter.get('/risk', async (req: Request, res: Response) => {
         const shadowResult = await ShadowRiskService.evaluateLiveShadow(userId, {
           evaluationTime: testEvalTime,
         });
-        const config = await ServerRiskStore.getConfig(userId);
+        const config = await ServerRiskStore.getConfig(userId, accountId);
         return sendJson(res, {
           tradingDate: shadowResult.tradingDate,
           userId,
@@ -740,7 +802,7 @@ apiRouter.get('/risk', async (req: Request, res: Response) => {
         });
       }
     }
-    const session = await ServerRiskStore.getSession(userId);
+    const session = await ServerRiskStore.getSession(userId, undefined, accountId);
     sendJson(res, session);
   } catch (err) {
     sendJson(res, { error: err instanceof Error ? err.message : 'Failed to fetch risk session' }, 500);
@@ -752,7 +814,8 @@ apiRouter.get('/risk/config', async (req: Request, res: Response) => {
   try {
     const userId = (req as any).userId || await authenticateRequest(req, res);
     if (!userId) return;
-    const config = await ServerRiskStore.getConfig(userId);
+    const accountId = (req.query?.accountId as string) || (req.headers['x-account-id'] as string) || undefined;
+    const config = await ServerRiskStore.getConfig(userId, accountId);
     sendJson(res, config);
   } catch (err) {
     sendJson(res, { error: err instanceof Error ? err.message : 'Failed to fetch risk config' }, 500);
@@ -765,7 +828,8 @@ apiRouter.put('/risk/config', async (req: Request, res: Response) => {
     const userId = (req as any).userId || await authenticateRequest(req, res);
     if (!userId) return;
     const body = req.body;
-    const result = await ServerRiskStore.saveConfig(userId, body);
+    const accountId = (req.query?.accountId as string) || (req.body?.accountId as string) || (req.headers['x-account-id'] as string) || undefined;
+    const result = await ServerRiskStore.saveConfig(userId, body, accountId);
 
     if (!result.success) {
       const isLocked = result.code === 'RISK_CONFIG_LOCKED' || result.errors?.some(e => e.includes('RISK_CONFIG_LOCKED'));
@@ -791,7 +855,8 @@ apiRouter.get('/lock/status', async (req: Request, res: Response) => {
   try {
     const userId = (req as any).userId || await authenticateRequest(req, res);
     if (!userId) return;
-    const status = await ServerRiskStore.getLockStatus(userId);
+    const accountId = (req.query?.accountId as string) || (req.headers['x-account-id'] as string) || undefined;
+    const status = await ServerRiskStore.getLockStatus(userId, accountId);
     sendJson(res, { ...status, authority: 'server' });
   } catch (err) {
     sendJson(res, { error: err instanceof Error ? err.message : 'Failed to fetch lock status' }, 500);
@@ -859,6 +924,7 @@ apiRouter.post('/risk/evaluate', async (req: Request, res: Response) => {
     const userId = (req as any).userId || await authenticateRequest(req, res);
     if (!userId) return;
 
+    const accountId = (req.query?.accountId as string) || (req.body?.accountId as string) || (req.headers['x-account-id'] as string) || undefined;
     const evalDate = req.body?.evaluationTime ? new Date(req.body.evaluationTime) : new Date();
 
     const isSandboxUser = userId === 'mock-trader-sandbox' || userId.startsWith('mock-');
@@ -876,7 +942,7 @@ apiRouter.post('/risk/evaluate', async (req: Request, res: Response) => {
           403
         );
       }
-      const resetSession = await ServerRiskStore.resetSession(userId);
+      const resetSession = await ServerRiskStore.resetSession(userId, accountId);
       return sendJson(res, {
         success: true,
         state: resetSession.state,
@@ -898,12 +964,12 @@ apiRouter.post('/risk/evaluate', async (req: Request, res: Response) => {
       if (typeof req.body.pnl !== 'number' || isNaN(req.body.pnl)) {
         return sendJson(res, { error: 'Valid numeric pnl is required for simulation' }, 400);
       }
-      const result = await ServerRiskStore.evaluatePnl(userId, req.body.pnl, evalDate);
+      const result = await ServerRiskStore.evaluatePnl(userId, req.body.pnl, evalDate, accountId);
       return sendJson(res, result);
     }
 
     // Phase 5 Authoritative Pipeline: Server loads positions, runs PnlEngine, and evaluates RiskEngine
-    const result = await ServerRiskStore.evaluateFromPositions(userId, evalDate);
+    const result = await ServerRiskStore.evaluateFromPositions(userId, evalDate, accountId);
     sendJson(res, result);
   } catch (err) {
     sendJson(res, { error: err instanceof Error ? err.message : 'Evaluation failed' }, 500);

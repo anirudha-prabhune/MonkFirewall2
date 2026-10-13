@@ -4,20 +4,19 @@ import { RiskSession } from '../types/risk';
 import { handleFirestoreError, OperationType } from './firestoreErrors';
 
 /**
- * Client service to read authoritative RiskSession and Lock state.
- *
- * NOTE: The client is READ-ONLY for riskSessions. All writes and mutations
- * are server-authoritative and denied to the client by Firestore security rules.
+ * Client service to read authoritative RiskSession and Lock state with multi-account support.
  */
 
-export async function getAuthoritativeRiskSession(userId: string): Promise<RiskSession> {
-  // If in sandbox mode or offline
+export async function getAuthoritativeRiskSession(userId: string, accountId?: string): Promise<RiskSession> {
+  const headers = await getAuthHeaders({
+    'x-user-id': userId,
+    ...(accountId ? { 'x-account-id': accountId } : {}),
+  });
+  const url = `/api/risk${accountId ? `?accountId=${encodeURIComponent(accountId)}` : ''}`;
+
   if (userId.startsWith('mock-')) {
     try {
-      const headers = await getAuthHeaders({ 'x-user-id': userId });
-      const res = await fetch('/api/risk', {
-        headers,
-      });
+      const res = await fetch(url, { headers });
       if (res.ok) {
         return await res.json();
       }
@@ -52,10 +51,7 @@ export async function getAuthoritativeRiskSession(userId: string): Promise<RiskS
 
   // Fetch via server authoritative API
   try {
-    const headers = await getAuthHeaders({ 'x-user-id': userId });
-    const res = await fetch('/api/risk', {
-      headers,
-    });
+    const res = await fetch(url, { headers });
     if (res.ok) {
       return await res.json();
     }
@@ -71,14 +67,26 @@ export async function getAuthoritativeRiskSession(userId: string): Promise<RiskS
     day: '2-digit',
   }).format(new Date());
 
-  const path = `users/${userId}/riskSessions/${today}`;
+  const subcoll = accountId ? 'accountRiskSessions' : 'riskSessions';
+  const docKey = accountId ? `${accountId}__${today}` : today;
+  const path = `users/${userId}/${subcoll}/${docKey}`;
+
   try {
-    const sessionDocRef = doc(db, 'users', userId, 'riskSessions', today);
+    const sessionDocRef = doc(db, 'users', userId, subcoll, docKey);
     const snapshot = await getDoc(sessionDocRef);
     if (snapshot.exists()) {
       return snapshot.data() as RiskSession;
     }
-    // Return baseline if no session generated yet today
+
+    // Try fallback to legacy riskSessions/{today} if default account
+    if (!accountId || accountId === 'acc_mt_zerodha_default') {
+      const legacyRef = doc(db, 'users', userId, 'riskSessions', today);
+      const legacySnap = await getDoc(legacyRef);
+      if (legacySnap.exists()) {
+        return legacySnap.data() as RiskSession;
+      }
+    }
+
     return {
       tradingDate: today,
       userId,
@@ -100,9 +108,23 @@ export async function getAuthoritativeRiskSession(userId: string): Promise<RiskS
   }
 }
 
+export async function getLockStatus(userId: string, accountId?: string): Promise<any> {
+  const headers = await getAuthHeaders({
+    'x-user-id': userId,
+    ...(accountId ? { 'x-account-id': accountId } : {}),
+  });
+  const url = `/api/lock/status${accountId ? `?accountId=${encodeURIComponent(accountId)}` : ''}`;
+  const res = await fetch(url, { headers });
+  if (res.ok) {
+    return await res.json();
+  }
+  throw new Error('Failed to fetch lock status');
+}
+
 export function subscribeRiskSession(
   userId: string,
-  onUpdate: (session: RiskSession) => void
+  onUpdate: (session: RiskSession) => void,
+  accountId?: string
 ): () => void {
   const today = new Intl.DateTimeFormat('en-CA', {
     timeZone: 'Asia/Kolkata',
@@ -111,19 +133,12 @@ export function subscribeRiskSession(
     day: '2-digit',
   }).format(new Date());
 
-  // Poll server API every 3 seconds for live authoritative session updates
   let active = true;
   const poll = async () => {
     if (!active) return;
     try {
-      const headers = await getAuthHeaders({ 'x-user-id': userId });
-      const res = await fetch('/api/risk', {
-        headers,
-      });
-      if (res.ok) {
-        const data = await res.json();
-        if (active) onUpdate(data);
-      }
+      const session = await getAuthoritativeRiskSession(userId, accountId);
+      if (active) onUpdate(session);
     } catch {
       // ignore transient poll errors
     }
@@ -132,19 +147,26 @@ export function subscribeRiskSession(
   poll();
   const interval = setInterval(poll, 3000);
 
-  // Also listen to Firestore document if online and not sandbox
   let unsubFirestore: (() => void) | null = null;
   if (!userId.startsWith('mock-')) {
     try {
-      const sessionDocRef = doc(db, 'users', userId, 'riskSessions', today);
-      unsubFirestore = onSnapshot(sessionDocRef, (snap) => {
-        if (snap.exists() && active) {
-          const docData = snap.data() as RiskSession;
-          if (docData && (docData.recordedAt || docData.isBreached || docData.state !== 'ALLOW')) {
-            onUpdate(docData);
+      const subcoll = accountId ? 'accountRiskSessions' : 'riskSessions';
+      const docKey = accountId ? `${accountId}__${today}` : today;
+      const sessionDocRef = doc(db, 'users', userId, subcoll, docKey);
+      unsubFirestore = onSnapshot(
+        sessionDocRef,
+        (snap) => {
+          if (snap.exists() && active) {
+            const docData = snap.data() as RiskSession;
+            if (docData && (docData.recordedAt || docData.isBreached || docData.state !== 'ALLOW')) {
+              onUpdate(docData);
+            }
           }
+        },
+        (error) => {
+          // Suppress/ignore permission-denied errors in snapshot listener gracefully
         }
-      });
+      );
     } catch {
       // ignore
     }

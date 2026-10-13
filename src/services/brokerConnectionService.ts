@@ -1,7 +1,8 @@
-import { doc, getDoc, setDoc, onSnapshot } from 'firebase/firestore';
+import { doc, getDoc, setDoc, onSnapshot, collection, getDocs } from 'firebase/firestore';
 import { db } from './firebase';
 import { BrokerConnection } from '../types/broker';
 import { handleFirestoreError, OperationType } from './firestoreErrors';
+import { DEFAULT_ACCOUNT_ID } from '../types/risk';
 
 export async function getBrokerConnection(userId: string): Promise<BrokerConnection | null> {
   const path = `users/${userId}/brokerConnections/primary`;
@@ -14,6 +15,66 @@ export async function getBrokerConnection(userId: string): Promise<BrokerConnect
     return null;
   } catch (error) {
     handleFirestoreError(error, OperationType.GET, path);
+  }
+}
+
+export async function getBrokerConnections(userId: string): Promise<Array<{ connectionId: string; connection: BrokerConnection }>> {
+  if (userId.startsWith('mock-')) {
+    return [
+      {
+        connectionId: DEFAULT_ACCOUNT_ID,
+        connection: {
+          broker: 'zerodha',
+          status: 'CONNECTED',
+          userId,
+          connectedAt: new Date().toISOString(),
+        },
+      },
+      {
+        connectionId: 'acc_zerodha_secondary',
+        connection: {
+          broker: 'zerodha',
+          status: 'CONNECTED',
+          userId,
+          connectedAt: new Date().toISOString(),
+        },
+      },
+    ];
+  }
+
+  try {
+    const colRef = collection(db, 'users', userId, 'brokerConnections');
+    const snapshot = await getDocs(colRef);
+    const list: Array<{ connectionId: string; connection: BrokerConnection }> = [];
+    snapshot.forEach((docSnap) => {
+      list.push({
+        connectionId: docSnap.id,
+        connection: docSnap.data() as BrokerConnection,
+      });
+    });
+
+    if (list.length === 0) {
+      list.push({
+        connectionId: DEFAULT_ACCOUNT_ID,
+        connection: {
+          broker: 'zerodha',
+          status: 'DISCONNECTED',
+          userId,
+        },
+      });
+    }
+    return list;
+  } catch (error) {
+    return [
+      {
+        connectionId: DEFAULT_ACCOUNT_ID,
+        connection: {
+          broker: 'zerodha',
+          status: 'DISCONNECTED',
+          userId,
+        },
+      },
+    ];
   }
 }
 

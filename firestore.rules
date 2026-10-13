@@ -98,6 +98,30 @@ service cloud.firestore {
         allow create, update, delete: if false;
       }
 
+      // Account Risk Configuration subcollection
+      match /accountRiskConfigs/{configId} {
+        allow get, list: if isOwner(userId);
+        allow create, update, delete: if false;
+      }
+
+      // Account Risk Sessions subcollection
+      match /accountRiskSessions/{sessionId} {
+        allow get, list: if isOwner(userId);
+        allow create, update, delete: if false;
+      }
+
+      // System subcollection
+      match /system/{sysId} {
+        allow get, list: if isOwner(userId);
+        allow create, update, delete: if false;
+      }
+
+      // Risk Recording subcollection
+      match /riskRecording/{recId} {
+        allow get, list: if isOwner(userId);
+        allow create, update, delete: if false;
+      }
+
       // Broker Connections subcollection
       // Owner can manage connection status metadata; secrets are strictly blocked
       match /brokerConnections/{connectionId} {
