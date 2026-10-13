@@ -13,6 +13,7 @@ import { ZerodhaCredentialManager } from './brokers/zerodha/credentials';
 import { liveAngelOneAdapter } from './brokers/angelone/liveAdapter';
 import { AngelOneSessionStore } from './brokers/angelone/sessionStore';
 import { normalizePositions } from './brokers/normalize';
+import { BrokerInstrument, LivePositionsResponse } from './brokers/types';
 import { ShadowRiskService } from './risk/shadowRiskService';
 import {
   LiveRiskRecorder,
@@ -380,16 +381,23 @@ apiRouter.get('/broker/angelone/live/positions', async (req: Request, res: Respo
   try {
     const userId = (req as any).userId || await authenticateRequest(req, res);
     if (!userId) return;
+    const status = await liveAngelOneAdapter.getConnectionStatus(userId);
     const rawPositions = await liveAngelOneAdapter.getPositions(userId);
     const instruments = await liveAngelOneAdapter.getInstruments(userId);
-    const instrumentMap = new Map<number, any>(instruments.map((i: any) => [i.instrumentToken, i]));
-    const normalized = normalizePositions(rawPositions, instrumentMap as any, 'ZERODHA_LIVE' as any);
-    sendJson(res, {
+    const instrumentMap = new Map<number, BrokerInstrument>(instruments.map((i: BrokerInstrument) => [i.instrumentToken, i]));
+    const normalized = normalizePositions(rawPositions, instrumentMap, 'ANGELONE_LIVE');
+    const fnoPositions = normalized.filter((p) => p.isFno === true && !p.unknownInstrument);
+    const response: LivePositionsResponse = {
       broker: 'angelone',
+      connectionStatus: status.status,
+      dataSource: 'ANGELONE_LIVE',
       positionCount: normalized.length,
+      fnoPositionCount: fnoPositions.length,
       positions: normalized,
       timestamp: new Date().toISOString(),
-    });
+      diagnosticNote: 'Positions normalized via Angel One live adapter',
+    };
+    sendJson(res, response);
   } catch (err) {
     sendJson(res, { error: err instanceof Error ? err.message : 'Failed to fetch Angel One positions' }, 500);
   }

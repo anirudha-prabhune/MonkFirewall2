@@ -26,7 +26,7 @@ export class PositionValidationError extends Error {
 export function normalizePosition(
   raw: RawBrokerPosition,
   instrumentMap?: Map<number, BrokerInstrument>,
-  dataSource: 'MOCK_DATA' | 'ZERODHA_LIVE' = 'MOCK_DATA'
+  dataSource: 'MOCK_DATA' | 'ZERODHA_LIVE' | 'ANGELONE_LIVE' = 'MOCK_DATA'
 ): NormalizedPosition {
   if (!raw || typeof raw !== 'object') {
     throw new PositionValidationError('Raw position must be a non-null object');
@@ -147,7 +147,7 @@ export function normalizePosition(
 export function normalizePositions(
   rawList: RawBrokerPosition[],
   instrumentMap?: Map<number, BrokerInstrument>,
-  dataSource: 'MOCK_DATA' | 'ZERODHA_LIVE' = 'MOCK_DATA'
+  dataSource: 'MOCK_DATA' | 'ZERODHA_LIVE' | 'ANGELONE_LIVE' = 'MOCK_DATA'
 ): NormalizedPosition[] {
   return rawList.map((raw) => normalizePosition(raw, instrumentMap, dataSource));
 }

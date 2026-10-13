@@ -94,3 +94,64 @@ export async function disconnectZerodhaSession(userId?: string): Promise<boolean
   }
 }
 
+export async function fetchAngelOneStatus(userId?: string): Promise<LiveBrokerStatusResponse | null> {
+  try {
+    const headers = await getAuthHeaders(userId ? { 'x-user-id': userId } : {});
+    const res = await fetch('/api/broker/angelone/live/status', { headers });
+    if (res.ok) {
+      return await res.json();
+    }
+  } catch (err) {
+    console.warn('Failed to fetch Angel One status:', err);
+  }
+  return null;
+}
+
+export async function fetchAngelOnePositions(userId?: string): Promise<LivePositionsResponse | null> {
+  try {
+    const headers = await getAuthHeaders(userId ? { 'x-user-id': userId } : {});
+    const res = await fetch('/api/broker/angelone/live/positions', { headers });
+    if (res.ok) {
+      return await res.json();
+    }
+  } catch (err) {
+    console.warn('Failed to fetch Angel One positions:', err);
+  }
+  return null;
+}
+
+export async function authenticateAngelOneSession(
+  credentials: { clientCode: string; password?: string; totp?: string; apiKey?: string },
+  userId?: string
+): Promise<{ success: boolean; error?: string }> {
+  try {
+    const headers = await getAuthHeaders(userId ? { 'x-user-id': userId } : {});
+    headers['Content-Type'] = 'application/json';
+    const res = await fetch('/api/broker/angelone/live/auth/session', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(credentials),
+    });
+    const data = await res.json();
+    if (res.ok && data.success) {
+      return { success: true };
+    }
+    return { success: false, error: data.error || 'Authentication failed' };
+  } catch (err) {
+    return { success: false, error: err instanceof Error ? err.message : 'Network error' };
+  }
+}
+
+export async function disconnectAngelOneSession(userId?: string): Promise<boolean> {
+  try {
+    const headers = await getAuthHeaders(userId ? { 'x-user-id': userId } : {});
+    const res = await fetch('/api/broker/angelone/live/auth/disconnect', {
+      method: 'POST',
+      headers,
+    });
+    return res.ok;
+  } catch (err) {
+    console.warn('Failed to disconnect Angel One session:', err);
+    return false;
+  }
+}

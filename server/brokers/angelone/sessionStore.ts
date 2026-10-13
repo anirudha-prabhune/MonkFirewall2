@@ -1,5 +1,5 @@
 import { EncryptedPayload, CryptoService } from '../../security/crypto';
-import { ensureFirebaseAdminInitialized } from '../../auth/session';
+import { getAdminFirestore } from '../zerodha/sessionStore';
 
 export interface PersistedAngelOneSessionDoc {
   provider: 'angelone';
@@ -40,13 +40,7 @@ export class AngelOneSessionStore {
   }
 
   private static getAdminFirestore(): any {
-    try {
-      const app = ensureFirebaseAdminInitialized();
-      const { getFirestore } = require('firebase-admin/firestore');
-      return getFirestore(app);
-    } catch {
-      return null;
-    }
+    return getAdminFirestore();
   }
 
   public static async saveSession(

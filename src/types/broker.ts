@@ -1,4 +1,4 @@
-export type BrokerType = 'zerodha' | 'mock';
+export type BrokerType = 'zerodha' | 'mock' | 'angelone';
 
 export type BrokerStatus = 'CONNECTED' | 'DISCONNECTED' | 'EXPIRED' | 'ERROR';
 

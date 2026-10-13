@@ -2,7 +2,7 @@ import { NormalizedPosition, BrokerConnectionStatus } from '../../server/brokers
 import { getAuthHeaders } from './firebase';
 
 export interface PositionsResponse {
-  dataSource: 'MOCK_DATA' | 'ZERODHA_LIVE';
+  dataSource: 'MOCK_DATA' | 'ZERODHA_LIVE' | 'ANGELONE_LIVE';
   count: number;
   positions: NormalizedPosition[];
   validationState?: string;

@@ -153,7 +153,7 @@ export class LiveAngelOneAdapter implements BrokerAdapter {
     const status = await this.getConnectionStatus(userId);
     if (status.status !== 'AUTHENTICATED') {
       return {
-        dataSource: 'ZERODHA_LIVE' as any,
+        dataSource: 'ANGELONE_LIVE',
         instrumentToken,
         exchange: 'NFO',
         segment: 'NFO-OPT',
@@ -166,7 +166,7 @@ export class LiveAngelOneAdapter implements BrokerAdapter {
       };
     }
     return {
-      dataSource: 'ZERODHA_LIVE' as any,
+      dataSource: 'ANGELONE_LIVE',
       instrumentToken,
       exchange: 'NFO',
       segment: 'NFO-OPT',

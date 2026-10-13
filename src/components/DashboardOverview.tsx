@@ -36,6 +36,10 @@ import {
   fetchLiveBrokerStatus,
   fetchKiteLoginUrl,
   disconnectZerodhaSession,
+  fetchAngelOneStatus,
+  fetchAngelOnePositions,
+  authenticateAngelOneSession,
+  disconnectAngelOneSession,
 } from '../services/liveBrokerService';
 import { getAuthHeaders } from '../services/firebase';
 import { getBrokerConnections } from '../services/brokerConnectionService';
@@ -97,6 +101,20 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
   const [showTokenInput, setShowTokenInput] = useState<boolean>(false);
   const [manualToken, setManualToken] = useState<string>('');
   const [submittingToken, setSubmittingToken] = useState<boolean>(false);
+
+  // Active Broker Selector ('zerodha' | 'angelone')
+  const [selectedBroker, setSelectedBroker] = useState<'zerodha' | 'angelone'>('zerodha');
+
+  // Angel One Live Broker Status & Auth State
+  const [angelOneStatus, setAngelOneStatus] = useState<LiveBrokerStatusResponse | null>(null);
+  const [authenticatingAngelOne, setAuthenticatingAngelOne] = useState<boolean>(false);
+  const [disconnectingAngelOne, setDisconnectingAngelOne] = useState<boolean>(false);
+  const [angelOneAuthMessage, setAngelOneAuthMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+  const [showAngelOneForm, setShowAngelOneForm] = useState<boolean>(false);
+  const [angelOneClientCode, setAngelOneClientCode] = useState<string>('');
+  const [angelOnePassword, setAngelOnePassword] = useState<string>('');
+  const [angelOneTotp, setAngelOneTotp] = useState<string>('');
+  const [angelOneApiKey, setAngelOneApiKey] = useState<string>('');
 
   // Demo / Simulation Controls State
   const [isDemoControlsOpen, setIsDemoControlsOpen] = useState<boolean>(false);
@@ -178,16 +196,39 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
   const loadPositionsAndPnl = async () => {
     setLoadingPositions(true);
     try {
-      const [pos, status, pnl] = await Promise.all([
-        fetchFnoPositions(user?.uid),
-        fetchBrokerStatus(),
-        fetchGrossPnl(user?.uid),
-      ]);
-      setFnoPositions(pos);
-      setBrokerStatus(status);
-      setPnlResult(pnl);
-      if (pnl && (pnl.riskSession || pnl.shadowSession)) {
-        setSession(pnl.riskSession || pnl.shadowSession);
+      if (selectedBroker === 'angelone') {
+        const [angelPositionsRes, angelStat, pnl] = await Promise.all([
+          fetchAngelOnePositions(user?.uid),
+          fetchAngelOneStatus(user?.uid),
+          fetchGrossPnl(user?.uid),
+        ]);
+        setAngelOneStatus(angelStat);
+        if (angelPositionsRes && Array.isArray(angelPositionsRes.positions)) {
+          setFnoPositions(angelPositionsRes.positions);
+        } else {
+          const [pos, status] = await Promise.all([
+            fetchFnoPositions(user?.uid),
+            fetchBrokerStatus(),
+          ]);
+          setFnoPositions(pos);
+          setBrokerStatus(status);
+        }
+        setPnlResult(pnl);
+        if (pnl && (pnl.riskSession || pnl.shadowSession)) {
+          setSession(pnl.riskSession || pnl.shadowSession);
+        }
+      } else {
+        const [pos, status, pnl] = await Promise.all([
+          fetchFnoPositions(user?.uid),
+          fetchBrokerStatus(),
+          fetchGrossPnl(user?.uid),
+        ]);
+        setFnoPositions(pos);
+        setBrokerStatus(status);
+        setPnlResult(pnl);
+        if (pnl && (pnl.riskSession || pnl.shadowSession)) {
+          setSession(pnl.riskSession || pnl.shadowSession);
+        }
       }
     } catch (err) {
       console.error('Failed to load positions & PnL:', err);
@@ -200,8 +241,12 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
   const loadLiveDiagnostics = async () => {
     if (!user) return;
     try {
-      const res = await fetchLiveBrokerStatus(user.uid);
+      const [res, angelRes] = await Promise.all([
+        fetchLiveBrokerStatus(user.uid),
+        fetchAngelOneStatus(user.uid),
+      ]);
       setLiveBrokerStatus(res);
+      setAngelOneStatus(angelRes);
     } catch (err) {
       console.error('Failed to fetch live broker status:', err);
     }
@@ -215,7 +260,7 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
       loadLiveDiagnostics();
     }, 30000);
     return () => clearInterval(interval);
-  }, [user]);
+  }, [user, selectedBroker]);
 
   // Handle Kite Login
   const handleKiteLogin = async () => {
@@ -339,6 +384,77 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
     }
   };
 
+  // Handle Angel One Connect Submission
+  const handleAngelOneConnect = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!user || !angelOneClientCode.trim()) return;
+    setAuthenticatingAngelOne(true);
+    setAngelOneAuthMessage(null);
+    try {
+      const result = await authenticateAngelOneSession(
+        {
+          clientCode: angelOneClientCode.trim(),
+          password: angelOnePassword.trim() || undefined,
+          totp: angelOneTotp.trim() || undefined,
+          apiKey: angelOneApiKey.trim() || undefined,
+        },
+        user.uid
+      );
+      if (result.success) {
+        setAngelOneAuthMessage({
+          type: 'success',
+          text: 'Angel One session established successfully.',
+        });
+        setShowAngelOneForm(false);
+        setAngelOnePassword('');
+        setAngelOneTotp('');
+        setAngelOneApiKey('');
+        await Promise.all([loadLiveDiagnostics(), loadPositionsAndPnl()]);
+      } else {
+        setAngelOneAuthMessage({
+          type: 'error',
+          text: result.error || 'Failed to authenticate Angel One session',
+        });
+      }
+    } catch (err) {
+      setAngelOneAuthMessage({
+        type: 'error',
+        text: err instanceof Error ? err.message : 'Angel One authentication failed',
+      });
+    } finally {
+      setAuthenticatingAngelOne(false);
+    }
+  };
+
+  // Handle Angel One Disconnect
+  const handleAngelOneDisconnect = async () => {
+    if (!user) return;
+    setDisconnectingAngelOne(true);
+    setAngelOneAuthMessage(null);
+    try {
+      const success = await disconnectAngelOneSession(user.uid);
+      if (success) {
+        setAngelOneAuthMessage({
+          type: 'success',
+          text: 'Angel One session disconnected. Switched to simulation mode.',
+        });
+        await Promise.all([loadLiveDiagnostics(), loadPositionsAndPnl()]);
+      } else {
+        setAngelOneAuthMessage({
+          type: 'error',
+          text: 'Failed to disconnect Angel One session.',
+        });
+      }
+    } catch (err) {
+      setAngelOneAuthMessage({
+        type: 'error',
+        text: err instanceof Error ? err.message : 'Disconnect failed',
+      });
+    } finally {
+      setDisconnectingAngelOne(false);
+    }
+  };
+
   // Demo / Simulation P&L Handlers
   const handleSimulatePnl = async (targetPnl: number, label: string) => {
     setEvaluatingDemo(true);
@@ -425,17 +541,19 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
   };
 
   // 1. Broker Connection state (independent of displayed P&L data source)
-  const isZerodhaConnected = liveBrokerStatus?.authenticated === true && liveBrokerStatus?.status === 'CONNECTED';
+  const isZerodhaConnected = liveBrokerStatus?.authenticated === true && (liveBrokerStatus?.status === 'CONNECTED' || liveBrokerStatus?.status === 'AUTHENTICATED');
+  const isAngelOneConnected = angelOneStatus?.authenticated === true && (angelOneStatus?.status === 'AUTHENTICATED' || angelOneStatus?.status === 'CONNECTED');
+  const isCurrentBrokerConnected = selectedBroker === 'angelone' ? isAngelOneConnected : isZerodhaConnected;
 
   // 2. Displayed Data-Source identification (Rules 1, 2, 6, 7)
-  // LIVE MODE only when displayed P&L AND positions are actually sourced from live Zerodha pipeline
+  // LIVE MODE only when displayed P&L AND positions are actually sourced from live broker pipeline
   const isPnlLiveSourced = pnlResult?.source === 'ZERODHA_LIVE' || pnlResult?.dataSource === 'ZERODHA_LIVE';
   const isPositionsLiveSourced =
     fnoPositions.length > 0
-      ? fnoPositions.every((pos) => pos.dataSource === 'ZERODHA_LIVE')
-      : isPnlLiveSourced;
+      ? fnoPositions.every((pos) => pos.dataSource === 'ZERODHA_LIVE' || pos.dataSource === 'ANGELONE_LIVE')
+      : isCurrentBrokerConnected;
 
-  const isLiveMode = isPnlLiveSourced && isPositionsLiveSourced;
+  const isLiveMode = (selectedBroker === 'angelone' ? isAngelOneConnected : isPnlLiveSourced) && isPositionsLiveSourced;
   const isSimulationMode = !isLiveMode;
 
   // 3. Authoritative P&L Values
@@ -560,6 +678,147 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
               className="px-3 py-2 bg-slate-100 dark:bg-[#283244] text-[#5C6B7E] dark:text-[#98C1D9] text-xs font-semibold rounded-lg hover:bg-slate-200 transition-colors cursor-pointer"
             >
               Cancel
+            </button>
+          </div>
+        </form>
+      )}
+
+      {/* Angel One Auth Status Message (if any) */}
+      {angelOneAuthMessage && (
+        <div
+          className={`p-3.5 rounded-xl border text-xs flex items-center justify-between shadow-xs transition-colors ${
+            angelOneAuthMessage.type === 'success'
+              ? 'bg-emerald-50 dark:bg-emerald-950/30 border-emerald-200 dark:border-emerald-800 text-emerald-800 dark:text-emerald-200'
+              : 'bg-rose-50 dark:bg-rose-950/30 border-rose-200 dark:border-rose-800 text-rose-800 dark:text-rose-200'
+          }`}
+        >
+          <div className="flex items-center space-x-2.5">
+            {angelOneAuthMessage.type === 'success' ? (
+              <CheckCircle2 className="w-4 h-4 text-emerald-600 dark:text-emerald-400 shrink-0" />
+            ) : (
+              <AlertCircle className="w-4 h-4 text-rose-600 dark:text-rose-400 shrink-0" />
+            )}
+            <span className="font-medium">{angelOneAuthMessage.text}</span>
+          </div>
+          <button
+            onClick={() => setAngelOneAuthMessage(null)}
+            className="text-xs font-semibold uppercase tracking-wider opacity-75 hover:opacity-100 ml-4 cursor-pointer"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
+
+      {/* Interactive Angel One Connect Form (if toggled) */}
+      {showAngelOneForm && (
+        <form
+          onSubmit={handleAngelOneConnect}
+          className="bg-white dark:bg-[#1F2633] p-4 rounded-xl border border-[#98C1D9]/40 dark:border-[#3D4A5E] shadow-xs space-y-3"
+        >
+          <div className="flex items-center justify-between border-b border-[#98C1D9]/20 dark:border-[#3D4A5E] pb-2">
+            <div>
+              <h4 className="text-xs font-bold uppercase tracking-wider text-[#293241] dark:text-[#E0FBFC]">
+                Connect Angel One SmartAPI
+              </h4>
+              <p className="text-[11px] text-[#5C6B7E] dark:text-[#98C1D9]">
+                Read-only connection for real-time risk firewall monitoring & position tracking.
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                setShowAngelOneForm(false);
+                setAngelOnePassword('');
+                setAngelOneTotp('');
+                setAngelOneApiKey('');
+              }}
+              className="text-xs text-[#5C6B7E] hover:text-slate-900 dark:text-[#98C1D9] dark:hover:text-white cursor-pointer px-2 py-1"
+            >
+              ✕
+            </button>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-3">
+            <div>
+              <label className="block text-[11px] font-semibold text-[#5C6B7E] dark:text-[#98C1D9] uppercase tracking-wider mb-1">
+                Client Code *
+              </label>
+              <input
+                type="text"
+                value={angelOneClientCode}
+                onChange={(e) => setAngelOneClientCode(e.target.value)}
+                placeholder="e.g. A123456"
+                required
+                className="w-full text-xs font-mono px-3 py-2 rounded-lg bg-slate-50 dark:bg-[#19202B] border border-[#98C1D9]/40 dark:border-[#3D4A5E] focus:outline-hidden focus:border-[#3D5A80]"
+              />
+            </div>
+            <div>
+              <label className="block text-[11px] font-semibold text-[#5C6B7E] dark:text-[#98C1D9] uppercase tracking-wider mb-1">
+                Password / MPIN
+              </label>
+              <input
+                type="password"
+                value={angelOnePassword}
+                onChange={(e) => setAngelOnePassword(e.target.value)}
+                placeholder="••••••••"
+                autoComplete="current-password"
+                className="w-full text-xs font-mono px-3 py-2 rounded-lg bg-slate-50 dark:bg-[#19202B] border border-[#98C1D9]/40 dark:border-[#3D4A5E] focus:outline-hidden focus:border-[#3D5A80]"
+              />
+            </div>
+            <div>
+              <label className="block text-[11px] font-semibold text-[#5C6B7E] dark:text-[#98C1D9] uppercase tracking-wider mb-1">
+                TOTP Code
+              </label>
+              <input
+                type="password"
+                value={angelOneTotp}
+                onChange={(e) => setAngelOneTotp(e.target.value)}
+                placeholder="6-digit TOTP"
+                autoComplete="one-time-code"
+                maxLength={6}
+                className="w-full text-xs font-mono px-3 py-2 rounded-lg bg-slate-50 dark:bg-[#19202B] border border-[#98C1D9]/40 dark:border-[#3D4A5E] focus:outline-hidden focus:border-[#3D5A80]"
+              />
+            </div>
+            <div>
+              <label className="block text-[11px] font-semibold text-[#5C6B7E] dark:text-[#98C1D9] uppercase tracking-wider mb-1">
+                API Key (Optional)
+              </label>
+              <input
+                type="password"
+                value={angelOneApiKey}
+                onChange={(e) => setAngelOneApiKey(e.target.value)}
+                placeholder="Leave blank to use server key"
+                className="w-full text-xs font-mono px-3 py-2 rounded-lg bg-slate-50 dark:bg-[#19202B] border border-[#98C1D9]/40 dark:border-[#3D4A5E] focus:outline-hidden focus:border-[#3D5A80]"
+              />
+            </div>
+          </div>
+
+          <div className="flex items-center justify-end space-x-2 pt-2">
+            <button
+              type="button"
+              onClick={() => {
+                setShowAngelOneForm(false);
+                setAngelOnePassword('');
+                setAngelOneTotp('');
+                setAngelOneApiKey('');
+              }}
+              className="px-3 py-1.5 bg-slate-100 dark:bg-[#283244] text-[#5C6B7E] dark:text-[#98C1D9] text-xs font-semibold rounded-lg hover:bg-slate-200 transition-colors cursor-pointer"
+            >
+              Cancel
+            </button>
+            <button
+              type="submit"
+              disabled={authenticatingAngelOne || !angelOneClientCode.trim()}
+              className="px-4 py-1.5 bg-[#EE6C4D] hover:bg-[#D95536] text-white text-xs font-semibold rounded-lg disabled:opacity-50 transition-colors cursor-pointer flex items-center space-x-1"
+            >
+              {authenticatingAngelOne ? (
+                <>
+                  <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                  <span>Connecting...</span>
+                </>
+              ) : (
+                <span>Connect Angel One</span>
+              )}
             </button>
           </div>
         </form>
@@ -956,48 +1215,113 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
 
           <span className="text-slate-300 dark:text-[#3D4A5E] hidden sm:inline">|</span>
 
-          {/* Broker Connection & Actions (Rule 3) */}
-          <div className="flex items-center space-x-2">
-            <span
-              className={`w-2 h-2 rounded-full ${
-                isZerodhaConnected ? 'bg-emerald-500 animate-pulse' : 'bg-slate-400'
+          {/* Broker Selector (Multi-Broker Segmented Control) */}
+          <div className="flex items-center gap-1 p-0.5 bg-slate-100 dark:bg-[#19202B] rounded-lg border border-[#98C1D9]/30 dark:border-[#3D4A5E]">
+            <button
+              type="button"
+              onClick={() => setSelectedBroker('zerodha')}
+              className={`px-2.5 py-1 text-xs font-semibold rounded-md transition-colors cursor-pointer ${
+                selectedBroker === 'zerodha'
+                  ? 'bg-white dark:bg-[#283244] text-[#293241] dark:text-[#E0FBFC] shadow-2xs'
+                  : 'text-[#5C6B7E] dark:text-[#98C1D9] hover:text-slate-900 dark:hover:text-white'
               }`}
-            />
-            <span className="font-semibold text-slate-900 dark:text-[#E0FBFC]">
-              {isZerodhaConnected ? 'Zerodha Connected' : 'Zerodha Disconnected'}
-            </span>
-
-            {/* Connection Actions */}
-            {isZerodhaConnected ? (
-              <button
-                onClick={handleKiteDisconnect}
-                disabled={disconnectingKite}
-                className="ml-1 text-[11px] text-[#5C6B7E] hover:text-rose-600 dark:text-[#98C1D9] dark:hover:text-rose-400 font-medium cursor-pointer transition-colors"
-                title="Disconnect Zerodha session"
-              >
-                ({disconnectingKite ? 'Disconnecting...' : 'Disconnect'})
-              </button>
-            ) : (
-              <div className="flex items-center space-x-2 ml-1">
-                <button
-                  onClick={handleKiteLogin}
-                  disabled={authenticatingKite}
-                  className="px-2.5 py-1 bg-[#3D5A80] hover:bg-[#2B3E58] text-white text-[11px] font-semibold rounded-lg flex items-center space-x-1 cursor-pointer disabled:opacity-50 transition-colors shadow-2xs"
-                  title="Connect live Zerodha Kite account"
-                >
-                  <LogIn className="w-3 h-3" />
-                  <span>{authenticatingKite ? 'Connecting...' : 'Connect Zerodha'}</span>
-                </button>
-                <button
-                  onClick={() => setShowTokenInput(!showTokenInput)}
-                  className="p-1 rounded-lg text-[#5C6B7E] hover:text-slate-900 dark:text-[#98C1D9] dark:hover:text-[#E0FBFC] cursor-pointer"
-                  title="Enter request token manually"
-                >
-                  <Key className="w-3.5 h-3.5" />
-                </button>
-              </div>
-            )}
+            >
+              Zerodha
+            </button>
+            <button
+              type="button"
+              onClick={() => setSelectedBroker('angelone')}
+              className={`px-2.5 py-1 text-xs font-semibold rounded-md transition-colors cursor-pointer ${
+                selectedBroker === 'angelone'
+                  ? 'bg-white dark:bg-[#283244] text-[#293241] dark:text-[#E0FBFC] shadow-2xs'
+                  : 'text-[#5C6B7E] dark:text-[#98C1D9] hover:text-slate-900 dark:hover:text-white'
+              }`}
+            >
+              Angel One
+            </button>
           </div>
+
+          <span className="text-slate-300 dark:text-[#3D4A5E] hidden sm:inline">|</span>
+
+          {/* Broker Connection & Actions */}
+          {selectedBroker === 'zerodha' ? (
+            <div className="flex items-center space-x-2">
+              <span
+                className={`w-2 h-2 rounded-full ${
+                  isZerodhaConnected ? 'bg-emerald-500 animate-pulse' : 'bg-slate-400'
+                }`}
+              />
+              <span className="font-semibold text-slate-900 dark:text-[#E0FBFC]">
+                {isZerodhaConnected ? 'Zerodha Connected' : 'Zerodha Disconnected'}
+              </span>
+
+              {/* Zerodha Actions */}
+              {isZerodhaConnected ? (
+                <button
+                  onClick={handleKiteDisconnect}
+                  disabled={disconnectingKite}
+                  className="ml-1 text-[11px] text-[#5C6B7E] hover:text-rose-600 dark:text-[#98C1D9] dark:hover:text-rose-400 font-medium cursor-pointer transition-colors"
+                  title="Disconnect Zerodha session"
+                >
+                  ({disconnectingKite ? 'Disconnecting...' : 'Disconnect'})
+                </button>
+              ) : (
+                <div className="flex items-center space-x-2 ml-1">
+                  <button
+                    onClick={handleKiteLogin}
+                    disabled={authenticatingKite}
+                    className="px-2.5 py-1 bg-[#3D5A80] hover:bg-[#2B3E58] text-white text-[11px] font-semibold rounded-lg flex items-center space-x-1 cursor-pointer disabled:opacity-50 transition-colors shadow-2xs"
+                    title="Connect live Zerodha Kite account"
+                  >
+                    <LogIn className="w-3 h-3" />
+                    <span>{authenticatingKite ? 'Connecting...' : 'Connect Zerodha'}</span>
+                  </button>
+                  <button
+                    onClick={() => setShowTokenInput(!showTokenInput)}
+                    className="p-1 rounded-lg text-[#5C6B7E] hover:text-slate-900 dark:text-[#98C1D9] dark:hover:text-[#E0FBFC] cursor-pointer"
+                    title="Enter request token manually"
+                  >
+                    <Key className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              )}
+            </div>
+          ) : (
+            <div className="flex items-center space-x-2">
+              <span
+                className={`w-2 h-2 rounded-full ${
+                  isAngelOneConnected ? 'bg-emerald-500 animate-pulse' : 'bg-slate-400'
+                }`}
+              />
+              <span className="font-semibold text-slate-900 dark:text-[#E0FBFC]">
+                {isAngelOneConnected ? 'Angel One Connected' : 'Angel One Disconnected'}
+              </span>
+
+              {/* Angel One Actions */}
+              {isAngelOneConnected ? (
+                <button
+                  onClick={handleAngelOneDisconnect}
+                  disabled={disconnectingAngelOne}
+                  className="ml-1 text-[11px] text-[#5C6B7E] hover:text-rose-600 dark:text-[#98C1D9] dark:hover:text-rose-400 font-medium cursor-pointer transition-colors"
+                  title="Disconnect Angel One session"
+                >
+                  ({disconnectingAngelOne ? 'Disconnecting...' : 'Disconnect'})
+                </button>
+              ) : (
+                <div className="flex items-center space-x-2 ml-1">
+                  <button
+                    onClick={() => setShowAngelOneForm(!showAngelOneForm)}
+                    disabled={authenticatingAngelOne}
+                    className="px-2.5 py-1 bg-[#EE6C4D] hover:bg-[#D95536] text-white text-[11px] font-semibold rounded-lg flex items-center space-x-1 cursor-pointer disabled:opacity-50 transition-colors shadow-2xs"
+                    title="Connect live Angel One SmartAPI account"
+                  >
+                    <LogIn className="w-3 h-3" />
+                    <span>{authenticatingAngelOne ? 'Connecting...' : 'Connect Angel One'}</span>
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
 
           <span className="text-slate-300 dark:text-[#3D4A5E] hidden md:inline">|</span>
 
@@ -1133,14 +1457,14 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
                 </span>
               ) : (
                 <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 border border-emerald-500/30 font-bold">
-                  Zerodha Live Account
+                  {selectedBroker === 'angelone' ? 'Angel One Live Account' : 'Zerodha Live Account'}
                 </span>
               )}
             </div>
             <p className="text-xs text-[#5C6B7E] dark:text-[#98C1D9] mt-0.5">
               {isLiveMode
-                ? 'Live derivative contracts from your connected Zerodha account'
-                : 'Simulated demo contracts for risk testing. Does not represent your Zerodha account.'}
+                ? `Live derivative contracts from your connected ${selectedBroker === 'angelone' ? 'Angel One' : 'Zerodha'} account`
+                : 'Simulated demo contracts for risk testing. Does not represent your live broker account.'}
             </p>
           </div>
 

@@ -130,7 +130,7 @@ export interface NormalizedPosition {
   totalPnl: number;
   m2m?: number;
   isFno: boolean;
-  dataSource: 'MOCK_DATA' | 'ZERODHA_LIVE';
+  dataSource: 'MOCK_DATA' | 'ZERODHA_LIVE' | 'ANGELONE_LIVE';
   unknownInstrument?: boolean;
   provenance?: 'net' | 'day';
   brokerLtp?: number;
@@ -172,7 +172,7 @@ export interface LiveBrokerStatusResponse {
 export interface LivePositionsResponse {
   broker: string;
   connectionStatus: ConnectionState;
-  dataSource: 'ZERODHA_LIVE';
+  dataSource: 'ZERODHA_LIVE' | 'ANGELONE_LIVE';
   positionCount: number;
   fnoPositionCount: number;
   positions: NormalizedPosition[];
@@ -212,7 +212,7 @@ export interface MarketPriceTick {
 }
 
 export interface LtpSnapshotResult {
-  dataSource: 'ZERODHA_LIVE';
+  dataSource: 'ZERODHA_LIVE' | 'ANGELONE_LIVE';
   instrumentToken: number;
   exchange: string;
   segment: string;
