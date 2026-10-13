@@ -4,6 +4,7 @@ export interface AngelOneConfig {
   apiKey?: string;
   clientCode?: string;
   password?: string;
+  totpSecret?: string;
   totp?: string;
 }
 

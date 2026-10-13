@@ -1,6 +1,6 @@
 /**
  * Phase 3 — Broker Abstraction & Normalized Position Contracts.
- *
+ * 
  * Guarantees:
  * - Broker-independent interface (application depends on BrokerAdapter, not directly on Zerodha).
  * - Snake_case for raw broker fields (Zerodha Kite representation).
@@ -31,6 +31,7 @@ export interface CredentialPresenceDiagnostic {
   apiKeyConfigured: boolean;
   accessTokenConfigured: boolean;
   apiSecretConfigured: boolean;
+  totpSecretConfigured?: boolean;
   authenticated?: boolean;
   authenticationRequired?: boolean;
   authenticatedAt?: string | null;

@@ -6,9 +6,10 @@ export class AngelOneCredentials {
 
   constructor(config: AngelOneConfig = {}) {
     this.config = {
-      apiKey: process.env.ANGELONE_API_KEY || config.apiKey,
-      clientCode: process.env.ANGELONE_CLIENT_CODE || config.clientCode,
-      password: process.env.ANGELONE_PASSWORD || config.password,
+      apiKey: config.apiKey !== undefined ? config.apiKey : process.env.ANGELONE_API_KEY,
+      clientCode: config.clientCode !== undefined ? config.clientCode : process.env.ANGELONE_CLIENT_CODE,
+      password: config.password !== undefined ? config.password : process.env.ANGELONE_PASSWORD,
+      totpSecret: config.totpSecret !== undefined ? config.totpSecret : process.env.ANGELONE_TOTP_SECRET,
     };
   }
 
@@ -25,6 +26,7 @@ export class AngelOneCredentials {
       apiKeyConfigured: Boolean(this.config.apiKey),
       accessTokenConfigured: Boolean(this.config.clientCode),
       apiSecretConfigured: Boolean(this.config.password),
+      totpSecretConfigured: Boolean(this.config.totpSecret),
     };
   }
 }
