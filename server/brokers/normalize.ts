@@ -160,3 +160,24 @@ export function normalizePositions(
 export function getFnoPositions(positions: NormalizedPosition[]): NormalizedPosition[] {
   return positions.filter((p) => p.isFno === true && !p.unknownInstrument);
 }
+
+/**
+ * Checks if current time is outside Indian Standard Time (IST) trading hours (Mon-Fri 09:15 - 15:30 IST).
+ */
+export function checkIsAfterHours(date: Date = new Date()): boolean {
+  // Convert date to IST (UTC + 5:30)
+  const utc = date.getTime() + date.getTimezoneOffset() * 60000;
+  const istOffset = 5.5 * 3600000;
+  const istDate = new Date(utc + istOffset);
+
+  const day = istDate.getDay(); // 0 = Sunday, 6 = Saturday
+  if (day === 0 || day === 6) return true;
+
+  const hours = istDate.getHours();
+  const minutes = istDate.getMinutes();
+  const timeInMinutes = hours * 60 + minutes;
+
+  // 9:15 AM IST = 555 minutes, 3:30 PM IST = 930 minutes
+  return timeInMinutes < 555 || timeInMinutes > 930;
+}
+

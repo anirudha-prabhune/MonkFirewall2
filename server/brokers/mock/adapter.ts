@@ -3,9 +3,11 @@ import {
   BrokerConnectionStatus,
   RawBrokerPosition,
   BrokerInstrument,
+  BrokerAccountCapital,
 } from '../types';
 import { MOCK_RAW_ZERODHA_POSITIONS } from './fixtures';
 import { MOCK_INSTRUMENT_MASTER } from '../../instruments/master';
+import { checkIsAfterHours } from '../normalize';
 
 /**
  * Mock Zerodha Broker Adapter (Phase 3).
@@ -36,9 +38,47 @@ export class MockZerodhaAdapter implements BrokerAdapter {
     return JSON.parse(JSON.stringify(MOCK_INSTRUMENT_MASTER));
   }
 
+  public async getCapital(): Promise<BrokerAccountCapital> {
+    const isAfterHours = checkIsAfterHours();
+    if (!this.isConnected) {
+      return {
+        broker: 'mock',
+        dataSource: 'MOCK_DATA',
+        connectionStatus: 'DISCONNECTED',
+        netBalance: null,
+        availableCash: null,
+        availableTradingMargin: null,
+        utilizedMargin: null,
+        withdrawableFunds: null,
+        currency: 'INR',
+        asOf: new Date().toISOString(),
+        isStale: true,
+        isAfterHours,
+        semanticNote: 'Mock session disconnected',
+      };
+    }
+
+    return {
+      broker: 'mock',
+      dataSource: 'MOCK_DATA',
+      connectionStatus: 'CONNECTED',
+      netBalance: 500000.0,
+      availableCash: 350000.0,
+      availableTradingMargin: 400000.0,
+      utilizedMargin: 100000.0,
+      withdrawableFunds: 300000.0,
+      currency: 'INR',
+      asOf: new Date().toISOString(),
+      isStale: false,
+      isAfterHours,
+      semanticNote: 'Simulated account capital (Mock Trading Mode)',
+    };
+  }
+
   public setConnected(connected: boolean): void {
     this.isConnected = connected;
   }
 }
 
 export const mockZerodhaAdapter = new MockZerodhaAdapter();
+

@@ -139,6 +139,33 @@ export interface NormalizedPosition {
 }
 
 /**
+ * Phase 5B — Broker-Neutral Read-Only Account Capital / Funds Model.
+ */
+export interface BrokerAccountCapital {
+  broker: 'zerodha' | 'angelone' | 'mock';
+  dataSource: 'MOCK_DATA' | 'ZERODHA_LIVE' | 'ANGELONE_LIVE';
+  connectionStatus: ConnectionState;
+  netBalance: number | null;
+  availableCash: number | null;
+  availableTradingMargin: number | null;
+  utilizedMargin: number | null;
+  withdrawableFunds: number | null;
+  currency: string;
+  asOf: string;
+  isStale: boolean;
+  isAfterHours: boolean;
+  semanticNote: string;
+}
+
+export interface LiveCapitalResponse {
+  success: boolean;
+  broker: 'zerodha' | 'angelone' | 'mock';
+  capital: BrokerAccountCapital | null;
+  error?: string;
+  timestamp: string;
+}
+
+/**
  * Abstract Broker Adapter contract.
  * The application depends strictly on this interface.
  * GUARANTEE: Read-only contract! No order-placement or trading methods.
@@ -149,6 +176,7 @@ export interface BrokerAdapter {
   getPositions(userId?: string): Promise<RawBrokerPosition[]>;
   getInstruments(userId?: string): Promise<BrokerInstrument[]>;
   getLtpSnapshot?(instrumentToken: number, userId?: string): Promise<LtpSnapshotResult>;
+  getCapital?(userId?: string): Promise<BrokerAccountCapital>;
 }
 
 /**

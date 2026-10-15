@@ -480,6 +480,8 @@ export class ZerodhaCredentialManager {
     options?: {
       connectionId?: string;
       customFetch?: HttpFetchFn;
+      signal?: AbortSignal;
+      timeoutMs?: number;
     } | HttpFetchFn
   ): Promise<{
     success: boolean;
@@ -496,6 +498,8 @@ export class ZerodhaCredentialManager {
     let userId = 'default_trader';
     let connectionId = 'zerodha';
     let customFetch: HttpFetchFn = fetch;
+    let callerSignal: AbortSignal | undefined;
+    let timeoutMs: number = 8000;
 
     if (typeof userIdOrFetch === 'function') {
       customFetch = userIdOrFetch;
@@ -508,6 +512,8 @@ export class ZerodhaCredentialManager {
     } else if (options && typeof options === 'object') {
       if (options.customFetch) customFetch = options.customFetch;
       if (options.connectionId) connectionId = options.connectionId;
+      if (options.signal) callerSignal = options.signal;
+      if (typeof options.timeoutMs === 'number' && options.timeoutMs > 0) timeoutMs = options.timeoutMs;
     }
 
     const apiKey = process.env.ZERODHA_API_KEY || process.env.KITE_API_KEY;
@@ -538,6 +544,8 @@ export class ZerodhaCredentialManager {
     bodyParams.append('checksum', checksum);
 
     const fetchFn = customFetch;
+    const timeoutSignal = AbortSignal.timeout(timeoutMs);
+    const effectiveSignal = callerSignal ? AbortSignal.any([callerSignal, timeoutSignal]) : timeoutSignal;
 
     try {
       const response = await fetchFn('https://api.kite.trade/session/token', {
@@ -547,6 +555,7 @@ export class ZerodhaCredentialManager {
           'Content-Type': 'application/x-www-form-urlencoded',
         },
         body: bodyParams.toString(),
+        signal: effectiveSignal,
       });
 
       const body = await response.json();
@@ -608,16 +617,21 @@ export class ZerodhaCredentialManager {
           userId: brokerUserId || userId,
         },
       };
-    } catch (err) {
+    } catch (err: any) {
       this.cachedSession = null;
       this.setAuthState('AUTHENTICATION_ERROR');
-      const rawMsg = err instanceof Error ? err.message : 'Unknown network failure';
+      const isTimeout = err?.name === 'TimeoutError' || err?.name === 'AbortError' || effectiveSignal.aborted;
+      const rawMsg = isTimeout
+        ? 'Request timed out or was aborted'
+        : (err instanceof Error ? err.message : 'Unknown network failure');
       return {
         success: false,
         error: this.sanitizeErrorString(`Failed to exchange token with Zerodha: ${rawMsg}`),
       };
     }
   }
+
+  public static readonly generateSessionFromRequestToken = ZerodhaCredentialManager.exchangeRequestToken;
 
   /**
    * Safe presence diagnostic reporting ONLY boolean presence flags and non-sensitive timestamps.

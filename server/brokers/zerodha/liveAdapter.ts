@@ -4,9 +4,11 @@ import {
   RawBrokerPosition,
   BrokerInstrument,
   LtpSnapshotResult,
+  BrokerAccountCapital,
 } from '../types';
 import { ZerodhaCredentialManager } from './credentials';
 import { classifyInstrument } from '../../instruments/master';
+import { checkIsAfterHours } from '../normalize';
 
 export class InstrumentValidationError extends Error {
   constructor(message: string) {
@@ -36,12 +38,21 @@ export type HttpFetchFn = (url: string, options?: any) => Promise<{
 export class LiveZerodhaAdapter implements BrokerAdapter {
   public readonly providerId: string = 'zerodha';
   private customFetch?: HttpFetchFn;
+  private timeoutMs: number = 8000;
   private cachedInstruments: BrokerInstrument[] | null = null;
   private instrumentCacheTimestamp: number = 0;
   private readonly INSTRUMENT_CACHE_TTL_MS = 3600 * 1000; // 1 hour
 
   constructor(customFetch?: HttpFetchFn) {
     this.customFetch = customFetch;
+  }
+
+  public setTimeoutMs(ms: number) {
+    this.timeoutMs = ms;
+  }
+
+  public getTimeoutMs(): number {
+    return this.timeoutMs;
   }
 
   /**
@@ -52,11 +63,21 @@ export class LiveZerodhaAdapter implements BrokerAdapter {
     this.cachedInstruments = null;
   }
 
-  private async fetch(url: string, options: any = {}) {
-    if (this.customFetch) {
-      return this.customFetch(url, options);
+  private createEffectiveSignal(callerSignal?: AbortSignal): AbortSignal {
+    const timeoutSignal = AbortSignal.timeout(this.timeoutMs);
+    if (!callerSignal) {
+      return timeoutSignal;
     }
-    return fetch(url, options);
+    return AbortSignal.any([callerSignal, timeoutSignal]);
+  }
+
+  private async fetch(url: string, options: any = {}) {
+    const signal = this.createEffectiveSignal(options.signal);
+    const requestOptions = { ...options, signal };
+    if (this.customFetch) {
+      return this.customFetch(url, requestOptions);
+    }
+    return fetch(url, requestOptions);
   }
 
   /**
@@ -505,6 +526,110 @@ export class LiveZerodhaAdapter implements BrokerAdapter {
       throw new Error('[LiveZerodhaAdapter] Failed to fetch LTP snapshot from Zerodha');
     }
   }
+
+  public async getCapital(userId = 'default_trader'): Promise<BrokerAccountCapital> {
+    const status = await this.getConnectionStatus(userId);
+    const isAfterHours = checkIsAfterHours();
+
+    if (status.status !== 'AUTHENTICATED' && status.status !== 'CONNECTED') {
+      return {
+        broker: 'zerodha',
+        dataSource: 'ZERODHA_LIVE',
+        connectionStatus: status.status,
+        netBalance: null,
+        availableCash: null,
+        availableTradingMargin: null,
+        utilizedMargin: null,
+        withdrawableFunds: null,
+        currency: 'INR',
+        asOf: new Date().toISOString(),
+        isStale: true,
+        isAfterHours,
+        semanticNote: `Zerodha capital unavailable: ${status.message}`,
+      };
+    }
+
+    const authSession = await ZerodhaCredentialManager.getAuthenticatedSession(userId);
+    if (!authSession || !authSession.accessToken) {
+      return {
+        broker: 'zerodha',
+        dataSource: 'ZERODHA_LIVE',
+        connectionStatus: 'AUTHENTICATION_REQUIRED',
+        netBalance: null,
+        availableCash: null,
+        availableTradingMargin: null,
+        utilizedMargin: null,
+        withdrawableFunds: null,
+        currency: 'INR',
+        asOf: new Date().toISOString(),
+        isStale: true,
+        isAfterHours,
+        semanticNote: 'Zerodha active session access token not found',
+      };
+    }
+
+    const { apiKey } = ZerodhaCredentialManager.getCredentials(userId);
+
+    try {
+      const response = await this.fetch('https://api.kite.trade/user/margins', {
+        headers: {
+          'X-Kite-Version': '3',
+          'Authorization': `token ${apiKey || 'zerodha_key'}:${authSession.accessToken}`,
+        },
+      });
+
+      if (!response.ok) {
+        throw new Error(`Kite Connect margins HTTP ${response.status}`);
+      }
+
+      const body = await response.json();
+      const equityData = body?.data?.equity || body?.data;
+      if (!equityData) {
+        throw new Error('Invalid margins response structure from Zerodha API');
+      }
+
+      const netBalance = Number(equityData.net ?? equityData.available?.cash ?? 0);
+      const availableCash = Number(equityData.available?.cash ?? 0);
+      const availableTradingMargin = Number(equityData.net ?? equityData.available?.live_balance ?? availableCash);
+      const utilizedMargin = Number(
+        equityData.utilised?.debits ??
+        (Number(equityData.utilised?.exposure || 0) + Number(equityData.utilised?.span || 0) + Number(equityData.utilised?.option_premium || 0))
+      );
+
+      return {
+        broker: 'zerodha',
+        dataSource: 'ZERODHA_LIVE',
+        connectionStatus: 'AUTHENTICATED',
+        netBalance,
+        availableCash,
+        availableTradingMargin,
+        utilizedMargin,
+        withdrawableFunds: null, // Zerodha Kite /user/margins API does not provide a withdrawable balance field
+        currency: 'INR',
+        asOf: new Date().toISOString(),
+        isStale: false,
+        isAfterHours,
+        semanticNote: 'Mapped from Zerodha Kite Connect /user/margins (equity segment)',
+      };
+    } catch (err: any) {
+      return {
+        broker: 'zerodha',
+        dataSource: 'ZERODHA_LIVE',
+        connectionStatus: 'ERROR',
+        netBalance: null,
+        availableCash: null,
+        availableTradingMargin: null,
+        utilizedMargin: null,
+        withdrawableFunds: null,
+        currency: 'INR',
+        asOf: new Date().toISOString(),
+        isStale: true,
+        isAfterHours,
+        semanticNote: `Failed to fetch Zerodha margins: ${ZerodhaCredentialManager.sanitizeErrorString(err?.message || 'Upstream request failed')}`,
+      };
+    }
+  }
 }
 
 export const liveZerodhaAdapter = new LiveZerodhaAdapter();
+

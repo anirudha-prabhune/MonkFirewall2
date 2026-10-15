@@ -134,6 +134,12 @@ service cloud.firestore {
         match /runtimeSession/{sessionId} {
           allow read, write: if false;
         }
+
+        // Subcollection: credentials (Phase 5C.3 - Per-User Encrypted API Keys)
+        // SERVER-AUTHORITATIVE & SERVER-ONLY: Client SDK has ZERO read/write/delete access!
+        match /credentials/{credentialId} {
+          allow read, write: if false;
+        }
       }
 
       // Risk Sessions subcollection

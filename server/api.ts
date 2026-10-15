@@ -10,6 +10,8 @@ import { MarketDataService } from './market/marketDataService';
 import { LivePnlValidationService } from './pnl/liveValidationService';
 import { ValidationSessionManager } from './pnl/validationSession';
 import { ZerodhaCredentialManager } from './brokers/zerodha/credentials';
+import { liveZerodhaAdapter } from './brokers/zerodha/liveAdapter';
+import { mockZerodhaAdapter } from './brokers/mock/adapter';
 import { liveAngelOneAdapter } from './brokers/angelone/liveAdapter';
 import { AngelOneSessionStore } from './brokers/angelone/sessionStore';
 import { normalizePositions } from './brokers/normalize';
@@ -362,6 +364,34 @@ apiRouter.get('/broker/live/positions', async (req: Request, res: Response) => {
   }
 });
 
+// GET /api/broker/live/capital - Phase 5B Read-Only Account Capital (Zerodha / Mock)
+apiRouter.get('/broker/live/capital', async (req: Request, res: Response) => {
+  try {
+    const userId = (req as any).userId || await authenticateRequest(req, res);
+    if (!userId) return;
+
+    const isExplicitMock = req.query.mode === 'mock' || req.query.broker === 'mock';
+    const capital = isExplicitMock
+      ? await mockZerodhaAdapter.getCapital()
+      : await liveZerodhaAdapter.getCapital(userId);
+
+    sendJson(res, {
+      success: true,
+      broker: isExplicitMock ? 'mock' : 'zerodha',
+      capital,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (err) {
+    sendJson(res, {
+      success: false,
+      broker: 'zerodha',
+      capital: null,
+      error: err instanceof Error ? err.message : 'Failed to fetch account capital',
+      timestamp: new Date().toISOString(),
+    }, 500);
+  }
+});
+
 // ============================================================================
 // ANGEL ONE SMARTAPI ENDPOINTS (PHASE 1 MULTI-BROKER)
 // ============================================================================
@@ -403,16 +433,72 @@ apiRouter.get('/broker/angelone/live/positions', async (req: Request, res: Respo
   }
 });
 
-apiRouter.post('/broker/angelone/live/auth/session', async (req: Request, res: Response) => {
+apiRouter.get('/broker/angelone/live/capital', async (req: Request, res: Response) => {
   try {
     const userId = (req as any).userId || await authenticateRequest(req, res);
     if (!userId) return;
-    const accessToken = req.body?.accessToken || 'mock_angelone_token';
-    const clientCode = req.body?.clientCode;
-    const saved = await AngelOneSessionStore.saveSession(userId, accessToken, { clientCode });
-    sendJson(res, { success: true, ...saved });
+    const capital = await liveAngelOneAdapter.getCapital(userId);
+    sendJson(res, {
+      success: true,
+      broker: 'angelone',
+      capital,
+      timestamp: new Date().toISOString(),
+    });
   } catch (err) {
-    sendJson(res, { error: err instanceof Error ? err.message : 'Failed to save Angel One session' }, 500);
+    sendJson(res, {
+      success: false,
+      broker: 'angelone',
+      capital: null,
+      error: err instanceof Error ? err.message : 'Failed to fetch Angel One account capital',
+      timestamp: new Date().toISOString(),
+    }, 500);
+  }
+});
+
+apiRouter.post('/broker/angelone/live/auth/session', async (req: Request, res: Response) => {
+  try {
+    const userId = await authenticateRequest(req, res);
+    if (!userId) return;
+
+    // Never accept client-supplied accessToken as proof of authentication
+    const { clientCode, password, totp, apiKey } = req.body || {};
+
+    const authResult = await liveAngelOneAdapter.authenticate(userId, {
+      clientCode,
+      password,
+      totp,
+      apiKey,
+    });
+
+    if (!authResult.success) {
+      return sendJson(
+        res,
+        {
+          success: false,
+          error: authResult.error || 'Angel One authentication failed',
+        },
+        401
+      );
+    }
+
+    sendJson(res, {
+      success: true,
+      authenticated: true,
+      status: 'AUTHENTICATED',
+      authState: 'AUTHENTICATED',
+      clientCode: authResult.session?.clientCode,
+      sessionVersion: authResult.session?.sessionVersion,
+      expiresAt: authResult.session?.expiresAt,
+    });
+  } catch (err) {
+    sendJson(
+      res,
+      {
+        success: false,
+        error: err instanceof Error ? err.message : 'Failed to authenticate Angel One session',
+      },
+      500
+    );
   }
 });
 

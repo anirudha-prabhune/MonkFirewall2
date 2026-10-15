@@ -29,3 +29,28 @@ export interface NormalizedPosition {
   unrealisedPnl?: number;
   totalPnl?: number;
 }
+
+export interface BrokerAccountCapital {
+  broker: 'zerodha' | 'angelone' | 'mock';
+  dataSource: 'MOCK_DATA' | 'ZERODHA_LIVE' | 'ANGELONE_LIVE';
+  connectionStatus: string;
+  netBalance: number | null;
+  availableCash: number | null;
+  availableTradingMargin: number | null;
+  utilizedMargin: number | null;
+  withdrawableFunds: number | null;
+  currency: string;
+  asOf: string;
+  isStale: boolean;
+  isAfterHours: boolean;
+  semanticNote: string;
+}
+
+export interface LiveCapitalResponse {
+  success: boolean;
+  broker: 'zerodha' | 'angelone' | 'mock';
+  capital: BrokerAccountCapital | null;
+  error?: string;
+  timestamp: string;
+}
+

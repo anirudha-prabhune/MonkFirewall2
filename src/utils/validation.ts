@@ -90,6 +90,10 @@ export function validateRiskConfig(input: any): ValidationResult {
     errors.push('lockDurationMinutes must be a finite valid number');
   } else if (rawDuration <= 0) {
     errors.push('lockDurationMinutes must be greater than 0');
+  } else if ((input.lockDurationType === 'FIXED' || !input.lockDurationType) && rawDuration < 60) {
+    errors.push('lockDurationMinutes must be at least 60 minutes');
+  } else if ((input.lockDurationType === 'FIXED' || !input.lockDurationType) && rawDuration % 60 !== 0) {
+    errors.push('lockDurationMinutes must be in increments of 60 minutes');
   }
 
   // 5. lockDurationType

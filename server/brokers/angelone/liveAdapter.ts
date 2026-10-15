@@ -4,10 +4,38 @@ import {
   RawBrokerPosition,
   BrokerInstrument,
   LtpSnapshotResult,
+  BrokerAccountCapital,
 } from '../types';
 import { AngelOneCredentials } from './credentials';
 import { AngelOneSessionStore } from './sessionStore';
 import { MOCK_INSTRUMENT_MASTER } from '../../instruments/master';
+import { generateTotp } from './totp';
+import { checkIsAfterHours } from '../normalize';
+
+export interface AngelOneAuthParams {
+  apiKey?: string;
+  clientCode?: string;
+  password?: string;
+  totp?: string;
+  totpSecret?: string;
+}
+
+export interface AngelOneAuthResult {
+  success: boolean;
+  error?: string;
+  session?: {
+    expiresAt: string;
+    sessionVersion: number;
+    clientCode?: string;
+  };
+}
+
+export function sanitizeAngelOneErrorString(errorStr?: string): string {
+  if (!errorStr) return 'Authentication failed';
+  return errorStr
+    .replace(/[a-zA-Z0-9_\-\.]{25,}/g, '[REDACTED_TOKEN]')
+    .replace(/(?:password|secret|key|totp)=[^&\s]+/gi, '$1=[REDACTED]');
+}
 
 /**
  * Live Angel One SmartAPI Adapter.
@@ -17,13 +45,208 @@ import { MOCK_INSTRUMENT_MASTER } from '../../instruments/master';
 export class LiveAngelOneAdapter implements BrokerAdapter {
   public readonly providerId: string = 'angelone';
   private credentials: AngelOneCredentials;
+  private customFetch?: typeof fetch;
 
-  constructor(config = {}) {
+  constructor(config = {}, customFetch?: typeof fetch) {
     this.credentials = new AngelOneCredentials(config);
+    this.customFetch = customFetch;
+  }
+
+  private timeoutMs: number = 8000;
+
+  public setTimeoutMs(ms: number) {
+    this.timeoutMs = ms;
+  }
+
+  public getTimeoutMs(): number {
+    return this.timeoutMs;
+  }
+
+  public setFetchHandler(fn?: typeof fetch) {
+    this.customFetch = fn;
+  }
+
+  private createEffectiveSignal(callerSignal?: AbortSignal | null): AbortSignal {
+    const timeoutSignal = AbortSignal.timeout(this.timeoutMs);
+    if (!callerSignal) {
+      return timeoutSignal;
+    }
+    return AbortSignal.any([callerSignal, timeoutSignal]);
+  }
+
+  private async fetchWithTimeout(
+    url: string | Request | URL,
+    options: RequestInit = {},
+    customFetchOverride?: typeof fetch
+  ): Promise<Response> {
+    const signal = this.createEffectiveSignal(options.signal);
+    const requestOptions: RequestInit = { ...options, signal };
+    const handler = customFetchOverride || this.customFetch || fetch;
+    return handler(url, requestOptions);
+  }
+
+  /**
+   * Authenticates with Angel One SmartAPI upstream using official loginByPassword contract.
+   *
+   * Security & Isolation Guarantees:
+   * 1. Never accepts client-provided accessToken as proof of authentication.
+   * 2. Marks session AUTHENTICATED only after successful upstream SmartAPI validation.
+   * 3. Sanitizes all errors and return values: zero tokens, passwords, TOTP secrets, or API keys leaked.
+   * 4. Persists encrypted session token strictly isolated per userId in AngelOneSessionStore.
+   * 5. Strictly fail-closed on network errors, invalid credentials, or malformed responses.
+   */
+  public async authenticate(
+    userId: string,
+    params: AngelOneAuthParams = {},
+    options: {
+      customFetch?: typeof fetch;
+      connectionId?: string;
+    } = {}
+  ): Promise<AngelOneAuthResult> {
+    if (!userId || typeof userId !== 'string' || !userId.trim()) {
+      return { success: false, error: 'User ID is required for authentication' };
+    }
+
+    const trimmedUserId = userId.trim();
+    const config = this.credentials.getConfig();
+
+    const apiKey = (params.apiKey !== undefined ? params.apiKey : (config.apiKey || '')).trim();
+    const clientCode = (params.clientCode !== undefined ? params.clientCode : (config.clientCode || '')).trim();
+    const password = (params.password !== undefined ? params.password : (config.password || '')).trim();
+
+    let totp = (params.totp?.trim() || '').trim();
+    if (!totp) {
+      const totpSecret = (params.totpSecret !== undefined ? params.totpSecret : (config.totpSecret || '')).trim();
+      if (totpSecret) {
+        try {
+          totp = generateTotp(totpSecret);
+        } catch (totpErr: any) {
+          return {
+            success: false,
+            error: `TOTP generation failed: ${sanitizeAngelOneErrorString(totpErr?.message)}`,
+          };
+        }
+      }
+    }
+
+    // Fail-closed validation before dispatching any network request
+    if (!apiKey) {
+      return { success: false, error: 'Angel One API Key is required' };
+    }
+    if (!clientCode) {
+      return { success: false, error: 'Angel One Client Code is required' };
+    }
+    if (!password) {
+      return { success: false, error: 'Angel One Password / MPIN is required' };
+    }
+    if (!totp) {
+      return { success: false, error: 'Angel One TOTP code or TOTP Secret is required' };
+    }
+    if (!/^\d{6}$/.test(totp)) {
+      return { success: false, error: 'Invalid TOTP format: must be a 6-digit numerical code' };
+    }
+
+    const fetchFn = (url: any, opts: any) => this.fetchWithTimeout(url, opts, options.customFetch);
+
+    try {
+      const loginResponse = await fetchFn(
+        'https://apiconnect.angelbroking.com/rest/auth/angelbroking/user/v1/loginByPassword',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+            'X-PrivateKey': apiKey,
+            'X-UserType': 'USER',
+            'X-SourceID': 'WEB',
+            'X-ClientLocalIP': '127.0.0.1',
+            'X-ClientPublicIP': '127.0.0.1',
+            'X-MACAddress': 'MAC',
+          },
+          body: JSON.stringify({
+            clientcode: clientCode,
+            password,
+            totp,
+          }),
+        }
+      );
+
+      if (!loginResponse.ok) {
+        let errorMsg = `SmartAPI login failed with HTTP ${loginResponse.status}`;
+        try {
+          const errorBody: any = await loginResponse.json();
+          if (errorBody?.message) {
+            errorMsg = errorBody.message;
+          }
+        } catch {}
+        return {
+          success: false,
+          error: sanitizeAngelOneErrorString(errorMsg),
+        };
+      }
+
+      const authData: any = await loginResponse.json();
+      if (!authData || !authData.status) {
+        const errorMsg = authData?.message || 'SmartAPI authentication failed';
+        return {
+          success: false,
+          error: sanitizeAngelOneErrorString(errorMsg),
+        };
+      }
+
+      const rawJwt = authData.data?.jwtToken || authData.data?.accessToken;
+      if (!rawJwt || typeof rawJwt !== 'string' || rawJwt.trim().length === 0) {
+        return {
+          success: false,
+          error: 'SmartAPI response missing valid session token',
+        };
+      }
+
+      const liveAccessToken = rawJwt.replace(/^Bearer\s+/i, '').trim();
+      if (liveAccessToken.length < 20) {
+        return {
+          success: false,
+          error: 'SmartAPI response returned invalid session token length',
+        };
+      }
+
+      // Persist encrypted token to isolated session store (FAIL-CLOSED)
+      const saveResult = await AngelOneSessionStore.saveSession(
+        trimmedUserId,
+        liveAccessToken,
+        {
+          clientCode,
+          connectionId: options.connectionId,
+        }
+      );
+
+      // Persist user's encrypted API key separately from session expiry
+      await AngelOneSessionStore.saveApiKey(
+        trimmedUserId,
+        apiKey,
+        options.connectionId
+      );
+
+      return {
+        success: true,
+        session: {
+          expiresAt: saveResult.expiresAt,
+          sessionVersion: saveResult.sessionVersion,
+          clientCode,
+        },
+      };
+    } catch (err: any) {
+      return {
+        success: false,
+        error: sanitizeAngelOneErrorString(err?.message || 'Upstream SmartAPI authentication failed'),
+      };
+    }
   }
 
   public async getConnectionStatus(userId = 'default_trader'): Promise<BrokerConnectionStatus> {
-    const configured = this.credentials.isConfigured();
+    const session = await AngelOneSessionStore.loadSession(userId);
+    const storedApiKey = await AngelOneSessionStore.loadApiKey(userId);
+    const configured = Boolean(storedApiKey || this.credentials.isConfigured() || (session && session.authState === 'AUTHENTICATED'));
     if (!configured) {
       return {
         broker: 'angelone',
@@ -38,7 +261,6 @@ export class LiveAngelOneAdapter implements BrokerAdapter {
       };
     }
 
-    const session = await AngelOneSessionStore.loadSession(userId);
     if (!session || session.authState !== 'AUTHENTICATED' || session.isExpired) {
       return {
         broker: 'angelone',
@@ -79,11 +301,17 @@ export class LiveAngelOneAdapter implements BrokerAdapter {
       throw new Error('Angel One active session access token not found');
     }
 
+    let apiKey = await AngelOneSessionStore.loadApiKey(userId);
+    if (!apiKey) {
+      apiKey = this.credentials.getConfig().apiKey || '';
+    }
+
     try {
-      const response = await fetch('https://apiconnect.angelbroking.com/rest/secure/angelbroking/order/v1/getPosition', {
+      const response = await this.fetchWithTimeout('https://apiconnect.angelbroking.com/rest/secure/angelbroking/order/v1/getPosition', {
         method: 'GET',
         headers: {
           'Authorization': `Bearer ${session.accessToken}`,
+          'X-PrivateKey': apiKey,
           'X-UserType': 'USER',
           'X-SourceID': 'WEB',
           'X-ClientLocalIP': '127.0.0.1',
@@ -120,27 +348,6 @@ export class LiveAngelOneAdapter implements BrokerAdapter {
         instrument_token: Number(item.symboltoken ?? 0),
       }));
     } catch (err: any) {
-      if (process.env.NODE_ENV === 'test' || process.env.NODE_ENV === 'development') {
-        return [
-          {
-            exchange: 'NFO',
-            tradingsymbol: 'NIFTY26OCT24000CE',
-            product: 'CARRYFORWARD',
-            quantity: 50,
-            average_price: 150.0,
-            last_price: 165.0,
-            pnl: 750.0,
-            realised: 0.0,
-            unrealised: 750.0,
-            day_buy_quantity: 50,
-            day_buy_value: 7500.0,
-            day_sell_quantity: 0,
-            day_sell_value: 0.0,
-            instrument_token: 999001,
-            multiplier: 50,
-          },
-        ];
-      }
       throw err;
     }
   }
@@ -177,6 +384,136 @@ export class LiveAngelOneAdapter implements BrokerAdapter {
       status: 'VALID',
     };
   }
+
+  public async getCapital(userId = 'default_trader'): Promise<BrokerAccountCapital> {
+    const status = await this.getConnectionStatus(userId);
+    const isAfterHours = checkIsAfterHours();
+
+    if (status.status !== 'AUTHENTICATED' && status.status !== 'CONNECTED') {
+      return {
+        broker: 'angelone',
+        dataSource: 'ANGELONE_LIVE',
+        connectionStatus: status.status,
+        netBalance: null,
+        availableCash: null,
+        availableTradingMargin: null,
+        utilizedMargin: null,
+        withdrawableFunds: null,
+        currency: 'INR',
+        asOf: new Date().toISOString(),
+        isStale: true,
+        isAfterHours,
+        semanticNote: `Angel One capital unavailable: ${status.message}`,
+      };
+    }
+
+    const session = await AngelOneSessionStore.loadSession(userId);
+    if (!session || !session.accessToken) {
+      return {
+        broker: 'angelone',
+        dataSource: 'ANGELONE_LIVE',
+        connectionStatus: 'AUTHENTICATION_REQUIRED',
+        netBalance: null,
+        availableCash: null,
+        availableTradingMargin: null,
+        utilizedMargin: null,
+        withdrawableFunds: null,
+        currency: 'INR',
+        asOf: new Date().toISOString(),
+        isStale: true,
+        isAfterHours,
+        semanticNote: 'Angel One active session access token not found',
+      };
+    }
+
+    let apiKey = await AngelOneSessionStore.loadApiKey(userId);
+    if (!apiKey) {
+      apiKey = this.credentials.getConfig().apiKey || '';
+    }
+
+    if (!apiKey) {
+      return {
+        broker: 'angelone',
+        dataSource: 'ANGELONE_LIVE',
+        connectionStatus: 'CONFIGURATION_ERROR',
+        netBalance: null,
+        availableCash: null,
+        availableTradingMargin: null,
+        utilizedMargin: null,
+        withdrawableFunds: null,
+        currency: 'INR',
+        asOf: new Date().toISOString(),
+        isStale: true,
+        isAfterHours,
+        semanticNote: 'Angel One API Key not found for user',
+      };
+    }
+
+    try {
+      const response = await this.fetchWithTimeout('https://apiconnect.angelbroking.com/rest/secure/angelbroking/user/v1/getRMS', {
+        method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${session.accessToken}`,
+          'X-PrivateKey': apiKey,
+          'X-UserType': 'USER',
+          'X-SourceID': 'WEB',
+          'X-ClientLocalIP': '127.0.0.1',
+          'X-ClientPublicIP': '127.0.0.1',
+          'X-MACAddress': 'MAC',
+          'Accept': 'application/json',
+        },
+      });
+
+      if (!response.ok) {
+        throw new Error(`SmartAPI getRMS HTTP ${response.status}`);
+      }
+
+      const data: any = await response.json();
+      if (!data.status && data.message) {
+        throw new Error(`SmartAPI error: ${data.message}`);
+      }
+
+      const rmsData = data.data || {};
+      const netBalance = Number(rmsData.net ?? rmsData.availablecash ?? 0);
+      const availableCash = Number(rmsData.availablecash ?? 0);
+      const availableTradingMargin = Number(rmsData.availablelimitmargin ?? rmsData.net ?? availableCash);
+      const utilizedMargin = Number(rmsData.utilisedDebits ?? 0);
+      const withdrawableFunds = rmsData.withdrawablebalance != null ? Number(rmsData.withdrawablebalance) : null;
+
+      return {
+        broker: 'angelone',
+        dataSource: 'ANGELONE_LIVE',
+        connectionStatus: 'AUTHENTICATED',
+        netBalance,
+        availableCash,
+        availableTradingMargin,
+        utilizedMargin,
+        withdrawableFunds,
+        currency: 'INR',
+        asOf: new Date().toISOString(),
+        isStale: false,
+        isAfterHours,
+        semanticNote: 'Mapped from Angel One SmartAPI /rest/secure/angelbroking/user/v1/getRMS',
+      };
+    } catch (err: any) {
+      return {
+        broker: 'angelone',
+        dataSource: 'ANGELONE_LIVE',
+        connectionStatus: 'ERROR',
+        netBalance: null,
+        availableCash: null,
+        availableTradingMargin: null,
+        utilizedMargin: null,
+        withdrawableFunds: null,
+        currency: 'INR',
+        asOf: new Date().toISOString(),
+        isStale: true,
+        isAfterHours,
+        semanticNote: `Failed to fetch Angel One RMS capital: ${sanitizeAngelOneErrorString(err?.message || 'Upstream request failed')}`,
+      };
+    }
+  }
 }
 
 export const liveAngelOneAdapter = new LiveAngelOneAdapter();
+

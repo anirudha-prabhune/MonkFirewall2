@@ -609,6 +609,12 @@ async function runPhase15SecuritySuite() {
           throw new Error('UNAVAILABLE: Firestore replica quorum dropped');
         },
       }),
+      batch: () => ({
+        set: () => {},
+        commit: async () => {
+          throw new Error('UNAVAILABLE: Firestore replica quorum dropped');
+        },
+      }),
     };
     setAdminFirestoreForTesting(mockFaultyDb);
     enableMockStoreForTesting(false);
@@ -644,6 +650,12 @@ async function runPhase15SecuritySuite() {
         set: async (data: any) => {
           persistedDoc = data;
         },
+      }),
+      batch: () => ({
+        set: (_ref: any, data: any) => {
+          persistedDoc = data;
+        },
+        commit: async () => {},
       }),
     };
     setAdminFirestoreForTesting(mockSuccessDb);

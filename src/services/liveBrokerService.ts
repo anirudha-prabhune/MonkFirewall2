@@ -2,6 +2,7 @@ import {
   LiveBrokerStatusResponse,
   LivePositionsResponse,
   MarketDataStatus,
+  LiveCapitalResponse,
 } from '../../server/brokers/types';
 import { getAuthHeaders } from './firebase';
 
@@ -15,6 +16,19 @@ export async function fetchLiveBrokerStatus(userId?: string): Promise<LiveBroker
     }
   } catch (err) {
     console.warn('Failed to fetch live broker status:', err);
+  }
+  return null;
+}
+
+export async function fetchLiveCapital(userId?: string): Promise<LiveCapitalResponse | null> {
+  try {
+    const headers = await getAuthHeaders(userId ? { 'x-user-id': userId } : {});
+    const res = await fetch('/api/broker/live/capital', { headers });
+    if (res.ok) {
+      return await res.json();
+    }
+  } catch (err) {
+    console.warn('Failed to fetch live capital:', err);
   }
   return null;
 }
@@ -120,6 +134,19 @@ export async function fetchAngelOnePositions(userId?: string): Promise<LivePosit
   return null;
 }
 
+export async function fetchAngelOneCapital(userId?: string): Promise<LiveCapitalResponse | null> {
+  try {
+    const headers = await getAuthHeaders(userId ? { 'x-user-id': userId } : {});
+    const res = await fetch('/api/broker/angelone/live/capital', { headers });
+    if (res.ok) {
+      return await res.json();
+    }
+  } catch (err) {
+    console.warn('Failed to fetch Angel One capital:', err);
+  }
+  return null;
+}
+
 export async function authenticateAngelOneSession(
   credentials: { clientCode: string; password?: string; totp?: string; apiKey?: string },
   userId?: string
@@ -155,3 +182,4 @@ export async function disconnectAngelOneSession(userId?: string): Promise<boolea
     return false;
   }
 }
+

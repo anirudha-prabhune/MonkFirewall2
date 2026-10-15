@@ -23,20 +23,33 @@ export interface DecryptedAngelOneSession {
   isExpired: boolean;
 }
 
+export interface PersistedAngelOneApiKeyDoc {
+  provider: 'angelone';
+  userId: string;
+  encryptedApiKey: EncryptedPayload;
+  updatedAt: string;
+}
+
 const DEFAULT_CONNECTION_ID = 'angelone_default';
 let useMockStoreForTesting = false;
 const inMemoryTestStore = new Map<string, PersistedAngelOneSessionDoc>();
+const inMemoryTestApiKeyStore = new Map<string, PersistedAngelOneApiKeyDoc>();
 
 export class AngelOneSessionStore {
   public static enableMockStoreForTesting(enabled: boolean): void {
     useMockStoreForTesting = enabled;
     if (!enabled) {
       inMemoryTestStore.clear();
+      inMemoryTestApiKeyStore.clear();
     }
   }
 
   public static getSessionDocPath(userId: string, connectionId = DEFAULT_CONNECTION_ID): string {
     return `users/${userId.trim()}/brokerConnections/${connectionId}/runtimeSession/current`;
+  }
+
+  public static getApiKeyDocPath(userId: string, connectionId = DEFAULT_CONNECTION_ID): string {
+    return `users/${userId.trim()}/brokerConnections/${connectionId}/credentials/apiKey`;
   }
 
   private static getAdminFirestore(): any {
@@ -263,5 +276,126 @@ export class AngelOneSessionStore {
     memCurrent.encryptedToken = { iv: '', ciphertext: '', tag: '', keyVersion: 0 };
     memCurrent.updatedAt = now;
     return { invalidated: true, currentVersion };
+  }
+
+  /**
+   * Persists an encrypted Angel One SmartAPI API key per user and connection.
+   */
+  public static async saveApiKey(
+    userId: string,
+    apiKey: string,
+    connectionId = DEFAULT_CONNECTION_ID
+  ): Promise<void> {
+    if (!userId || !userId.trim()) {
+      throw new Error('UserId is required to persist Angel One API key');
+    }
+    if (!apiKey || !apiKey.trim()) {
+      throw new Error('API key is required to persist Angel One API key');
+    }
+
+    const trimmedUserId = userId.trim();
+    const trimmedApiKey = apiKey.trim();
+    const now = new Date().toISOString();
+    const encrypted = CryptoService.encrypt(trimmedApiKey, trimmedUserId);
+    const docPath = this.getApiKeyDocPath(trimmedUserId, connectionId);
+
+    const docData: PersistedAngelOneApiKeyDoc = {
+      provider: 'angelone',
+      userId: trimmedUserId,
+      encryptedApiKey: {
+        iv: encrypted.iv,
+        ciphertext: encrypted.ciphertext,
+        tag: encrypted.tag,
+        keyVersion: encrypted.keyVersion,
+      },
+      updatedAt: now,
+    };
+
+    if (!useMockStoreForTesting) {
+      const db = this.getAdminFirestore();
+      if (!db) {
+        throw new Error('Firebase Admin Firestore not initialized');
+      }
+      try {
+        await db.doc(docPath).set(docData, { merge: true });
+      } catch (err: any) {
+        throw new Error(`Failed to persist Angel One API key: ${err?.message || String(err)}`);
+      }
+      return;
+    }
+
+    inMemoryTestApiKeyStore.set(docPath, docData);
+  }
+
+  /**
+   * Loads and decrypts the user's stored Angel One SmartAPI API key.
+   */
+  public static async loadApiKey(
+    userId: string,
+    connectionId = DEFAULT_CONNECTION_ID
+  ): Promise<string | null> {
+    if (!userId || !userId.trim()) {
+      return null;
+    }
+
+    const trimmedUserId = userId.trim();
+    const docPath = this.getApiKeyDocPath(trimmedUserId, connectionId);
+    let docData: PersistedAngelOneApiKeyDoc | null = null;
+
+    if (!useMockStoreForTesting) {
+      const db = this.getAdminFirestore();
+      if (!db) {
+        return null;
+      }
+      try {
+        const snap = await db.doc(docPath).get();
+        if (snap.exists) {
+          docData = snap.data() as PersistedAngelOneApiKeyDoc;
+        }
+      } catch {
+        return null;
+      }
+    } else {
+      docData = inMemoryTestApiKeyStore.get(docPath) || null;
+    }
+
+    if (!docData || !docData.encryptedApiKey) {
+      return null;
+    }
+
+    try {
+      const apiKey = CryptoService.decrypt(docData.encryptedApiKey, trimmedUserId);
+      return apiKey;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Deletes the user's stored Angel One API key credential.
+   */
+  public static async deleteApiKey(
+    userId: string,
+    connectionId = DEFAULT_CONNECTION_ID
+  ): Promise<void> {
+    if (!userId || !userId.trim()) {
+      return;
+    }
+
+    const trimmedUserId = userId.trim();
+    const docPath = this.getApiKeyDocPath(trimmedUserId, connectionId);
+
+    if (!useMockStoreForTesting) {
+      const db = this.getAdminFirestore();
+      if (!db) {
+        return;
+      }
+      try {
+        await db.doc(docPath).delete();
+      } catch {}
+      return;
+    }
+
+    inMemoryTestApiKeyStore.delete(docPath);
   }
 }

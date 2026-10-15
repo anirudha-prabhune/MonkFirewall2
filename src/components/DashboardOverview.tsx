@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   ShieldCheck,
   AlertTriangle,
@@ -21,6 +21,7 @@ import {
 } from 'lucide-react';
 import { RiskConfig, RiskSession } from '../types/risk';
 import { formatINR, getISTReadableDate, getISTTimestamp } from '../utils/formatters';
+import { validateBrokerCapitalPayload } from '../utils/brokerCapitalState';
 import { useAuth } from '../context/AuthContext';
 import { subscribeRiskSession } from '../services/riskSessionService';
 import { getRiskConfig, subscribeRiskConfig } from '../services/riskConfigService';
@@ -34,16 +35,19 @@ import {
 import { PnlResult } from '../../server/pnl/types';
 import {
   fetchLiveBrokerStatus,
+  fetchLiveCapital,
   fetchKiteLoginUrl,
   disconnectZerodhaSession,
   fetchAngelOneStatus,
   fetchAngelOnePositions,
+  fetchAngelOneCapital,
   authenticateAngelOneSession,
   disconnectAngelOneSession,
 } from '../services/liveBrokerService';
 import { getAuthHeaders } from '../services/firebase';
 import { getBrokerConnections } from '../services/brokerConnectionService';
-import { BrokerConnection } from '../types/broker';
+import { BrokerConnection, BrokerAccountCapital } from '../types/broker';
+import { AccountCapitalCard } from './AccountCapitalCard';
 
 interface DashboardOverviewProps {
   riskConfig: RiskConfig;
@@ -115,6 +119,17 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
   const [angelOnePassword, setAngelOnePassword] = useState<string>('');
   const [angelOneTotp, setAngelOneTotp] = useState<string>('');
   const [angelOneApiKey, setAngelOneApiKey] = useState<string>('');
+
+  // Account Capital & Margins State (Phase 5B & Phase 6C.1 Race Remediation)
+  const [capital, setCapital] = useState<BrokerAccountCapital | null>(null);
+  const [loadingCapital, setLoadingCapital] = useState<boolean>(false);
+  const capitalRequestIdRef = useRef<number>(0);
+  const positionsRequestIdRef = useRef<number>(0);
+  const activeBrokerRef = useRef<'zerodha' | 'angelone'>('zerodha');
+
+  useEffect(() => {
+    activeBrokerRef.current = selectedBroker;
+  }, [selectedBroker]);
 
   // Demo / Simulation Controls State
   const [isDemoControlsOpen, setIsDemoControlsOpen] = useState<boolean>(false);
@@ -192,30 +207,82 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
     };
   }, [user, selectedAccountId]);
 
-  // Load Positions and P&L
-  const loadPositionsAndPnl = async () => {
-    setLoadingPositions(true);
+  // Load Account Capital (Phase 5B & Phase 6C.1 Race Remediation)
+  const loadAccountCapital = useCallback(async (targetBroker?: 'zerodha' | 'angelone') => {
+    const brokerToFetch = targetBroker || activeBrokerRef.current;
+    const reqId = ++capitalRequestIdRef.current;
+    setLoadingCapital(true);
+
     try {
-      if (selectedBroker === 'angelone') {
-        const [angelPositionsRes, angelStat, pnl] = await Promise.all([
+      if (brokerToFetch === 'angelone') {
+        const res = await fetchAngelOneCapital(user?.uid);
+        // Guard against race conditions:
+        // 1. Sequence check: Ensure this is still the most recent request
+        // 2. Active broker check: Ensure the active broker hasn't changed
+        if (reqId !== capitalRequestIdRef.current || activeBrokerRef.current !== 'angelone') {
+          return;
+        }
+        // 3. DataSource & broker validation: Angel One must return ANGELONE_LIVE and angelone broker
+        if (res?.capital && !validateBrokerCapitalPayload('angelone', res.capital)) {
+          setCapital(null);
+          return;
+        }
+        setCapital(res?.capital || null);
+      } else {
+        const res = await fetchLiveCapital(user?.uid);
+        // Guard against race conditions:
+        if (reqId !== capitalRequestIdRef.current || activeBrokerRef.current !== 'zerodha') {
+          return;
+        }
+        // DataSource & broker validation: Zerodha must return ZERODHA_LIVE or MOCK_DATA and zerodha broker
+        if (res?.capital && !validateBrokerCapitalPayload('zerodha', res.capital)) {
+          setCapital(null);
+          return;
+        }
+        setCapital(res?.capital || null);
+      }
+    } catch (err) {
+      console.warn('Failed to load account capital:', err);
+      // Clear capital on error only if this request is still the active one
+      if (reqId === capitalRequestIdRef.current && activeBrokerRef.current === brokerToFetch) {
+        setCapital(null);
+      }
+    } finally {
+      if (reqId === capitalRequestIdRef.current && activeBrokerRef.current === brokerToFetch) {
+        setLoadingCapital(false);
+      }
+    }
+  }, [user?.uid]);
+
+  // Load Positions and P&L (Phase 6C.1 Race-Protected)
+  const loadPositionsAndPnl = useCallback(async (targetBroker?: 'zerodha' | 'angelone') => {
+    const brokerToFetch = targetBroker || activeBrokerRef.current;
+    const reqId = ++positionsRequestIdRef.current;
+    setLoadingPositions(true);
+
+    try {
+      loadAccountCapital(brokerToFetch);
+      if (brokerToFetch === 'angelone') {
+        const [angelPositionsRes, angelStat] = await Promise.all([
           fetchAngelOnePositions(user?.uid),
           fetchAngelOneStatus(user?.uid),
-          fetchGrossPnl(user?.uid),
         ]);
+        if (reqId !== positionsRequestIdRef.current || activeBrokerRef.current !== 'angelone') {
+          return;
+        }
         setAngelOneStatus(angelStat);
-        if (angelPositionsRes && Array.isArray(angelPositionsRes.positions)) {
+        setPnlResult(null); // Clear summary P&L result when Angel One is active
+
+        const isAngelConnected =
+          angelStat?.authenticated === true &&
+          (angelStat?.status === 'AUTHENTICATED' || angelStat?.status === 'CONNECTED');
+
+        if (isAngelConnected && angelPositionsRes && Array.isArray(angelPositionsRes.positions)) {
           setFnoPositions(angelPositionsRes.positions);
         } else {
-          const [pos, status] = await Promise.all([
-            fetchFnoPositions(user?.uid),
-            fetchBrokerStatus(),
-          ]);
-          setFnoPositions(pos);
-          setBrokerStatus(status);
-        }
-        setPnlResult(pnl);
-        if (pnl && (pnl.riskSession || pnl.shadowSession)) {
-          setSession(pnl.riskSession || pnl.shadowSession);
+          // Angel One disconnected, expired, error, or missing positions -> clear positions immediately.
+          // Do NOT silently fall back to Zerodha or mock positions!
+          setFnoPositions([]);
         }
       } else {
         const [pos, status, pnl] = await Promise.all([
@@ -223,6 +290,9 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
           fetchBrokerStatus(),
           fetchGrossPnl(user?.uid),
         ]);
+        if (reqId !== positionsRequestIdRef.current || activeBrokerRef.current !== 'zerodha') {
+          return;
+        }
         setFnoPositions(pos);
         setBrokerStatus(status);
         setPnlResult(pnl);
@@ -232,13 +302,21 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
       }
     } catch (err) {
       console.error('Failed to load positions & PnL:', err);
+      if (reqId === positionsRequestIdRef.current && activeBrokerRef.current === brokerToFetch) {
+        if (brokerToFetch === 'angelone') {
+          setFnoPositions([]);
+          setPnlResult(null);
+        }
+      }
     } finally {
-      setLoadingPositions(false);
+      if (reqId === positionsRequestIdRef.current && activeBrokerRef.current === brokerToFetch) {
+        setLoadingPositions(false);
+      }
     }
-  };
+  }, [user?.uid, loadAccountCapital]);
 
   // Load Live Diagnostics
-  const loadLiveDiagnostics = async () => {
+  const loadLiveDiagnostics = useCallback(async () => {
     if (!user) return;
     try {
       const [res, angelRes] = await Promise.all([
@@ -250,17 +328,51 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
     } catch (err) {
       console.error('Failed to fetch live broker status:', err);
     }
+  }, [user]);
+
+  // Handle immediate switch of active broker (Phase 6C.1)
+  const handleSelectBroker = (broker: 'zerodha' | 'angelone') => {
+    if (broker === selectedBroker) return;
+    // Invalidate in-flight capital and positions requests immediately
+    capitalRequestIdRef.current += 1;
+    positionsRequestIdRef.current += 1;
+    activeBrokerRef.current = broker;
+
+    // Clear displayed capital immediately upon broker switch (set to null and loading state)
+    setCapital(null);
+    setLoadingCapital(true);
+
+    // Clear positions and PnL immediately upon broker switch
+    setFnoPositions([]);
+    if (broker === 'angelone') {
+      setPnlResult(null);
+    }
+    setLoadingPositions(true);
+
+    setSelectedBroker(broker);
   };
 
   useEffect(() => {
-    loadPositionsAndPnl();
+    // When selectedBroker or user changes, clear state immediately to prevent stale/cross-broker display
+    capitalRequestIdRef.current += 1;
+    positionsRequestIdRef.current += 1;
+    activeBrokerRef.current = selectedBroker;
+    setCapital(null);
+    setLoadingCapital(true);
+    setFnoPositions([]);
+    if (selectedBroker === 'angelone') {
+      setPnlResult(null);
+    }
+    setLoadingPositions(true);
+
+    loadPositionsAndPnl(selectedBroker);
     loadLiveDiagnostics();
     const interval = setInterval(() => {
-      loadPositionsAndPnl();
+      loadPositionsAndPnl(activeBrokerRef.current);
       loadLiveDiagnostics();
     }, 30000);
     return () => clearInterval(interval);
-  }, [user, selectedBroker]);
+  }, [user, selectedBroker, loadPositionsAndPnl, loadLiveDiagnostics]);
 
   // Handle Kite Login
   const handleKiteLogin = async () => {
@@ -915,274 +1027,417 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
         </div>
       )}
 
+      {/* Angel One Mode Information Banner */}
+      {selectedBroker === 'angelone' && (
+        <div
+          className={`p-4 rounded-xl border text-xs mb-6 shadow-xs ${
+            isAngelOneConnected
+              ? 'bg-sky-500/10 dark:bg-sky-500/15 border-sky-500/30 text-sky-900 dark:text-sky-200'
+              : 'bg-amber-500/10 dark:bg-amber-500/15 border-amber-500/30 text-amber-900 dark:text-amber-200'
+          }`}
+        >
+          <div className="flex items-center space-x-2 font-bold mb-1">
+            <span
+              className={`px-2 py-0.5 rounded font-mono text-[10px] uppercase font-bold ${
+                isAngelOneConnected
+                  ? 'bg-sky-500/20 border border-sky-500/40 text-sky-800 dark:text-sky-300'
+                  : 'bg-amber-500/20 border border-amber-500/40 text-amber-800 dark:text-amber-300'
+              }`}
+            >
+              {isAngelOneConnected ? 'ANGEL ONE LIVE ACCOUNT' : 'ANGEL ONE DISCONNECTED'}
+            </span>
+            <span>
+              {isAngelOneConnected
+                ? 'Summary P&L & Daily Loss Limit Buffer Unavailable'
+                : 'Authentication Required'}
+            </span>
+          </div>
+          <p className="text-slate-700 dark:text-slate-300 leading-relaxed">
+            {isAngelOneConnected
+              ? 'Angel One summary P&L aggregation and Trading Firewall risk monitoring are currently unavailable for Angel One accounts. Individual position P&L is provided directly by SmartAPI in the positions table below. Risk enforcement remains strictly bound to Zerodha / Mock mode to prevent cross-broker data substitution.'
+              : 'Your Angel One session is disconnected or expired. Please authenticate your connection to view live positions. Old position and P&L values have been cleared and are not displayed.'}
+          </p>
+        </div>
+      )}
+
       {/* 1. PRIMARY RISK SUMMARY (3-Column Layout, Risk State Dominant) */}
       <div className="bg-white dark:bg-[#1F2633] rounded-2xl border border-[#98C1D9]/40 dark:border-[#3D4A5E] p-6 shadow-xs transition-colors">
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 lg:divide-x divide-slate-100 dark:divide-[#3D4A5E]">
           
           {/* Pillar 1: Current Risk State (Visually Dominant) */}
-          {(() => {
-            const isSyncStale =
-              isLiveMode &&
-              pnlResult !== null &&
-              session.currentPnl !== undefined &&
-              Math.abs(session.currentPnl - effectivePnl) > 0.01;
-
-            const displayState = isSyncStale ? 'EVALUATING' : session.state;
-
-            return (
-              <div className="flex flex-col justify-between pr-0 lg:pr-6">
-                <div>
-                  <div className="flex items-center justify-between mb-2">
-                    <span className="text-xs font-bold text-[#5C6B7E] dark:text-[#98C1D9] uppercase tracking-wider">
-                      Firewall Status
-                    </span>
-                    <span
-                      className={`text-[10px] font-mono px-2 py-0.5 rounded font-bold uppercase tracking-wider ${
-                        displayState === 'EVALUATING'
-                          ? 'bg-amber-500/20 text-amber-700 dark:text-amber-300 border border-amber-500/40 animate-pulse'
-                          : displayState === 'LOCKED'
-                          ? 'bg-rose-500/20 text-rose-700 dark:text-rose-300 border border-rose-500/40'
-                          : displayState === 'MARKET_CLOSED'
-                          ? 'bg-slate-500/20 text-slate-700 dark:text-slate-300 border border-slate-500/40'
-                          : displayState === 'WARNING'
-                          ? 'bg-amber-500/20 text-amber-700 dark:text-amber-300 border border-amber-500/40'
-                          : 'bg-emerald-500/20 text-emerald-700 dark:text-emerald-300 border border-emerald-500/40'
-                      }`}
-                    >
-                      {displayState === 'MARKET_CLOSED' ? 'CLOSED' : displayState}
-                    </span>
-                  </div>
- 
-                   {/* Visually Dominant State Card */}
-                  <div
-                    className={`p-4 rounded-xl border-2 flex items-center space-x-4 mt-2 transition-all ${
-                      displayState === 'EVALUATING'
-                        ? 'bg-amber-500/10 border-amber-500/40 text-amber-700 dark:text-amber-300'
-                        : displayState === 'LOCKED'
-                        ? 'bg-rose-500/10 border-rose-500/40 text-rose-700 dark:text-rose-300'
-                        : displayState === 'WARNING'
-                        ? 'bg-amber-500/10 border-amber-500/40 text-amber-700 dark:text-amber-300'
-                        : displayState === 'MARKET_CLOSED'
-                        ? 'bg-slate-50 dark:bg-slate-800/20 border-slate-200 dark:border-slate-800/40 text-slate-600 dark:text-slate-300'
-                        : 'bg-emerald-500/10 border-emerald-500/40 text-emerald-700 dark:text-emerald-300'
-                    }`}
-                  >
-                    <div
-                      className={`p-3.5 rounded-xl border flex items-center justify-center shrink-0 ${
-                        displayState === 'EVALUATING'
-                          ? 'bg-amber-500/20 border-amber-500/40 text-amber-600 dark:text-amber-400'
-                          : displayState === 'LOCKED'
-                          ? 'bg-rose-500/20 border-rose-500/40 text-rose-600 dark:text-rose-400'
-                          : displayState === 'WARNING'
-                          ? 'bg-amber-500/20 border-amber-500/40 text-amber-600 dark:text-amber-400'
-                          : displayState === 'MARKET_CLOSED'
-                          ? 'bg-slate-100 border-slate-200 text-slate-500 dark:bg-slate-800 dark:border-slate-700 dark:text-slate-400'
-                          : 'bg-emerald-500/20 border-emerald-500/40 text-emerald-600 dark:text-emerald-400'
-                      }`}
-                    >
-                      {displayState === 'EVALUATING' ? (
-                        <RefreshCw className="w-9 h-9 animate-spin" />
-                      ) : displayState === 'LOCKED' ? (
-                        <Lock className="w-9 h-9" />
-                      ) : displayState === 'WARNING' ? (
-                        <AlertTriangle className="w-9 h-9" />
-                      ) : displayState === 'MARKET_CLOSED' ? (
-                        <Clock className="w-9 h-9" />
-                      ) : (
-                        <ShieldCheck className="w-9 h-9" />
-                      )}
-                    </div>
- 
-                     <div>
-                      <div className="text-5xl font-black font-mono tracking-wider">
-                        {displayState === 'MARKET_CLOSED' ? 'CLOSED' : displayState}
-                      </div>
-                      <div className="text-xs font-semibold mt-1">
-                        {displayState === 'EVALUATING'
-                          ? 'Syncing Risk State... Evaluating Current P&L'
-                          : displayState === 'LOCKED'
-                          ? 'Trading Locked · Circuit Breaker Engaged'
-                          : displayState === 'WARNING'
-                          ? 'Warning Active · Loss Nearing Limit'
-                          : displayState === 'MARKET_CLOSED'
-                          ? 'Trading Ended · Risk Monitoring Paused'
-                          : 'Trading Authorized · Limits Normal'}
-                      </div>
-                    </div>
-                  </div>
+          {selectedBroker === 'angelone' ? (
+            <div className="flex flex-col justify-between pr-0 lg:pr-6">
+              <div>
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-xs font-bold text-[#5C6B7E] dark:text-[#98C1D9] uppercase tracking-wider">
+                    Firewall Status
+                  </span>
+                  <span className="text-[10px] font-mono px-2 py-0.5 rounded font-bold uppercase tracking-wider bg-slate-500/20 text-slate-700 dark:text-slate-300 border border-slate-500/40">
+                    UNMONITORED
+                  </span>
                 </div>
-
-                <div className="mt-4 pt-3 border-t border-slate-100 dark:border-[#3D4A5E] text-[11px] text-[#5C6B7E] dark:text-[#98C1D9] flex items-center justify-between">
-                  <span>
-                    Protection:{' '}
-                    {!riskConfig.enabled
-                      ? 'Disabled'
-                      : pnlResult?.liveRiskStateRecordingEnabled === true
-                      ? 'Active'
-                      : 'Shadow Mode'}
-                  </span>
-                  <span className="font-mono">
-                    {session.lastEvaluatedAt
-                      ? new Date(session.lastEvaluatedAt).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' })
-                      : istTime}{' '}
-                    IST
-                  </span>
+                <div className="p-4 rounded-xl border-2 border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/20 flex items-center space-x-4 mt-2">
+                  <div className="p-3.5 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400 shrink-0">
+                    <ShieldCheck className="w-9 h-9" />
+                  </div>
+                  <div>
+                    <div className="text-3xl font-black font-mono tracking-wider text-slate-700 dark:text-slate-300">
+                      INACTIVE
+                    </div>
+                    <div className="text-xs font-semibold mt-1 text-slate-600 dark:text-slate-400">
+                      Risk firewall is disabled for Angel One · Firewall bound to Zerodha/Mock
+                    </div>
+                  </div>
                 </div>
               </div>
-            );
-          })()}
+              <div className="mt-4 pt-3 border-t border-slate-100 dark:border-[#3D4A5E] text-[11px] text-[#5C6B7E] dark:text-[#98C1D9]">
+                Protection: Disabled (Angel One)
+              </div>
+            </div>
+          ) : (
+            (() => {
+              const isSyncStale =
+                isLiveMode &&
+                pnlResult !== null &&
+                session.currentPnl !== undefined &&
+                Math.abs(session.currentPnl - effectivePnl) > 0.01;
+
+              const displayState = isSyncStale ? 'EVALUATING' : session.state;
+
+              return (
+                <div className="flex flex-col justify-between pr-0 lg:pr-6">
+                  <div>
+                    <div className="flex items-center justify-between mb-2">
+                      <span className="text-xs font-bold text-[#5C6B7E] dark:text-[#98C1D9] uppercase tracking-wider">
+                        Firewall Status
+                      </span>
+                      <span
+                        className={`text-[10px] font-mono px-2 py-0.5 rounded font-bold uppercase tracking-wider ${
+                          displayState === 'EVALUATING'
+                            ? 'bg-amber-500/20 text-amber-700 dark:text-amber-300 border border-amber-500/40 animate-pulse'
+                            : displayState === 'LOCKED'
+                            ? 'bg-rose-500/20 text-rose-700 dark:text-rose-300 border border-rose-500/40'
+                            : displayState === 'MARKET_CLOSED'
+                            ? 'bg-slate-500/20 text-slate-700 dark:text-slate-300 border border-slate-500/40'
+                            : displayState === 'WARNING'
+                            ? 'bg-amber-500/20 text-amber-700 dark:text-amber-300 border border-amber-500/40'
+                            : 'bg-emerald-500/20 text-emerald-700 dark:text-emerald-300 border border-emerald-500/40'
+                        }`}
+                      >
+                        {displayState === 'MARKET_CLOSED' ? 'CLOSED' : displayState}
+                      </span>
+                    </div>
+
+                    {/* Visually Dominant State Card */}
+                    <div
+                      className={`p-4 rounded-xl border-2 flex items-center space-x-4 mt-2 transition-all ${
+                        displayState === 'EVALUATING'
+                          ? 'bg-amber-500/10 border-amber-500/40 text-amber-700 dark:text-amber-300'
+                          : displayState === 'LOCKED'
+                          ? 'bg-rose-500/10 border-rose-500/40 text-rose-700 dark:text-rose-300'
+                          : displayState === 'WARNING'
+                          ? 'bg-amber-500/10 border-amber-500/40 text-amber-700 dark:text-amber-300'
+                          : displayState === 'MARKET_CLOSED'
+                          ? 'bg-slate-50 dark:bg-slate-800/20 border-slate-200 dark:border-slate-800/40 text-slate-600 dark:text-slate-300'
+                          : 'bg-emerald-500/10 border-emerald-500/40 text-emerald-700 dark:text-emerald-300'
+                      }`}
+                    >
+                      <div
+                        className={`p-3.5 rounded-xl border flex items-center justify-center shrink-0 ${
+                          displayState === 'EVALUATING'
+                            ? 'bg-amber-500/20 border-amber-500/40 text-amber-600 dark:text-amber-400'
+                            : displayState === 'LOCKED'
+                            ? 'bg-rose-500/20 border-rose-500/40 text-rose-600 dark:text-rose-400'
+                            : displayState === 'WARNING'
+                            ? 'bg-amber-500/20 border-amber-500/40 text-amber-600 dark:text-amber-400'
+                            : displayState === 'MARKET_CLOSED'
+                            ? 'bg-slate-100 border-slate-200 text-slate-500 dark:bg-slate-800 dark:border-slate-700 dark:text-slate-400'
+                            : 'bg-emerald-500/20 border-emerald-500/40 text-emerald-600 dark:text-emerald-400'
+                        }`}
+                      >
+                        {displayState === 'EVALUATING' ? (
+                          <RefreshCw className="w-9 h-9 animate-spin" />
+                        ) : displayState === 'LOCKED' ? (
+                          <Lock className="w-9 h-9" />
+                        ) : displayState === 'WARNING' ? (
+                          <AlertTriangle className="w-9 h-9" />
+                        ) : displayState === 'MARKET_CLOSED' ? (
+                          <Clock className="w-9 h-9" />
+                        ) : (
+                          <ShieldCheck className="w-9 h-9" />
+                        )}
+                      </div>
+
+                      <div>
+                        <div className="text-5xl font-black font-mono tracking-wider">
+                          {displayState === 'MARKET_CLOSED' ? 'CLOSED' : displayState}
+                        </div>
+                        <div className="text-xs font-semibold mt-1">
+                          {displayState === 'EVALUATING'
+                            ? 'Syncing Risk State... Evaluating Current P&L'
+                            : displayState === 'LOCKED'
+                            ? 'Trading Locked · Circuit Breaker Engaged'
+                            : displayState === 'WARNING'
+                            ? 'Warning Active · Loss Nearing Limit'
+                            : displayState === 'MARKET_CLOSED'
+                            ? 'Trading Ended · Risk Monitoring Paused'
+                            : 'Trading Authorized · Limits Normal'}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="mt-4 pt-3 border-t border-slate-100 dark:border-[#3D4A5E] text-[11px] text-[#5C6B7E] dark:text-[#98C1D9] flex items-center justify-between">
+                    <span>
+                      Protection:{' '}
+                      {!riskConfig.enabled
+                        ? 'Disabled'
+                        : pnlResult?.liveRiskStateRecordingEnabled === true
+                        ? 'Active'
+                        : 'Shadow Mode'}
+                    </span>
+                    <span className="font-mono">
+                      {session.lastEvaluatedAt
+                        ? new Date(session.lastEvaluatedAt).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' })
+                        : istTime}{' '}
+                      IST
+                    </span>
+                  </div>
+                </div>
+              );
+            })()
+          )}
 
           {/* Pillar 2: F&O P&L (Clearly distinguishing LIVE vs SIMULATION mode) */}
-          <div className="flex flex-col justify-between px-0 lg:px-6">
-            <div>
-              <div className="flex items-center justify-between mb-2">
-                <span className="text-xs font-bold text-[#5C6B7E] dark:text-[#98C1D9] uppercase tracking-wider">
-                  {isLiveMode ? "Today's F&O P&L" : 'Simulated F&O P&L'}
-                </span>
-
-                {/* Mode Tag */}
-                {isLiveMode ? (
-                  <div className="flex items-center space-x-1.5">
-                    <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 border border-emerald-500/30 font-bold flex items-center space-x-1">
-                      <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
-                      <span>Zerodha Live Account</span>
-                    </span>
-                    {(pnlResult as any)?.marketDataStatus && (pnlResult as any)?.marketDataStatus !== 'FRESH' && (
-                      <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-amber-500/10 text-amber-700 dark:text-amber-300 border border-amber-500/40 font-bold uppercase tracking-wider">
-                        Data: {(pnlResult as any)?.marketDataStatus}
-                      </span>
-                    )}
-                  </div>
-                ) : (
-                  <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-amber-500/10 text-amber-700 dark:text-amber-300 border border-dashed border-amber-500/40 font-bold uppercase tracking-wider">
-                    SIMULATION
+          {selectedBroker === 'angelone' ? (
+            <div className="flex flex-col justify-between px-0 lg:px-6">
+              <div>
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-xs font-bold text-[#5C6B7E] dark:text-[#98C1D9] uppercase tracking-wider">
+                    Angel One Summary P&L
                   </span>
-                )}
-              </div>
-
-              {/* P&L Display: Demo P&L visually distinguished so it never resembles live broker P&L */}
-              <div
-                className={`p-4 rounded-xl border transition-all ${
-                  isLiveMode
-                    ? 'bg-slate-50/50 dark:bg-[#19202B]/40 border-slate-200 dark:border-[#3D4A5E]'
-                    : 'bg-amber-50/30 dark:bg-amber-950/10 border-dashed border-amber-500/30'
-                }`}
-              >
-                <div className="flex items-baseline justify-between">
-                  <div
-                    className={`text-3xl font-extrabold font-mono tracking-tight ${
-                      effectivePnl < 0
-                        ? 'text-rose-600 dark:text-rose-400'
-                        : effectivePnl > 0
-                        ? 'text-emerald-600 dark:text-emerald-400'
-                        : 'text-slate-900 dark:text-[#E0FBFC]'
-                    }`}
-                  >
-                    {formatINR(effectivePnl)}
+                  <span className={`text-[10px] font-mono px-2 py-0.5 rounded-full font-bold border ${
+                    isAngelOneConnected
+                      ? 'bg-sky-500/15 text-sky-700 dark:text-sky-300 border-sky-500/30'
+                      : 'bg-amber-500/15 text-amber-700 dark:text-amber-300 border-amber-500/30'
+                  }`}>
+                    {isAngelOneConnected ? 'ANGEL ONE LIVE' : 'DISCONNECTED'}
+                  </span>
+                </div>
+                <div className="p-4 rounded-xl border bg-slate-50/50 dark:bg-[#19202B]/40 border-slate-200 dark:border-[#3D4A5E]">
+                  <div className="flex items-baseline justify-between">
+                    <div className="text-3xl font-extrabold font-mono tracking-tight text-slate-400 dark:text-slate-500">
+                      Unavailable
+                    </div>
+                    <span className="text-[11px] font-mono font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider">
+                      (Aggregation Pending)
+                    </span>
                   </div>
-                  {isSimulationMode && (
-                    <span className="text-[11px] font-mono font-semibold text-amber-700 dark:text-amber-400 uppercase tracking-wider">
-                      (Simulated)
+                  <div className="grid grid-cols-2 gap-4 mt-3 text-xs">
+                    <div>
+                      <span className="text-[#5C6B7E] dark:text-[#98C1D9] block text-[11px]">Realized</span>
+                      <span className="font-mono font-bold text-slate-400 dark:text-slate-500">N/A</span>
+                    </div>
+                    <div>
+                      <span className="text-[#5C6B7E] dark:text-[#98C1D9] block text-[11px]">Unrealized</span>
+                      <span className="font-mono font-bold text-slate-400 dark:text-slate-500">N/A</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+              <div className="mt-4 pt-3 border-t border-slate-100 dark:border-[#3D4A5E] text-[11px] text-[#5C6B7E] dark:text-[#98C1D9]">
+                Summary aggregation unavailable · Position P&L displayed in table below
+              </div>
+            </div>
+          ) : (
+            <div className="flex flex-col justify-between px-0 lg:px-6">
+              <div>
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-xs font-bold text-[#5C6B7E] dark:text-[#98C1D9] uppercase tracking-wider">
+                    {isLiveMode ? "Today's F&O P&L" : 'Simulated F&O P&L'}
+                  </span>
+
+                  {/* Mode Tag */}
+                  {isLiveMode ? (
+                    <div className="flex items-center space-x-1.5">
+                      <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 border border-emerald-500/30 font-bold flex items-center space-x-1">
+                        <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                        <span>Zerodha Live Account</span>
+                      </span>
+                      {(pnlResult as any)?.marketDataStatus && (pnlResult as any)?.marketDataStatus !== 'FRESH' && (
+                        <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-amber-500/10 text-amber-700 dark:text-amber-300 border border-amber-500/40 font-bold uppercase tracking-wider">
+                          Data: {(pnlResult as any)?.marketDataStatus}
+                        </span>
+                      )}
+                    </div>
+                  ) : (
+                    <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-amber-500/10 text-amber-700 dark:text-amber-300 border border-dashed border-amber-500/40 font-bold uppercase tracking-wider">
+                      SIMULATION
                     </span>
                   )}
                 </div>
 
-                <div className="grid grid-cols-2 gap-4 mt-3 text-xs">
-                  <div>
-                    <span className="text-[#5C6B7E] dark:text-[#98C1D9] block text-[11px]">Realized</span>
-                    <span className="font-mono font-bold text-slate-800 dark:text-slate-200">
-                      {formatINR(effectiveRealised)}
-                    </span>
+                {/* P&L Display: Demo P&L visually distinguished so it never resembles live broker P&L */}
+                <div
+                  className={`p-4 rounded-xl border transition-all ${
+                    isLiveMode
+                      ? 'bg-slate-50/50 dark:bg-[#19202B]/40 border-slate-200 dark:border-[#3D4A5E]'
+                      : 'bg-amber-50/30 dark:bg-amber-950/10 border-dashed border-amber-500/30'
+                  }`}
+                >
+                  <div className="flex items-baseline justify-between">
+                    <div
+                      className={`text-3xl font-extrabold font-mono tracking-tight ${
+                        effectivePnl < 0
+                          ? 'text-rose-600 dark:text-rose-400'
+                          : effectivePnl > 0
+                          ? 'text-emerald-600 dark:text-emerald-400'
+                          : 'text-slate-900 dark:text-[#E0FBFC]'
+                      }`}
+                    >
+                      {formatINR(effectivePnl)}
+                    </div>
+                    {isSimulationMode && (
+                      <span className="text-[11px] font-mono font-semibold text-amber-700 dark:text-amber-400 uppercase tracking-wider">
+                        (Simulated)
+                      </span>
+                    )}
                   </div>
-                  <div>
-                    <span className="text-[#5C6B7E] dark:text-[#98C1D9] block text-[11px]">Unrealized</span>
-                    <span className="font-mono font-bold text-slate-800 dark:text-slate-200">
-                      {formatINR(effectiveUnrealised)}
-                    </span>
+
+                  <div className="grid grid-cols-2 gap-4 mt-3 text-xs">
+                    <div>
+                      <span className="text-[#5C6B7E] dark:text-[#98C1D9] block text-[11px]">Realized</span>
+                      <span className="font-mono font-bold text-slate-800 dark:text-slate-200">
+                        {formatINR(effectiveRealised)}
+                      </span>
+                    </div>
+                    <div>
+                      <span className="text-[#5C6B7E] dark:text-[#98C1D9] block text-[11px]">Unrealized</span>
+                      <span className="font-mono font-bold text-slate-800 dark:text-slate-200">
+                        {formatINR(effectiveUnrealised)}
+                      </span>
+                    </div>
                   </div>
                 </div>
               </div>
-            </div>
 
-            <div className="mt-4 pt-3 border-t border-slate-100 dark:border-[#3D4A5E] text-[11px] text-[#5C6B7E] dark:text-[#98C1D9]">
-              {isLiveMode ? (
-                <span className="text-emerald-700 dark:text-emerald-300 font-medium">
-                  Zerodha Live Account · Real-time F&O performance
-                </span>
-              ) : (
-                <span className="text-amber-700 dark:text-amber-400 font-medium">
-                  Simulated demo data only. Does not represent your Zerodha account.
-                </span>
-              )}
+              <div className="mt-4 pt-3 border-t border-slate-100 dark:border-[#3D4A5E] text-[11px] text-[#5C6B7E] dark:text-[#98C1D9]">
+                {isLiveMode ? (
+                  <span className="text-emerald-700 dark:text-emerald-300 font-medium">
+                    Zerodha Live Account · Real-time F&O performance
+                  </span>
+                ) : (
+                  <span className="text-amber-700 dark:text-amber-400 font-medium">
+                    Simulated demo data only. Does not represent your Zerodha account.
+                  </span>
+                )}
+              </div>
             </div>
-          </div>
+          )}
 
           {/* Pillar 3: Daily Loss Limit */}
-          <div className="flex flex-col justify-between pl-0 lg:pl-6">
-            <div>
-              <div className="flex items-center justify-between mb-2">
-                <span className="text-xs font-bold text-[#5C6B7E] dark:text-[#98C1D9] uppercase tracking-wider">
-                  Daily Loss Limit
-                </span>
-                <button
-                  onClick={onOpenSettings}
-                  className="text-xs text-[#3D5A80] dark:text-[#98C1D9] hover:text-[#293241] dark:hover:text-[#E0FBFC] font-semibold flex items-center space-x-1 cursor-pointer transition-colors"
-                >
-                  <Sliders className="w-3 h-3" />
-                  <span>Configure</span>
-                </button>
-              </div>
-
-              <div className="text-3xl font-extrabold font-mono tracking-tight text-slate-900 dark:text-[#E0FBFC]">
-                {formatINR(riskConfig.dailyLossLimit)}
-              </div>
-
-              <div className="mt-2.5">
-                <div className="flex items-center justify-between text-xs font-mono mb-1.5">
-                  <span
-                    className={`font-semibold ${
-                      lossUtilizedPercent >= 90
-                        ? 'text-rose-600 dark:text-rose-400 font-bold'
-                        : lossUtilizedPercent >= 70
-                        ? 'text-amber-600 dark:text-amber-400 font-bold'
-                        : 'text-slate-700 dark:text-slate-300'
-                    }`}
+          {selectedBroker === 'angelone' ? (
+            <div className="flex flex-col justify-between pl-0 lg:pl-6">
+              <div>
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-xs font-bold text-[#5C6B7E] dark:text-[#98C1D9] uppercase tracking-wider">
+                    Daily Loss Limit
+                  </span>
+                  <button
+                    onClick={onOpenSettings}
+                    className="text-xs text-[#3D5A80] dark:text-[#98C1D9] hover:text-[#293241] dark:hover:text-[#E0FBFC] font-semibold flex items-center space-x-1 cursor-pointer transition-colors"
                   >
-                    {lossUtilizedPercent}% Used
-                  </span>
-                  <span className="text-[#5C6B7E] dark:text-[#98C1D9]">
-                    Buffer: <span className="font-semibold text-slate-800 dark:text-slate-200">{formatINR(remainingBuffer)}</span>
-                  </span>
+                    <Sliders className="w-3 h-3" />
+                    <span>Configure</span>
+                  </button>
                 </div>
-
-                {/* Clean Progress Bar */}
-                <div className="w-full bg-slate-100 dark:bg-[#19202B] h-2 rounded-full overflow-hidden border border-[#98C1D9]/30 dark:border-[#3D4A5E]">
-                  <div
-                    className={`h-full rounded-full transition-all duration-500 ${
-                      lossUtilizedPercent >= 100
-                        ? 'bg-rose-500'
-                        : lossUtilizedPercent >= 70
-                        ? 'bg-amber-500'
-                        : 'bg-emerald-500'
-                    }`}
-                    style={{ width: `${Math.min(lossUtilizedPercent, 100)}%` }}
-                  />
+                <div className="text-3xl font-extrabold font-mono tracking-tight text-slate-900 dark:text-[#E0FBFC]">
+                  {formatINR(riskConfig.dailyLossLimit)}
+                </div>
+                <div className="mt-2.5">
+                  <div className="flex items-center justify-between text-xs font-mono mb-1.5">
+                    <span className="font-semibold text-slate-500 dark:text-slate-400">
+                      Buffer Unavailable
+                    </span>
+                    <span className="text-[#5C6B7E] dark:text-[#98C1D9]">
+                      N/A
+                    </span>
+                  </div>
+                  <div className="w-full bg-slate-100 dark:bg-[#19202B] h-2 rounded-full overflow-hidden border border-[#98C1D9]/30 dark:border-[#3D4A5E]">
+                    <div className="h-full rounded-full bg-slate-300 dark:bg-slate-700 w-0" />
+                  </div>
                 </div>
               </div>
+              <div className="mt-4 pt-3 border-t border-slate-100 dark:border-[#3D4A5E] text-[11px] text-[#5C6B7E] dark:text-[#98C1D9]">
+                Loss limit buffer calculation disabled for Angel One
+              </div>
             </div>
+          ) : (
+            <div className="flex flex-col justify-between pl-0 lg:pl-6">
+              <div>
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-xs font-bold text-[#5C6B7E] dark:text-[#98C1D9] uppercase tracking-wider">
+                    Daily Loss Limit
+                  </span>
+                  <button
+                    onClick={onOpenSettings}
+                    className="text-xs text-[#3D5A80] dark:text-[#98C1D9] hover:text-[#293241] dark:hover:text-[#E0FBFC] font-semibold flex items-center space-x-1 cursor-pointer transition-colors"
+                  >
+                    <Sliders className="w-3 h-3" />
+                    <span>Configure</span>
+                  </button>
+                </div>
 
-            <div className="mt-4 pt-3 border-t border-slate-100 dark:border-[#3D4A5E] text-[11px] text-[#5C6B7E] dark:text-[#98C1D9] flex items-center justify-between font-mono">
-              <span>Alert 1: {riskConfig.warningThreshold1}%</span>
-              <span>Alert 2: {riskConfig.warningThreshold2}%</span>
-              <span>
-                {session.state === 'MARKET_CLOSED' ? 'Lock Policy' : 'Lock'}:{' '}
-                {riskConfig.lockDurationType === 'UNTIL_4PM'
-                  ? '4:00 PM'
-                  : `${Math.round((riskConfig.lockDurationMinutes || 60) / 60)}h`}
-              </span>
+                <div className="text-3xl font-extrabold font-mono tracking-tight text-slate-900 dark:text-[#E0FBFC]">
+                  {formatINR(riskConfig.dailyLossLimit)}
+                </div>
+
+                <div className="mt-2.5">
+                  <div className="flex items-center justify-between text-xs font-mono mb-1.5">
+                    <span
+                      className={`font-semibold ${
+                        lossUtilizedPercent >= 90
+                          ? 'text-rose-600 dark:text-rose-400 font-bold'
+                          : lossUtilizedPercent >= 70
+                          ? 'text-amber-600 dark:text-amber-400 font-bold'
+                          : 'text-slate-700 dark:text-slate-300'
+                      }`}
+                    >
+                      {lossUtilizedPercent}% Used
+                    </span>
+                    <span className="text-[#5C6B7E] dark:text-[#98C1D9]">
+                      Buffer: <span className="font-semibold text-slate-800 dark:text-slate-200">{formatINR(remainingBuffer)}</span>
+                    </span>
+                  </div>
+
+                  {/* Clean Progress Bar */}
+                  <div className="w-full bg-slate-100 dark:bg-[#19202B] h-2 rounded-full overflow-hidden border border-[#98C1D9]/30 dark:border-[#3D4A5E]">
+                    <div
+                      className={`h-full rounded-full transition-all duration-500 ${
+                        lossUtilizedPercent >= 100
+                          ? 'bg-rose-500'
+                          : lossUtilizedPercent >= 70
+                          ? 'bg-amber-500'
+                          : 'bg-emerald-500'
+                      }`}
+                      style={{ width: `${Math.min(lossUtilizedPercent, 100)}%` }}
+                    />
+                  </div>
+                </div>
+              </div>
+
+              <div className="mt-4 pt-3 border-t border-slate-100 dark:border-[#3D4A5E] text-[11px] text-[#5C6B7E] dark:text-[#98C1D9] flex items-center justify-between font-mono">
+                <span>Alert 1: {riskConfig.warningThreshold1}%</span>
+                <span>Alert 2: {riskConfig.warningThreshold2}%</span>
+                <span>
+                  {session.state === 'MARKET_CLOSED' ? 'Lock Policy' : 'Lock'}:{' '}
+                  {riskConfig.lockDurationType === 'UNTIL_4PM'
+                    ? '4:00 PM'
+                    : `${Math.round((riskConfig.lockDurationMinutes || 60) / 60)}h`}
+                </span>
+              </div>
             </div>
-          </div>
-
+          )}
         </div>
       </div>
 
@@ -1219,7 +1474,7 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
           <div className="flex items-center gap-1 p-0.5 bg-slate-100 dark:bg-[#19202B] rounded-lg border border-[#98C1D9]/30 dark:border-[#3D4A5E]">
             <button
               type="button"
-              onClick={() => setSelectedBroker('zerodha')}
+              onClick={() => handleSelectBroker('zerodha')}
               className={`px-2.5 py-1 text-xs font-semibold rounded-md transition-colors cursor-pointer ${
                 selectedBroker === 'zerodha'
                   ? 'bg-white dark:bg-[#283244] text-[#293241] dark:text-[#E0FBFC] shadow-2xs'
@@ -1230,7 +1485,7 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
             </button>
             <button
               type="button"
-              onClick={() => setSelectedBroker('angelone')}
+              onClick={() => handleSelectBroker('angelone')}
               className={`px-2.5 py-1 text-xs font-semibold rounded-md transition-colors cursor-pointer ${
                 selectedBroker === 'angelone'
                   ? 'bg-white dark:bg-[#283244] text-[#293241] dark:text-[#E0FBFC] shadow-2xs'
@@ -1340,7 +1595,7 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
 
         {/* Refresh Action */}
         <button
-          onClick={loadPositionsAndPnl}
+          onClick={() => loadPositionsAndPnl(selectedBroker)}
           disabled={loadingPositions}
           className="p-1.5 rounded-lg text-[#5C6B7E] hover:text-[#293241] dark:text-[#98C1D9] dark:hover:text-[#E0FBFC] hover:bg-slate-100 dark:hover:bg-[#19202B] transition-colors cursor-pointer disabled:opacity-50"
           title="Refresh positions and risk state"
@@ -1443,6 +1698,14 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
         </div>
       )}
 
+      {/* BROKER ACCOUNT CAPITAL & MARGINS CARD (Phase 5B) */}
+      <AccountCapitalCard
+        selectedBroker={selectedBroker}
+        capital={capital}
+        loading={loadingCapital}
+        onRefresh={() => loadAccountCapital(selectedBroker)}
+      />
+
       {/* 4. POSITIONS TABLE (Hides zero-quantity positions by default, clear mode context) */}
       <div className="bg-white dark:bg-[#1F2633] rounded-2xl border border-[#98C1D9]/40 dark:border-[#3D4A5E] overflow-hidden shadow-xs transition-colors">
         <div className="px-6 py-4 border-b border-[#98C1D9]/30 dark:border-[#3D4A5E] flex flex-col sm:flex-row sm:items-center justify-between gap-2">
@@ -1504,16 +1767,35 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
                 <th className="px-4 py-3 text-right font-semibold">Qty</th>
                 <th className="px-4 py-3 text-right font-semibold">Avg Price</th>
                 <th className="px-4 py-3 text-right font-semibold">LTP</th>
-                <th className="px-5 py-3 text-right font-semibold">P&L</th>
+                <th className="px-5 py-3 text-right font-semibold">
+                  {selectedBroker === 'angelone' ? 'P&L (Broker Provided)' : 'P&L'}
+                </th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100 dark:divide-[#3D4A5E]/60 text-slate-800 dark:text-[#E0FBFC]">
               {displayedPositions.length === 0 ? (
                 <tr>
                   <td colSpan={6} className="px-5 py-8 text-center text-slate-400 dark:text-slate-500 font-sans">
-                    {openPositions.length === 0 && closedCount > 0
-                      ? 'No open positions (closed positions hidden).'
-                      : 'No derivative positions found.'}
+                    {selectedBroker === 'angelone' ? (
+                      !isAngelOneConnected ? (
+                        <div className="space-y-1">
+                          <p className="font-semibold text-amber-600 dark:text-amber-400">
+                            Angel One Session Disconnected or Expired
+                          </p>
+                          <p className="text-xs">
+                            Please enter your credentials in the header above to connect your Angel One account and view live positions.
+                          </p>
+                        </div>
+                      ) : openPositions.length === 0 && closedCount > 0 ? (
+                        'No open positions in Angel One account (closed positions hidden).'
+                      ) : (
+                        'No derivative positions found in connected Angel One account.'
+                      )
+                    ) : openPositions.length === 0 && closedCount > 0 ? (
+                      'No open positions (closed positions hidden).'
+                    ) : (
+                      'No derivative positions found.'
+                    )}
                   </td>
                 </tr>
               ) : (
@@ -1535,6 +1817,11 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
                       {/* Contract */}
                       <td className="px-5 py-3 font-semibold text-slate-900 dark:text-[#E0FBFC]">
                         {pos.tradingsymbol}
+                        {pos.dataSource === 'ANGELONE_LIVE' && (
+                          <span className="ml-2 text-[9px] font-mono px-1.5 py-0.5 rounded bg-sky-500/15 text-sky-700 dark:text-sky-300 border border-sky-500/30">
+                            ANGELONE LIVE
+                          </span>
+                        )}
                         {isClosed && (
                           <span className="ml-2 text-[10px] font-sans px-1.5 py-0.5 rounded bg-slate-200 dark:bg-[#283244] text-[#5C6B7E] dark:text-[#98C1D9]">
                             Closed
@@ -1586,17 +1873,24 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
 
                       {/* P&L */}
                       <td className="px-5 py-3 text-right font-bold">
-                        <span
-                          className={
-                            pnl > 0
-                              ? 'text-emerald-600 dark:text-emerald-400'
-                              : pnl < 0
-                              ? 'text-rose-600 dark:text-rose-400'
-                              : 'text-slate-600 dark:text-slate-400'
-                          }
-                        >
-                          {formatINR(pnl)}
-                        </span>
+                        <div className="flex flex-col items-end">
+                          <span
+                            className={
+                              pnl > 0
+                                ? 'text-emerald-600 dark:text-emerald-400'
+                                : pnl < 0
+                                ? 'text-rose-600 dark:text-rose-400'
+                                : 'text-slate-600 dark:text-slate-400'
+                            }
+                          >
+                            {formatINR(pnl)}
+                          </span>
+                          {pos.dataSource === 'ANGELONE_LIVE' && (
+                            <span className="text-[9px] font-sans font-semibold text-sky-700 dark:text-sky-300 bg-sky-500/10 px-1.5 py-0.2 rounded border border-sky-500/20 mt-0.5">
+                              Broker Provided
+                            </span>
+                          )}
+                        </div>
                       </td>
                     </tr>
                   );

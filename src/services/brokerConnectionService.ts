@@ -13,7 +13,12 @@ export async function getBrokerConnection(userId: string): Promise<BrokerConnect
       return snapshot.data() as BrokerConnection;
     }
     return null;
-  } catch (error) {
+  } catch (error: any) {
+    const msg = (error?.message || String(error)).toLowerCase();
+    if (msg.includes('client is offline') || msg.includes('unavailable') || msg.includes('failed to get document')) {
+      console.warn(`getBrokerConnection offline for ${userId}; returning null`);
+      return null;
+    }
     handleFirestoreError(error, OperationType.GET, path);
   }
 }
@@ -115,7 +120,18 @@ export async function setInitialBrokerStatus(userId: string, broker: 'zerodha' |
     };
     await setDoc(docRef, connectionData, { merge: true });
     return connectionData;
-  } catch (error) {
+  } catch (error: any) {
+    const msg = (error?.message || String(error)).toLowerCase();
+    if (msg.includes('client is offline') || msg.includes('unavailable') || msg.includes('failed to get document')) {
+      console.warn(`setInitialBrokerStatus offline for ${userId}; returning local status`);
+      return {
+        broker,
+        status,
+        userId,
+        connectedAt: new Date().toISOString(),
+        lastSyncAt: new Date().toISOString(),
+      };
+    }
     handleFirestoreError(error, OperationType.WRITE, path);
   }
 }
