@@ -178,8 +178,8 @@ async function runPhase7D1Suite() {
     assert.equal(putCap.code, 200);
     assert.equal(putCap.data.success, true);
     assert.equal(putCap.data.config.dailyLossLimit, 25000);
-    // Server-side boundary MUST maintain OBSERVE_ONLY
-    assert.equal(putCap.data.config.executionMode, 'OBSERVE_ONLY');
+    // Phase 8C: Explicit ENFORCE activation permitted for Angel One
+    assert.equal(putCap.data.config.executionMode, 'ENFORCE');
     assert.equal(putCap.data.config.broker, 'angelone');
     assert.equal(putCap.data.config.accountId, DEFAULT_ANGELONE_ACCOUNT_ID);
 
@@ -205,7 +205,7 @@ async function runPhase7D1Suite() {
     // Simulate switching between account A and account B
     const seq = [
       { acc: DEFAULT_ACCOUNT_ID, expectedLimit: 15000, expectedMode: 'ENFORCE' },
-      { acc: DEFAULT_ANGELONE_ACCOUNT_ID, expectedLimit: 25000, expectedMode: 'OBSERVE_ONLY' },
+      { acc: DEFAULT_ANGELONE_ACCOUNT_ID, expectedLimit: 25000, expectedMode: 'ENFORCE' },
       { acc: DEFAULT_ACCOUNT_ID, expectedLimit: 15000, expectedMode: 'ENFORCE' },
     ];
 

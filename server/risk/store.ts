@@ -206,7 +206,13 @@ export class ServerRiskStore {
     const isAngelOne = resolvedAccountId === DEFAULT_ANGELONE_ACCOUNT_ID || resolvedAccountId.includes('angelone');
     if (isAngelOne) {
       sanitized.broker = 'angelone';
-      sanitized.executionMode = 'OBSERVE_ONLY'; // Angel One enforcement is strictly prohibited
+      // Phase 8C: Default to OBSERVE_ONLY, but permit explicit ENFORCE configuration for Angel One
+      const requestedMode = rawInput?.executionMode;
+      if (requestedMode === 'ENFORCE' || requestedMode === 'OBSERVE_ONLY') {
+        sanitized.executionMode = requestedMode;
+      } else {
+        sanitized.executionMode = currentConfig.executionMode || 'OBSERVE_ONLY';
+      }
       sanitized.accountId = resolvedAccountId;
       sanitized.scope = 'ACCOUNT';
     } else {

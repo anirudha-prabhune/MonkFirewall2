@@ -35,7 +35,8 @@ export async function getRiskConfig(userId: string, accountId?: string): Promise
     });
     const url = `/api/risk/config${accountId ? `?accountId=${encodeURIComponent(accountId)}` : ''}`;
     const res = await fetch(url, { headers });
-    if (res.ok) {
+    const contentType = res.headers.get('content-type');
+    if (res.ok && contentType && contentType.includes('application/json')) {
       const data = await res.json();
       const val = validateRiskConfig(data);
       if (val.valid && val.sanitized) {
@@ -108,12 +109,35 @@ export async function saveRiskConfig(
     body: JSON.stringify({ ...newConfig, ...(accountId ? { accountId } : {}) }),
   });
 
-  const data = await response.json();
+  const contentType = response.headers.get('content-type');
+  let data: any = null;
+  if (contentType && contentType.includes('application/json')) {
+    try {
+      data = await response.json();
+    } catch {
+      // Ignore JSON parse error
+    }
+  }
 
-  if (!response.ok || !data.success) {
+  if (!response.ok || !data || !data.success) {
+    const errorList = Array.isArray(data?.errors)
+      ? data.errors.filter((e: any) => Boolean(e) && typeof e === 'string' && e.trim().length > 0)
+      : [];
     const errorMsg =
-      data.errors?.join(', ') || data.message || data.error || 'Failed to update risk parameters on server';
-    throw new Error(errorMsg);
+      errorList.length > 0
+        ? errorList.join(', ')
+        : data?.code === 'RISK_CONFIG_LOCKED'
+        ? 'Daily Loss Limit cannot be modified while Trading Firewall circuit breaker is LOCKED for this account.'
+        : data?.message ||
+          data?.error ||
+          (response.ok
+            ? 'Server returned invalid response'
+            : `Server HTTP error ${response.status}: ${response.statusText || 'Forbidden'}`);
+    const err = new Error(errorMsg);
+    if (data?.code) {
+      (err as any).code = data.code;
+    }
+    throw err;
   }
 
   return data.config;

@@ -88,7 +88,7 @@ export const RiskConfigEditor: React.FC<RiskConfigEditorProps> = ({
     activeAccountId.includes('angelone') ||
     formData.broker === 'angelone';
   const brokerName = isAngelOne ? 'Angel One' : 'Zerodha';
-  const executionMode = isAngelOne ? 'OBSERVE_ONLY' : (formData.executionMode || 'ENFORCE');
+  const executionMode = formData.executionMode || (isAngelOne ? 'OBSERVE_ONLY' : 'ENFORCE');
 
   // Load connected accounts if not provided as props
   useEffect(() => {
@@ -225,7 +225,7 @@ export const RiskConfigEditor: React.FC<RiskConfigEditorProps> = ({
         ...formData,
         accountId: targetAccountId,
         broker: isAngelOne ? 'angelone' : 'zerodha',
-        executionMode: isAngelOne ? 'OBSERVE_ONLY' : 'ENFORCE',
+        executionMode: formData.executionMode || (isAngelOne ? 'OBSERVE_ONLY' : 'ENFORCE'),
       };
 
       const saved = await saveRiskConfig(user.uid, payload, targetAccountId);
@@ -365,16 +365,30 @@ export const RiskConfigEditor: React.FC<RiskConfigEditorProps> = ({
         </div>
       </div>
 
-      {/* Advisory Notice for Angel One OBSERVE_ONLY Mode */}
+      {/* Advisory / Enforcement Notice for Angel One */}
       {isAngelOne && (
-        <div className="p-4 rounded-xl bg-purple-50 dark:bg-purple-950/20 border border-purple-200 dark:border-purple-900/40 text-purple-900 dark:text-purple-300 text-xs flex items-start space-x-2.5 shadow-xs">
-          <Eye className="w-5 h-5 text-purple-600 dark:text-purple-400 shrink-0 mt-0.5" />
+        <div
+          className={`p-4 rounded-xl text-xs flex items-start space-x-2.5 shadow-xs ${
+            executionMode === 'OBSERVE_ONLY'
+              ? 'bg-purple-50 dark:bg-purple-950/20 border border-purple-200 dark:border-purple-900/40 text-purple-900 dark:text-purple-300'
+              : 'bg-emerald-50 dark:bg-emerald-950/20 border border-emerald-200 dark:border-emerald-900/40 text-emerald-900 dark:text-emerald-300'
+          }`}
+        >
+          {executionMode === 'OBSERVE_ONLY' ? (
+            <Eye className="w-5 h-5 text-purple-600 dark:text-purple-400 shrink-0 mt-0.5" />
+          ) : (
+            <ShieldCheck className="w-5 h-5 text-emerald-600 dark:text-emerald-400 shrink-0 mt-0.5" />
+          )}
           <div>
-            <span className="font-bold text-purple-900 dark:text-purple-200">
-              Angel One Advisory Mode (OBSERVE_ONLY):
+            <span className="font-bold">
+              {executionMode === 'OBSERVE_ONLY'
+                ? 'Angel One Advisory Mode (OBSERVE_ONLY):'
+                : 'Angel One Controlled Enforcement Active (ENFORCE):'}
             </span>
-            <p className="text-purple-800 dark:text-purple-300 mt-0.5 leading-relaxed">
-              Angel One is monitored in read-only observation mode. When daily loss thresholds are reached, the system generates real-time alerts and records audit events, but <strong>no automated broker lockout or order cancellations</strong> are executed on Angel One.
+            <p className="mt-0.5 leading-relaxed">
+              {executionMode === 'OBSERVE_ONLY'
+                ? 'Angel One is monitored in read-only observation mode. When daily loss thresholds are reached, real-time alerts and audit events are generated, but no automated circuit breaker locks are enforced.'
+                : 'Angel One is actively monitored with account-scoped risk enforcement. When daily loss thresholds are breached, the Trading Firewall establishes an account-level circuit breaker lock for this Angel One account.'}
             </p>
           </div>
         </div>
