@@ -15,6 +15,7 @@ import { auth } from './services/firebase';
 function MainApp() {
   const { user, loading: authLoading, notice, clearNotice } = useAuth();
   const [activeTab, setActiveTab] = useState<'dashboard' | 'settings' | 'health'>('dashboard');
+  const [selectedAccountId, setSelectedAccountId] = useState<string>('acc_mt_zerodha_default');
   const [riskConfig, setRiskConfig] = useState<RiskConfig>(DEFAULT_RISK_CONFIG);
   const [configLoading, setConfigLoading] = useState(false);
   const [isRiskLocked, setIsRiskLocked] = useState(false);
@@ -49,19 +50,22 @@ function MainApp() {
         }
 
         const res = await fetch('/api/risk/extension-token', { headers });
-        const data = await res.json();
-        if (data.extensionToken) {
-          setExtensionToken(data.extensionToken);
+        const contentType = res.headers.get('content-type');
+        if (res.ok && contentType && contentType.includes('application/json')) {
+          const data = await res.json();
+          if (data.extensionToken) {
+            setExtensionToken(data.extensionToken);
+          }
         }
       } catch (err) {
-        console.error('Failed to load extension token:', err);
+        // Suppress non-critical extension token load errors silently
       }
     };
     fetchExtensionToken();
 
     const pollRiskState = async () => {
       try {
-        const session = await getAuthoritativeRiskSession(user.uid);
+        const session = await getAuthoritativeRiskSession(user.uid, selectedAccountId);
         if (session && session.state === 'LOCKED') {
           const isUnexpired = !session.lockUntil || new Date(session.lockUntil).getTime() > Date.now();
           setIsRiskLocked(isUnexpired);
@@ -77,7 +81,7 @@ function MainApp() {
 
     setConfigLoading(true);
     // Initial fetch
-    getRiskConfig(user.uid)
+    getRiskConfig(user.uid, selectedAccountId)
       .then((cfg) => {
         setRiskConfig(cfg);
         setConfigLoading(false);
@@ -95,14 +99,15 @@ function MainApp() {
       },
       (err) => {
         console.error('Risk config subscription error:', err);
-      }
+      },
+      selectedAccountId
     );
 
     return () => {
       clearInterval(interval);
       unsubscribe();
     };
-  }, [user]);
+  }, [user, selectedAccountId]);
 
   if (authLoading) {
     return (
@@ -158,6 +163,8 @@ function MainApp() {
               <DashboardOverview
                 riskConfig={riskConfig}
                 onOpenSettings={() => setActiveTab('settings')}
+                selectedAccountId={selectedAccountId}
+                onSelectAccount={setSelectedAccountId}
               />
             )}
 
@@ -166,6 +173,8 @@ function MainApp() {
                 initialConfig={riskConfig}
                 onSaved={(updated) => setRiskConfig(updated)}
                 isLocked={isRiskLocked}
+                accountId={selectedAccountId}
+                onSelectAccount={setSelectedAccountId}
               />
             )}
 

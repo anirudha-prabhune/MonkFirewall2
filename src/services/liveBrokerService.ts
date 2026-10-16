@@ -20,10 +20,16 @@ export async function fetchLiveBrokerStatus(userId?: string): Promise<LiveBroker
   return null;
 }
 
-export async function fetchLiveCapital(userId?: string): Promise<LiveCapitalResponse | null> {
+export async function fetchLiveCapital(userId?: string, accountId?: string): Promise<LiveCapitalResponse | null> {
   try {
-    const headers = await getAuthHeaders(userId ? { 'x-user-id': userId } : {});
-    const res = await fetch('/api/broker/live/capital', { headers });
+    const customHeaders: Record<string, string> = {};
+    if (userId) customHeaders['x-user-id'] = userId;
+    if (accountId) customHeaders['x-account-id'] = accountId;
+
+    const headers = await getAuthHeaders(customHeaders);
+    const url = accountId ? `/api/broker/live/capital?accountId=${encodeURIComponent(accountId)}` : '/api/broker/live/capital';
+
+    const res = await fetch(url, { headers });
     if (res.ok) {
       return await res.json();
     }
@@ -33,11 +39,16 @@ export async function fetchLiveCapital(userId?: string): Promise<LiveCapitalResp
   return null;
 }
 
-export async function fetchLivePositions(userId?: string): Promise<LivePositionsResponse | null> {
+export async function fetchLivePositions(userId?: string, accountId?: string): Promise<LivePositionsResponse | null> {
   try {
-    const headers = await getAuthHeaders(userId ? { 'x-user-id': userId } : {});
+    const customHeaders: Record<string, string> = {};
+    if (userId) customHeaders['x-user-id'] = userId;
+    if (accountId) customHeaders['x-account-id'] = accountId;
 
-    const res = await fetch('/api/broker/live/positions', { headers });
+    const headers = await getAuthHeaders(customHeaders);
+    const url = accountId ? `/api/broker/live/positions?accountId=${encodeURIComponent(accountId)}` : '/api/broker/live/positions';
+
+    const res = await fetch(url, { headers });
     if (res.ok) {
       return await res.json();
     }
@@ -121,10 +132,14 @@ export async function fetchAngelOneStatus(userId?: string): Promise<LiveBrokerSt
   return null;
 }
 
-export async function fetchAngelOnePositions(userId?: string): Promise<LivePositionsResponse | null> {
+export async function fetchAngelOnePositions(userId?: string, accountId?: string): Promise<LivePositionsResponse | null> {
   try {
-    const headers = await getAuthHeaders(userId ? { 'x-user-id': userId } : {});
-    const res = await fetch('/api/broker/angelone/live/positions', { headers });
+    const customHeaders: Record<string, string> = {};
+    if (userId) customHeaders['x-user-id'] = userId;
+    if (accountId) customHeaders['x-account-id'] = accountId;
+    const headers = await getAuthHeaders(customHeaders);
+    const query = accountId ? `?accountId=${encodeURIComponent(accountId)}` : '';
+    const res = await fetch(`/api/broker/angelone/live/positions${query}`, { headers });
     if (res.ok) {
       return await res.json();
     }
@@ -134,10 +149,14 @@ export async function fetchAngelOnePositions(userId?: string): Promise<LivePosit
   return null;
 }
 
-export async function fetchAngelOneCapital(userId?: string): Promise<LiveCapitalResponse | null> {
+export async function fetchAngelOneCapital(userId?: string, accountId?: string): Promise<LiveCapitalResponse | null> {
   try {
-    const headers = await getAuthHeaders(userId ? { 'x-user-id': userId } : {});
-    const res = await fetch('/api/broker/angelone/live/capital', { headers });
+    const customHeaders: Record<string, string> = {};
+    if (userId) customHeaders['x-user-id'] = userId;
+    if (accountId) customHeaders['x-account-id'] = accountId;
+    const headers = await getAuthHeaders(customHeaders);
+    const query = accountId ? `?accountId=${encodeURIComponent(accountId)}` : '';
+    const res = await fetch(`/api/broker/angelone/live/capital${query}`, { headers });
     if (res.ok) {
       return await res.json();
     }

@@ -28,11 +28,15 @@ export async function fetchBrokerStatus(): Promise<BrokerConnectionStatus> {
   };
 }
 
-export async function fetchFnoPositions(userId?: string): Promise<NormalizedPosition[]> {
+export async function fetchFnoPositions(userId?: string, accountId?: string): Promise<NormalizedPosition[]> {
   try {
-    const headers = await getAuthHeaders(userId ? { 'x-user-id': userId } : {});
+    const customHeaders: Record<string, string> = {};
+    if (userId) customHeaders['x-user-id'] = userId;
+    if (accountId) customHeaders['x-account-id'] = accountId;
+    const headers = await getAuthHeaders(customHeaders);
 
-    const res = await fetch('/api/positions/fno', { headers });
+    const query = accountId ? `?accountId=${encodeURIComponent(accountId)}` : '';
+    const res = await fetch(`/api/positions/fno${query}`, { headers });
     if (res.ok) {
       const data: PositionsResponse = await res.json();
       return data.positions || [];

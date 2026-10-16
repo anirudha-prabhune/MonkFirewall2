@@ -35,8 +35,8 @@ export function isNseMarketClosed(date: Date = new Date()): boolean {
     process.argv.some(arg => arg.includes('test'))
   );
 
-  if (isRunningInTest) {
-    return false; // Default to market being OPEN in existing tests for backward compatibility
+  if (isRunningInTest || process.env.NODE_ENV !== 'production') {
+    return false; // Default to market being OPEN in development/preview and test environments
   }
 
   const parts = new Intl.DateTimeFormat('en-US', {
@@ -77,6 +77,8 @@ export class PnlIntegrityError extends Error {
 export interface RiskSession {
   tradingDate: string; // YYYY-MM-DD in Asia/Kolkata
   userId: string;
+  accountId?: string;
+  executionMode?: 'ENFORCE' | 'ALERT_ONLY' | 'OBSERVE_ONLY';
   state: RiskState;
   isBreached: boolean;
   lockedAt: string | null;
@@ -398,12 +400,60 @@ export class RiskEngine {
     }
 
     // -------------------------------------------------------------
-    // CASE 4: NEW LOSS LIMIT BREACH -> LOCKED
+    // CASE 4: NEW LOSS LIMIT BREACH -> LOCKED (or OBSERVE_ONLY)
     // lossAmount >= dailyLossLimit (inclusive comparison)
     // -------------------------------------------------------------
     const isNewlyBreached = lossAmount >= config.dailyLossLimit;
 
     if (isNewlyBreached) {
+      if (config.executionMode === 'OBSERVE_ONLY') {
+        transitionEvents.push({
+          userId,
+          type: 'LOSS_LIMIT_BREACHED',
+          message: `[OBSERVE_ONLY] Daily loss limit of ₹${config.dailyLossLimit.toLocaleString(
+            'en-IN'
+          )} breached with loss ₹${lossAmount.toLocaleString('en-IN')}. Lock skipped for observe-only scope.`,
+          timestamp: nowIso,
+        });
+
+        const session: RiskSession = {
+          tradingDate: effectiveTradingDate,
+          userId,
+          accountId: config.accountId,
+          executionMode: 'OBSERVE_ONLY',
+          state: 'WARNING',
+          isBreached: true,
+          lockedAt: null,
+          lockUntil: null,
+          currentPnl: grossTradingPnl,
+          lossAmount,
+          realisedPnl: realised,
+          unrealisedPnl: unrealised,
+          lossLimit: config.dailyLossLimit,
+          warningThreshold1: config.warningThreshold1,
+          warningThreshold2: config.warningThreshold2,
+          lastEvaluatedAt: nowIso,
+          reason: `[OBSERVE_ONLY] Daily loss limit of ₹${config.dailyLossLimit.toLocaleString('en-IN')} breached (Observation mode active)`,
+        };
+
+        return {
+          state: 'WARNING',
+          totalPnl: grossTradingPnl,
+          grossTradingPnl,
+          currentPnl: grossTradingPnl,
+          lossAmount,
+          lossUtilizedPercent,
+          isBreached: true,
+          tradingDate: effectiveTradingDate,
+          lockedAt: null,
+          lockUntil: null,
+          reason: session.reason,
+          session,
+          transitionEvents,
+          isIdempotent: false,
+        };
+      }
+
       const lockedAt = nowIso;
       let lockUntil: string;
       let durationDesc: string;
@@ -441,6 +491,8 @@ export class RiskEngine {
       const session: RiskSession = {
         tradingDate: effectiveTradingDate,
         userId,
+        accountId: config.accountId,
+        executionMode: config.executionMode || 'ENFORCE',
         state: 'LOCKED',
         isBreached: true,
         lockedAt,

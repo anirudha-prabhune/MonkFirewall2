@@ -2,7 +2,7 @@ import { doc, getDoc, setDoc, onSnapshot, collection, getDocs } from 'firebase/f
 import { db } from './firebase';
 import { BrokerConnection } from '../types/broker';
 import { handleFirestoreError, OperationType } from './firestoreErrors';
-import { DEFAULT_ACCOUNT_ID } from '../types/risk';
+import { DEFAULT_ACCOUNT_ID, DEFAULT_ANGELONE_ACCOUNT_ID } from '../types/risk';
 
 export async function getBrokerConnection(userId: string): Promise<BrokerConnection | null> {
   const path = `users/${userId}/brokerConnections/primary`;
@@ -24,63 +24,67 @@ export async function getBrokerConnection(userId: string): Promise<BrokerConnect
 }
 
 export async function getBrokerConnections(userId: string): Promise<Array<{ connectionId: string; connection: BrokerConnection }>> {
-  if (userId.startsWith('mock-')) {
-    return [
-      {
-        connectionId: DEFAULT_ACCOUNT_ID,
-        connection: {
-          broker: 'zerodha',
-          status: 'CONNECTED',
-          userId,
-          connectedAt: new Date().toISOString(),
-        },
+  const accounts: Array<{ connectionId: string; connection: BrokerConnection }> = [
+    {
+      connectionId: DEFAULT_ACCOUNT_ID,
+      connection: {
+        broker: 'zerodha',
+        status: userId.startsWith('mock-') ? 'CONNECTED' : 'DISCONNECTED',
+        userId,
+        connectedAt: new Date().toISOString(),
       },
-      {
-        connectionId: 'acc_zerodha_secondary',
-        connection: {
-          broker: 'zerodha',
-          status: 'CONNECTED',
-          userId,
-          connectedAt: new Date().toISOString(),
-        },
+    },
+    {
+      connectionId: DEFAULT_ANGELONE_ACCOUNT_ID,
+      connection: {
+        broker: 'angelone',
+        status: userId.startsWith('mock-') ? 'CONNECTED' : 'DISCONNECTED',
+        userId,
+        connectedAt: new Date().toISOString(),
       },
-    ];
-  }
+    },
+  ];
 
   try {
     const colRef = collection(db, 'users', userId, 'brokerConnections');
     const snapshot = await getDocs(colRef);
-    const list: Array<{ connectionId: string; connection: BrokerConnection }> = [];
     snapshot.forEach((docSnap) => {
-      list.push({
-        connectionId: docSnap.id,
-        connection: docSnap.data() as BrokerConnection,
-      });
-    });
+      const docId = docSnap.id;
+      const resolvedId = (docId === 'primary' || docId === 'zerodha-default' || docId === 'default') ? DEFAULT_ACCOUNT_ID : docId;
+      const data = docSnap.data() as BrokerConnection;
 
-    if (list.length === 0) {
-      list.push({
-        connectionId: DEFAULT_ACCOUNT_ID,
-        connection: {
-          broker: 'zerodha',
-          status: 'DISCONNECTED',
-          userId,
-        },
+      const existingIndex = accounts.findIndex((a) => a.connectionId === resolvedId);
+      if (existingIndex >= 0) {
+        accounts[existingIndex].connection = {
+          ...accounts[existingIndex].connection,
+          ...data,
+        };
+      } else {
+        accounts.push({
+          connectionId: resolvedId,
+          connection: data,
+        });
+      }
+    });
+  } catch (error) {
+    console.warn('Failed to fetch broker connections from Firestore, using default configured accounts:', error);
+  }
+
+  // Deduplicate by connectionId, preserving distinct accounts
+  const uniqueMap = new Map<string, { connectionId: string; connection: BrokerConnection }>();
+  for (const acc of accounts) {
+    if (!uniqueMap.has(acc.connectionId)) {
+      uniqueMap.set(acc.connectionId, acc);
+    } else {
+      const existing = uniqueMap.get(acc.connectionId)!;
+      uniqueMap.set(acc.connectionId, {
+        connectionId: acc.connectionId,
+        connection: { ...existing.connection, ...acc.connection },
       });
     }
-    return list;
-  } catch (error) {
-    return [
-      {
-        connectionId: DEFAULT_ACCOUNT_ID,
-        connection: {
-          broker: 'zerodha',
-          status: 'DISCONNECTED',
-          userId,
-        },
-      },
-    ];
   }
+
+  return Array.from(uniqueMap.values());
 }
 
 export function subscribeBrokerConnection(

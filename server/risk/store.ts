@@ -1,11 +1,19 @@
 import { getAdminFirestore, isMockStoreEnabled } from '../brokers/zerodha/sessionStore';
-import { RiskConfig, DEFAULT_RISK_CONFIG } from '../../src/types/risk';
+import {
+  RiskConfig,
+  DEFAULT_RISK_CONFIG,
+  DEFAULT_ACCOUNT_ID,
+  DEFAULT_ANGELONE_ACCOUNT_ID,
+  DEFAULT_ANGELONE_RISK_CONFIG,
+  AccountRiskConfig,
+} from '../../src/types/risk';
 import {
   RiskEngine,
   RiskSession,
   RiskEvent,
   RiskEvaluationResult,
   getTradingDateKolkata,
+  isNseMarketClosed,
 } from './engine';
 import { validateRiskConfig } from './validation';
 import { PnlResult } from '../pnl/types';
@@ -14,7 +22,7 @@ import { BrokerService } from '../brokers/service';
 import { ShadowRiskService } from './shadowRiskService';
 
 /**
- * Server-authoritative Risk Store and Session Manager (Phase 5).
+ * Server-authoritative Risk Store and Session Manager (Phase 5 / Phase 7B.1).
  *
  * Guarantees:
  * - Backed by Firestore ACID transactions (runTransaction) for state transitions & persistence
@@ -22,11 +30,12 @@ import { ShadowRiskService } from './shadowRiskService';
  * - Server evaluates PnlResult from normalized positions; does NOT trust client-submitted P&L
  * - Thread-safe atomic evaluation preventing concurrent lock creation race conditions
  * - Preserves existing active lock when configuration is modified or disabled
- * - Structured server logging for risk transitions, lock creation, expiry, and config updates
- * - Excludes all broker secrets from logs
+ * - Account-scoped isolation: Zerodha & Angel One accounts operate on isolated configs & sessions
+ * - Angel One defaults to OBSERVE_ONLY execution mode with zero cross-broker lock leakage
+ * - Preserves legacy Zerodha dual-write for 100% backward compatibility
  */
 
-export const DEFAULT_ACCOUNT_ID = 'acc_mt_zerodha_default';
+export { DEFAULT_ACCOUNT_ID, DEFAULT_ANGELONE_ACCOUNT_ID };
 
 interface UserRiskState {
   config: RiskConfig;
@@ -94,7 +103,7 @@ export class ServerRiskStore {
       return { ...cachedAccountConfig };
     }
 
-    if (!userState.loadedFromFirestore) {
+    if (!userState.loadedFromFirestore || !userState.accountConfigs.has(resolvedAccountId)) {
       const adminDb = getAdminFirestore();
       const isProduction = process.env.NODE_ENV === 'production';
       const isMock = isMockStoreEnabled();
@@ -108,7 +117,10 @@ export class ServerRiskStore {
           // Read account config first, fallback to legacy config path
           const accountDocRef = adminDb.doc(`users/${userId}/accountRiskConfigs/${resolvedAccountId}`);
           const legacyDocRef = adminDb.doc(`users/${userId}/riskConfig/config`);
-          const [accountSnap, legacySnap] = await Promise.all([accountDocRef.get(), legacyDocRef.get()]);
+          const [accountSnap, legacySnap] = await Promise.all([
+            accountDocRef.get(),
+            resolvedAccountId === DEFAULT_ACCOUNT_ID ? legacyDocRef.get() : Promise.resolve({ exists: false } as any)
+          ]);
 
           if (accountSnap.exists) {
             const raw = accountSnap.data();
@@ -141,7 +153,36 @@ export class ServerRiskStore {
       }
     }
 
-    const effectiveConfig = userState.accountConfigs.get(resolvedAccountId) || userState.config;
+    // Default configuration resolution
+    let effectiveConfig = userState.accountConfigs.get(resolvedAccountId);
+    if (!effectiveConfig) {
+      if (resolvedAccountId === DEFAULT_ANGELONE_ACCOUNT_ID || resolvedAccountId.includes('angelone')) {
+        effectiveConfig = {
+          ...DEFAULT_ANGELONE_RISK_CONFIG,
+          accountId: resolvedAccountId,
+          updatedAt: new Date().toISOString(),
+        };
+      } else {
+        const base = userState.config || DEFAULT_RISK_CONFIG;
+        effectiveConfig = {
+          dailyLossLimit: base.dailyLossLimit,
+          warningThreshold1: base.warningThreshold1,
+          warningThreshold2: base.warningThreshold2,
+          lockDurationMinutes: base.lockDurationMinutes,
+          lockDurationType: base.lockDurationType || 'FIXED',
+          includeRealisedPnl: base.includeRealisedPnl,
+          includeUnrealisedPnl: base.includeUnrealisedPnl,
+          enabled: base.enabled,
+          executionMode: base.executionMode || 'ENFORCE',
+          broker: base.broker || 'zerodha',
+          scope: base.scope || 'ACCOUNT',
+          accountId: resolvedAccountId,
+          updatedAt: new Date().toISOString(),
+        };
+      }
+      userState.accountConfigs.set(resolvedAccountId, effectiveConfig);
+    }
+
     return { ...effectiveConfig };
   }
 
@@ -158,8 +199,22 @@ export class ServerRiskStore {
 
     const userState = this.getOrCreateUserState(userId);
     const resolvedAccountId = await this.resolveAccountId(userId, accountId);
-    const currentConfig = userState.accountConfigs.get(resolvedAccountId) || userState.config;
-    const sanitized = validation.sanitized;
+    const currentConfig = await this.getConfig(userId, resolvedAccountId);
+    const sanitized = { ...validation.sanitized };
+
+    // Enforce account identity and broker execution boundaries
+    const isAngelOne = resolvedAccountId === DEFAULT_ANGELONE_ACCOUNT_ID || resolvedAccountId.includes('angelone');
+    if (isAngelOne) {
+      sanitized.broker = 'angelone';
+      sanitized.executionMode = 'OBSERVE_ONLY'; // Angel One enforcement is strictly prohibited
+      sanitized.accountId = resolvedAccountId;
+      sanitized.scope = 'ACCOUNT';
+    } else {
+      sanitized.broker = sanitized.broker || 'zerodha';
+      sanitized.executionMode = sanitized.executionMode || currentConfig.executionMode || 'ENFORCE';
+      sanitized.accountId = resolvedAccountId;
+      sanitized.scope = sanitized.scope || currentConfig.scope || 'ACCOUNT';
+    }
 
     // Phase 11C: LOCKED Config Immutability Guard
     const today = getTradingDateKolkata(new Date());
@@ -198,7 +253,7 @@ export class ServerRiskStore {
         } catch {}
       }
 
-      if (!activeSession || activeSession.state !== 'LOCKED') {
+      if ((!activeSession || activeSession.state !== 'LOCKED') && resolvedAccountId === DEFAULT_ACCOUNT_ID) {
         try {
           const liveAdapter = BrokerService.getLiveAdapter();
           const connStatus = await liveAdapter.getConnectionStatus(userId);
@@ -269,7 +324,9 @@ export class ServerRiskStore {
         const legacyDocRef = adminDb.doc(`users/${userId}/riskConfig/config`);
 
         batch.set(accountConfigDocRef, sanitized, { merge: true });
-        batch.set(legacyDocRef, sanitized, { merge: true });
+        if (resolvedAccountId === DEFAULT_ACCOUNT_ID) {
+          batch.set(legacyDocRef, sanitized, { merge: true });
+        }
 
         await batch.commit();
       } catch (err) {
@@ -283,7 +340,9 @@ export class ServerRiskStore {
     }
 
     // Mutate in-memory cache ONLY AFTER authoritative Firestore persistence succeeds
-    userState.config = sanitized;
+    if (resolvedAccountId === DEFAULT_ACCOUNT_ID) {
+      userState.config = sanitized;
+    }
     userState.accountConfigs.set(resolvedAccountId, sanitized);
     userState.loadedFromFirestore = true;
 
@@ -551,7 +610,7 @@ export class ServerRiskStore {
       }
     }
 
-    if (!session) {
+    if (!session || (session.state === 'MARKET_CLOSED' && !isNseMarketClosed())) {
       // Evaluate from current positions
       const evalResult = await this.evaluateFromPositions(userId, new Date(), resolvedAccountId);
       session = evalResult.session;

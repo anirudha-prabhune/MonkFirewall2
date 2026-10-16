@@ -115,6 +115,14 @@ export function validateRiskConfig(input: any): ValidationResult {
     errors.push('enabled must be a boolean');
   }
 
+  // 7. Multi-account policy execution mode
+  let executionMode = input.executionMode;
+  if (executionMode !== undefined && executionMode !== null) {
+    if (!['ENFORCE', 'ALERT_ONLY', 'OBSERVE_ONLY'].includes(executionMode)) {
+      errors.push("executionMode must be one of 'ENFORCE', 'ALERT_ONLY', or 'OBSERVE_ONLY'");
+    }
+  }
+
   if (errors.length > 0) {
     return { valid: false, errors };
   }
@@ -129,6 +137,10 @@ export function validateRiskConfig(input: any): ValidationResult {
     includeUnrealisedPnl: input.includeUnrealisedPnl !== undefined ? Boolean(input.includeUnrealisedPnl) : DEFAULT_RISK_CONFIG.includeUnrealisedPnl,
     enabled: input.enabled !== undefined ? Boolean(input.enabled) : DEFAULT_RISK_CONFIG.enabled,
     updatedAt: new Date().toISOString(),
+    ...(executionMode ? { executionMode } : {}),
+    ...(input.accountId ? { accountId: String(input.accountId) } : {}),
+    ...(input.broker ? { broker: input.broker } : {}),
+    ...(input.scope ? { scope: input.scope } : {}),
   };
 
   return { valid: true, errors: [], sanitized };

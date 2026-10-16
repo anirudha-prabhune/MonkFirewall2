@@ -1,11 +1,16 @@
 import { PnlResult } from '../../server/pnl/types';
 import { getAuthHeaders } from './firebase';
 
-export async function fetchGrossPnl(userId?: string): Promise<PnlResult | null> {
+export async function fetchGrossPnl(userId?: string, accountId?: string): Promise<PnlResult | null> {
   try {
-    const headers = await getAuthHeaders(userId ? { 'x-user-id': userId } : {});
+    const customHeaders: Record<string, string> = {};
+    if (userId) customHeaders['x-user-id'] = userId;
+    if (accountId) customHeaders['x-account-id'] = accountId;
 
-    const res = await fetch('/api/pnl', { headers });
+    const headers = await getAuthHeaders(customHeaders);
+    const url = accountId ? `/api/pnl?accountId=${encodeURIComponent(accountId)}` : '/api/pnl';
+
+    const res = await fetch(url, { headers });
     if (res.ok) {
       return await res.json();
     }

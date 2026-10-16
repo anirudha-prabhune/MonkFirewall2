@@ -20,7 +20,7 @@ import {
   Radio,
 } from 'lucide-react';
 import { RiskConfig, RiskSession } from '../types/risk';
-import { formatINR, getISTReadableDate, getISTTimestamp } from '../utils/formatters';
+import { formatINR, getISTReadableDate, getISTTimestamp, getFriendlyAccountLabel } from '../utils/formatters';
 import { validateBrokerCapitalPayload } from '../utils/brokerCapitalState';
 import { useAuth } from '../context/AuthContext';
 import { subscribeRiskSession } from '../services/riskSessionService';
@@ -52,11 +52,15 @@ import { AccountCapitalCard } from './AccountCapitalCard';
 interface DashboardOverviewProps {
   riskConfig: RiskConfig;
   onOpenSettings: () => void;
+  selectedAccountId?: string;
+  onSelectAccount?: (accountId: string) => void;
 }
 
 export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
   riskConfig,
   onOpenSettings,
+  selectedAccountId: selectedAccountIdProp,
+  onSelectAccount: onSelectAccountProp,
 }) => {
   const { user } = useAuth();
   const [istTime, setIstTime] = useState(getISTTimestamp());
@@ -143,7 +147,22 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
   const [accountRiskConfig, setAccountRiskConfig] = useState<RiskConfig>(riskConfig);
   const [accountsLoading, setAccountsLoading] = useState<boolean>(true);
   const [connectedAccounts, setConnectedAccounts] = useState<Array<{ connectionId: string; connection: BrokerConnection }>>([]);
-  const [selectedAccountId, setSelectedAccountId] = useState<string>('acc_mt_zerodha_default');
+  const [internalAccountId, setInternalAccountId] = useState<string>(selectedAccountIdProp || 'acc_mt_zerodha_default');
+  const selectedAccountId = selectedAccountIdProp || internalAccountId;
+
+  const setSelectedAccountId = useCallback(
+    (accId: string) => {
+      setInternalAccountId(accId);
+      if (onSelectAccountProp) onSelectAccountProp(accId);
+    },
+    [onSelectAccountProp]
+  );
+
+  useEffect(() => {
+    if (selectedAccountIdProp && selectedAccountIdProp !== internalAccountId) {
+      setInternalAccountId(selectedAccountIdProp);
+    }
+  }, [selectedAccountIdProp, internalAccountId]);
 
   const activeConfig = accountRiskConfig || riskConfig;
 
@@ -207,15 +226,16 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
     };
   }, [user, selectedAccountId]);
 
-  // Load Account Capital (Phase 5B & Phase 6C.1 Race Remediation)
-  const loadAccountCapital = useCallback(async (targetBroker?: 'zerodha' | 'angelone') => {
+  // Load Account Capital (Phase 5B & Phase 6C.1 Race Remediation & Phase 7D Multi-Account)
+  const loadAccountCapital = useCallback(async (targetBroker?: 'zerodha' | 'angelone', targetAccountId?: string) => {
     const brokerToFetch = targetBroker || activeBrokerRef.current;
+    const accountToFetch = targetAccountId || selectedAccountId;
     const reqId = ++capitalRequestIdRef.current;
     setLoadingCapital(true);
 
     try {
       if (brokerToFetch === 'angelone') {
-        const res = await fetchAngelOneCapital(user?.uid);
+        const res = await fetchAngelOneCapital(user?.uid, accountToFetch);
         // Guard against race conditions:
         // 1. Sequence check: Ensure this is still the most recent request
         // 2. Active broker check: Ensure the active broker hasn't changed
@@ -229,7 +249,7 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
         }
         setCapital(res?.capital || null);
       } else {
-        const res = await fetchLiveCapital(user?.uid);
+        const res = await fetchLiveCapital(user?.uid, accountToFetch);
         // Guard against race conditions:
         if (reqId !== capitalRequestIdRef.current || activeBrokerRef.current !== 'zerodha') {
           return;
@@ -252,26 +272,31 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
         setLoadingCapital(false);
       }
     }
-  }, [user?.uid]);
+  }, [user?.uid, selectedAccountId]);
 
-  // Load Positions and P&L (Phase 6C.1 Race-Protected)
-  const loadPositionsAndPnl = useCallback(async (targetBroker?: 'zerodha' | 'angelone') => {
+  // Load Positions and P&L (Phase 6C.1 & Phase 7D Race-Protected)
+  const loadPositionsAndPnl = useCallback(async (targetBroker?: 'zerodha' | 'angelone', targetAccountId?: string) => {
     const brokerToFetch = targetBroker || activeBrokerRef.current;
+    const accountToFetch = targetAccountId || selectedAccountId;
     const reqId = ++positionsRequestIdRef.current;
     setLoadingPositions(true);
 
     try {
-      loadAccountCapital(brokerToFetch);
+      loadAccountCapital(brokerToFetch, accountToFetch);
       if (brokerToFetch === 'angelone') {
-        const [angelPositionsRes, angelStat] = await Promise.all([
-          fetchAngelOnePositions(user?.uid),
+        const [angelPositionsRes, angelStat, pnl] = await Promise.all([
+          fetchAngelOnePositions(user?.uid, accountToFetch),
           fetchAngelOneStatus(user?.uid),
+          fetchGrossPnl(user?.uid, accountToFetch),
         ]);
         if (reqId !== positionsRequestIdRef.current || activeBrokerRef.current !== 'angelone') {
           return;
         }
         setAngelOneStatus(angelStat);
-        setPnlResult(null); // Clear summary P&L result when Angel One is active
+        setPnlResult(pnl);
+        if (pnl && (pnl.riskSession || pnl.shadowSession)) {
+          setSession(pnl.riskSession || pnl.shadowSession);
+        }
 
         const isAngelConnected =
           angelStat?.authenticated === true &&
@@ -286,9 +311,9 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
         }
       } else {
         const [pos, status, pnl] = await Promise.all([
-          fetchFnoPositions(user?.uid),
+          fetchFnoPositions(user?.uid, accountToFetch),
           fetchBrokerStatus(),
-          fetchGrossPnl(user?.uid),
+          fetchGrossPnl(user?.uid, accountToFetch),
         ]);
         if (reqId !== positionsRequestIdRef.current || activeBrokerRef.current !== 'zerodha') {
           return;
@@ -313,7 +338,7 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
         setLoadingPositions(false);
       }
     }
-  }, [user?.uid, loadAccountCapital]);
+  }, [user?.uid, selectedAccountId, loadAccountCapital]);
 
   // Load Live Diagnostics
   const loadLiveDiagnostics = useCallback(async () => {
@@ -352,8 +377,34 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
     setSelectedBroker(broker);
   };
 
+  // Handle immediate switch of selected account (Phase 7D Operational Readiness)
+  const handleSelectAccount = (newAccountId: string) => {
+    if (newAccountId === selectedAccountId) return;
+
+    // Invalidate in-flight capital and positions requests immediately
+    capitalRequestIdRef.current += 1;
+    positionsRequestIdRef.current += 1;
+
+    // Clear previous displayed state immediately to prevent stale UI cross-leakage
+    setCapital(null);
+    setLoadingCapital(true);
+    setFnoPositions([]);
+    setPnlResult(null);
+    setLoadingPositions(true);
+
+    const targetAcc = connectedAccounts.find((a) => a.connectionId === newAccountId);
+    const targetBroker: 'zerodha' | 'angelone' =
+      targetAcc?.connection?.broker === 'angelone' || newAccountId.includes('angelone')
+        ? 'angelone'
+        : 'zerodha';
+
+    activeBrokerRef.current = targetBroker;
+    setSelectedBroker(targetBroker);
+    setSelectedAccountId(newAccountId);
+  };
+
   useEffect(() => {
-    // When selectedBroker or user changes, clear state immediately to prevent stale/cross-broker display
+    // When selectedBroker, selectedAccountId or user changes, clear state immediately to prevent stale/cross-broker display
     capitalRequestIdRef.current += 1;
     positionsRequestIdRef.current += 1;
     activeBrokerRef.current = selectedBroker;
@@ -365,14 +416,14 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
     }
     setLoadingPositions(true);
 
-    loadPositionsAndPnl(selectedBroker);
+    loadPositionsAndPnl(selectedBroker, selectedAccountId);
     loadLiveDiagnostics();
     const interval = setInterval(() => {
-      loadPositionsAndPnl(activeBrokerRef.current);
+      loadPositionsAndPnl(activeBrokerRef.current, selectedAccountId);
       loadLiveDiagnostics();
     }, 30000);
     return () => clearInterval(interval);
-  }, [user, selectedBroker, loadPositionsAndPnl, loadLiveDiagnostics]);
+  }, [user, selectedBroker, selectedAccountId, loadPositionsAndPnl, loadLiveDiagnostics]);
 
   // Handle Kite Login
   const handleKiteLogin = async () => {
@@ -706,7 +757,7 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
               Active Trading Account
             </h3>
             <p className="text-[11px] text-[#5C6B7E] dark:text-[#98C1D9] font-mono">
-              Account ID: {selectedAccountId}
+              {getFriendlyAccountLabel(selectedAccountId, activeBrokerRef.current)} ({selectedAccountId})
             </p>
           </div>
         </div>
@@ -719,14 +770,20 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
           ) : (
             <select
               value={selectedAccountId}
-              onChange={(e) => setSelectedAccountId(e.target.value)}
+              onChange={(e) => handleSelectAccount(e.target.value)}
               className="w-full sm:w-64 text-xs font-medium px-3 py-2 rounded-lg bg-slate-50 dark:bg-[#19202B] border border-[#98C1D9]/40 dark:border-[#3D4A5E] text-[#293241] dark:text-[#E0FBFC] focus:outline-hidden focus:border-[#3D5A80] cursor-pointer"
             >
-              {connectedAccounts.map((acc) => (
-                <option key={acc.connectionId} value={acc.connectionId}>
-                  {acc.connectionId} ({acc.connection.broker.toUpperCase()} - {acc.connection.status})
-                </option>
-              ))}
+              {connectedAccounts.map((acc) => {
+                const isZerodhaLive = acc.connection.broker === 'zerodha' && (isZerodhaConnected || liveBrokerStatus?.authenticated || isPnlLiveSourced);
+                const isAngelLive = acc.connection.broker === 'angelone' && (isAngelOneConnected || angelOneStatus?.authenticated);
+                const effectiveStatus = (isZerodhaLive || isAngelLive) ? 'CONNECTED' : acc.connection.status;
+                const label = getFriendlyAccountLabel(acc.connectionId, acc.connection.broker);
+                return (
+                  <option key={acc.connectionId} value={acc.connectionId}>
+                    {label} ({effectiveStatus})
+                  </option>
+                );
+              })}
             </select>
           )}
         </div>
@@ -1096,13 +1153,7 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
             </div>
           ) : (
             (() => {
-              const isSyncStale =
-                isLiveMode &&
-                pnlResult !== null &&
-                session.currentPnl !== undefined &&
-                Math.abs(session.currentPnl - effectivePnl) > 0.01;
-
-              const displayState = isSyncStale ? 'EVALUATING' : session.state;
+              const displayState = session.state;
 
               return (
                 <div className="flex flex-col justify-between pr-0 lg:pr-6">
@@ -1113,9 +1164,7 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
                       </span>
                       <span
                         className={`text-[10px] font-mono px-2 py-0.5 rounded font-bold uppercase tracking-wider ${
-                          displayState === 'EVALUATING'
-                            ? 'bg-amber-500/20 text-amber-700 dark:text-amber-300 border border-amber-500/40 animate-pulse'
-                            : displayState === 'LOCKED'
+                          displayState === 'LOCKED'
                             ? 'bg-rose-500/20 text-rose-700 dark:text-rose-300 border border-rose-500/40'
                             : displayState === 'MARKET_CLOSED'
                             ? 'bg-slate-500/20 text-slate-700 dark:text-slate-300 border border-slate-500/40'
@@ -1131,9 +1180,7 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
                     {/* Visually Dominant State Card */}
                     <div
                       className={`p-4 rounded-xl border-2 flex items-center space-x-4 mt-2 transition-all ${
-                        displayState === 'EVALUATING'
-                          ? 'bg-amber-500/10 border-amber-500/40 text-amber-700 dark:text-amber-300'
-                          : displayState === 'LOCKED'
+                        displayState === 'LOCKED'
                           ? 'bg-rose-500/10 border-rose-500/40 text-rose-700 dark:text-rose-300'
                           : displayState === 'WARNING'
                           ? 'bg-amber-500/10 border-amber-500/40 text-amber-700 dark:text-amber-300'
@@ -1144,9 +1191,7 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
                     >
                       <div
                         className={`p-3.5 rounded-xl border flex items-center justify-center shrink-0 ${
-                          displayState === 'EVALUATING'
-                            ? 'bg-amber-500/20 border-amber-500/40 text-amber-600 dark:text-amber-400'
-                            : displayState === 'LOCKED'
+                          displayState === 'LOCKED'
                             ? 'bg-rose-500/20 border-rose-500/40 text-rose-600 dark:text-rose-400'
                             : displayState === 'WARNING'
                             ? 'bg-amber-500/20 border-amber-500/40 text-amber-600 dark:text-amber-400'
@@ -1155,9 +1200,7 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
                             : 'bg-emerald-500/20 border-emerald-500/40 text-emerald-600 dark:text-emerald-400'
                         }`}
                       >
-                        {displayState === 'EVALUATING' ? (
-                          <RefreshCw className="w-9 h-9 animate-spin" />
-                        ) : displayState === 'LOCKED' ? (
+                        {displayState === 'LOCKED' ? (
                           <Lock className="w-9 h-9" />
                         ) : displayState === 'WARNING' ? (
                           <AlertTriangle className="w-9 h-9" />
@@ -1173,9 +1216,7 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
                           {displayState === 'MARKET_CLOSED' ? 'CLOSED' : displayState}
                         </div>
                         <div className="text-xs font-semibold mt-1">
-                          {displayState === 'EVALUATING'
-                            ? 'Syncing Risk State... Evaluating Current P&L'
-                            : displayState === 'LOCKED'
+                          {displayState === 'LOCKED'
                             ? 'Trading Locked · Circuit Breaker Engaged'
                             : displayState === 'WARNING'
                             ? 'Warning Active · Loss Nearing Limit'

@@ -106,12 +106,37 @@ apiRouter.get('/positions/fno', async (req: Request, res: Response) => {
   try {
     const userId = (req as any).userId || await authenticateRequest(req, res);
     if (!userId) return;
+
+    const accountId = (req.query?.accountId as string) || (req.headers['x-account-id'] as string) || undefined;
+    const isAngelOne = (accountId && (accountId === 'acc_mt_angelone_default' || accountId.includes('angelone'))) || req.query?.broker === 'angelone';
+
+    if (isAngelOne) {
+      const connStatus = await liveAngelOneAdapter.getConnectionStatus(userId);
+      if (connStatus.status === 'CONNECTED' && connStatus.authenticated) {
+        const rawPositions = await liveAngelOneAdapter.getPositions(userId);
+        const instruments = await liveAngelOneAdapter.getInstruments(userId);
+        const instrumentMap = new Map<number, BrokerInstrument>(instruments.map((i: BrokerInstrument) => [i.instrumentToken, i]));
+        const normalized = normalizePositions(rawPositions, instrumentMap, 'ANGELONE_LIVE');
+        const fnoPositions = normalized.filter((p) => p.isFno === true && !p.unknownInstrument);
+        return sendJson(res, {
+          dataSource: 'ANGELONE_LIVE',
+          count: fnoPositions.length,
+          positions: fnoPositions,
+        });
+      }
+      return sendJson(res, {
+        dataSource: 'ANGELONE_LIVE',
+        count: 0,
+        positions: [],
+      });
+    }
+
     const liveAdapter = BrokerService.getLiveAdapter();
     const connStatus = await liveAdapter.getConnectionStatus(userId);
 
     // If Zerodha is authenticated and connected, return validated real live positions
     if (connStatus.status === 'CONNECTED' && connStatus.authenticated) {
-      const config = await ServerRiskStore.getConfig(userId);
+      const config = await ServerRiskStore.getConfig(userId, accountId);
       const validationResult = await LivePnlValidationService.validateLivePnl(
         config,
         new Date(),
@@ -352,11 +377,34 @@ apiRouter.get('/broker/live/diagnostic/session', async (req: Request, res: Respo
   }
 });
 
-// GET /api/broker/live/positions - Phase 7 Live Zerodha Read-Only Normalized Positions
+// GET /api/broker/live/positions - Phase 7 Live Read-Only Normalized Positions
 apiRouter.get('/broker/live/positions', async (req: Request, res: Response) => {
   try {
     const userId = (req as any).userId || await authenticateRequest(req, res);
     if (!userId) return;
+    const accountId = (req.query?.accountId as string) || (req.headers['x-account-id'] as string) || undefined;
+    const isAngelOne = (accountId && (accountId === 'acc_mt_angelone_default' || accountId.includes('angelone'))) || req.query?.broker === 'angelone';
+
+    if (isAngelOne) {
+      const status = await liveAngelOneAdapter.getConnectionStatus(userId);
+      const rawPositions = await liveAngelOneAdapter.getPositions(userId);
+      const instruments = await liveAngelOneAdapter.getInstruments(userId);
+      const instrumentMap = new Map<number, BrokerInstrument>(instruments.map((i: BrokerInstrument) => [i.instrumentToken, i]));
+      const normalized = normalizePositions(rawPositions, instrumentMap, 'ANGELONE_LIVE');
+      const fnoPositions = normalized.filter((p) => p.isFno === true && !p.unknownInstrument);
+      const response: LivePositionsResponse = {
+        broker: 'angelone',
+        connectionStatus: status.status,
+        dataSource: 'ANGELONE_LIVE',
+        positionCount: normalized.length,
+        fnoPositionCount: fnoPositions.length,
+        positions: normalized,
+        timestamp: new Date().toISOString(),
+        diagnosticNote: 'Positions normalized via Angel One live adapter',
+      };
+      return sendJson(res, response);
+    }
+
     const livePositions = await BrokerService.getLiveDiagnosticPositions(userId);
     sendJson(res, livePositions);
   } catch (err) {
@@ -364,20 +412,25 @@ apiRouter.get('/broker/live/positions', async (req: Request, res: Response) => {
   }
 });
 
-// GET /api/broker/live/capital - Phase 5B Read-Only Account Capital (Zerodha / Mock)
+// GET /api/broker/live/capital - Phase 5B Read-Only Account Capital (Zerodha / Angel One / Mock)
 apiRouter.get('/broker/live/capital', async (req: Request, res: Response) => {
   try {
     const userId = (req as any).userId || await authenticateRequest(req, res);
     if (!userId) return;
 
-    const isExplicitMock = req.query.mode === 'mock' || req.query.broker === 'mock';
+    const accountId = (req.query?.accountId as string) || (req.headers['x-account-id'] as string) || undefined;
+    const isExplicitMock = req.query?.mode === 'mock' || req.query?.broker === 'mock';
+    const isAngelOne = (accountId && (accountId === 'acc_mt_angelone_default' || accountId.includes('angelone'))) || req.query?.broker === 'angelone';
+
     const capital = isExplicitMock
       ? await mockZerodhaAdapter.getCapital()
+      : isAngelOne
+      ? await liveAngelOneAdapter.getCapital(userId)
       : await liveZerodhaAdapter.getCapital(userId);
 
     sendJson(res, {
       success: true,
-      broker: isExplicitMock ? 'mock' : 'zerodha',
+      broker: isExplicitMock ? 'mock' : isAngelOne ? 'angelone' : 'zerodha',
       capital,
       timestamp: new Date().toISOString(),
     });
@@ -561,12 +614,84 @@ apiRouter.get('/broker/live/ltp', async (req: Request, res: Response) => {
   }
 });
 
-// GET /api/pnl - Authoritative Gross F&O P&L (Live Zerodha or Mock Fallback)
+// GET /api/pnl - Authoritative Gross F&O P&L (Live Zerodha, Live Angel One, or Mock Fallback)
 apiRouter.get('/pnl', async (req: Request, res: Response) => {
   try {
     const userId = (req as any).userId || await authenticateRequest(req, res);
     if (!userId) return;
-    const config = await ServerRiskStore.getConfig(userId);
+
+    const accountId = (req.query?.accountId as string) || (req.headers['x-account-id'] as string) || undefined;
+    const config = await ServerRiskStore.getConfig(userId, accountId);
+    const isAngelOne = (accountId && (accountId === 'acc_mt_angelone_default' || accountId.includes('angelone'))) || req.query?.broker === 'angelone';
+
+    if (isAngelOne) {
+      const connStatus = await liveAngelOneAdapter.getConnectionStatus(userId);
+      if (connStatus.status === 'CONNECTED' && connStatus.authenticated) {
+        const rawPositions = await liveAngelOneAdapter.getPositions(userId);
+        const instruments = await liveAngelOneAdapter.getInstruments(userId);
+        const instrumentMap = new Map<number, BrokerInstrument>(instruments.map((i: BrokerInstrument) => [i.instrumentToken, i]));
+        const normalized = normalizePositions(rawPositions, instrumentMap, 'ANGELONE_LIVE');
+        const fnoPositions = normalized.filter((p) => p.isFno === true && !p.unknownInstrument);
+        const pnlCalc = PnlEngine.calculate(fnoPositions, config);
+        const evalResult = await ServerRiskStore.evaluatePnlResult(userId, pnlCalc, new Date(), config, accountId);
+        const accountSession = evalResult.session;
+
+        return sendJson(res, {
+          tradingDate: pnlCalc.tradingDate,
+          realisedPnl: pnlCalc.realisedPnl,
+          unrealisedPnl: pnlCalc.unrealisedPnl,
+          totalPnl: pnlCalc.totalPnl,
+          grossTradingPnl: pnlCalc.grossTradingPnl,
+          dailyRealisedPnl: pnlCalc.dailyRealisedPnl,
+          dailyUnrealisedPnl: pnlCalc.dailyUnrealisedPnl,
+          fnoPositionCount: fnoPositions.length,
+          totalPositionCount: fnoPositions.length,
+          positions: fnoPositions,
+          source: 'ANGELONE_LIVE' as const,
+          dataSource: 'ANGELONE_LIVE' as const,
+          calculatedAt: new Date().toISOString(),
+          riskSession: accountSession,
+          shadowSession: accountSession,
+          state: accountSession.state,
+          currentPnl: pnlCalc.grossTradingPnl,
+          lossAmount: accountSession.lossAmount ?? (pnlCalc.grossTradingPnl < 0 ? Math.abs(pnlCalc.grossTradingPnl) : 0),
+          dailyLossLimit: config.dailyLossLimit,
+          executionMode: 'OBSERVE_ONLY',
+          lossUtilizedPercent: evalResult.lossUtilizedPercent,
+          warningThreshold1: config.warningThreshold1,
+          warningThreshold2: config.warningThreshold2,
+          isBreached: accountSession.isBreached,
+        });
+      }
+
+      // Angel One is not connected or not authenticated - return explicit disconnected state without Zerodha leakage
+      const accountSession = await ServerRiskStore.getSession(userId, undefined, accountId);
+      return sendJson(res, {
+        tradingDate: getTradingDateKolkata(),
+        realisedPnl: 0,
+        unrealisedPnl: 0,
+        totalPnl: 0,
+        grossTradingPnl: 0,
+        dailyRealisedPnl: 0,
+        dailyUnrealisedPnl: 0,
+        fnoPositionCount: 0,
+        totalPositionCount: 0,
+        positions: [],
+        source: 'ANGELONE_DISCONNECTED' as const,
+        dataSource: 'ANGELONE_DISCONNECTED' as const,
+        calculatedAt: new Date().toISOString(),
+        riskSession: accountSession,
+        shadowSession: accountSession,
+        state: accountSession?.state || 'ALLOW',
+        currentPnl: 0,
+        lossAmount: 0,
+        dailyLossLimit: config.dailyLossLimit,
+        executionMode: 'OBSERVE_ONLY',
+        broker: 'angelone',
+        connectionStatus: connStatus.status,
+      });
+    }
+
     const liveAdapter = BrokerService.getLiveAdapter();
     const connStatus = await liveAdapter.getConnectionStatus(userId);
 
@@ -655,9 +780,28 @@ apiRouter.get('/pnl', async (req: Request, res: Response) => {
 
     // Preserve existing simulation mode when live data is unavailable
     const positions = await BrokerService.getNormalizedPositions();
-    const pnlResult = PnlEngine.calculate(positions, config);
+    let pnlResult: any;
+    try {
+      pnlResult = PnlEngine.calculate(positions, config);
+    } catch {
+      pnlResult = {
+        tradingDate: getTradingDateKolkata(),
+        realisedPnl: 0,
+        unrealisedPnl: 0,
+        totalPnl: 0,
+        grossTradingPnl: 0,
+        dailyRealisedPnl: 0,
+        dailyUnrealisedPnl: 0,
+        fnoPositionCount: positions.filter((p) => p.isFno).length,
+        totalPositionCount: positions.length,
+        positions: positions.filter((p) => p.isFno),
+        source: 'MOCK_DATA',
+        calculatedAt: new Date().toISOString(),
+      };
+    }
     sendJson(res, pnlResult);
   } catch (err) {
+    console.error('[PNL_ROUTE_ERROR]', err);
     sendJson(res, { error: err instanceof Error ? err.message : 'Failed to calculate P&L' }, 500);
   }
 });

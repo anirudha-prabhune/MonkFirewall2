@@ -54,3 +54,16 @@ export function getISTReadableDate(date: Date = new Date()): string {
     year: 'numeric',
   }).format(date);
 }
+
+export function getFriendlyAccountLabel(connectionId: string, broker: string): string {
+  if (connectionId === 'acc_mt_zerodha_default') {
+    return 'Zerodha';
+  }
+  if (connectionId === 'acc_mt_angelone_default') {
+    return 'Angel One';
+  }
+  const brokerName = broker === 'angelone' ? 'Angel One' : 'Zerodha';
+  return `${brokerName} (${connectionId})`;
+}
+
+
