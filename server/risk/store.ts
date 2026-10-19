@@ -11,6 +11,9 @@ import {
   RiskEngine,
   RiskSession,
   RiskEvent,
+  RiskEventType,
+  RiskEventSeverity,
+  RiskEventMetrics,
   RiskEvaluationResult,
   getTradingDateKolkata,
   isNseMarketClosed,
@@ -43,11 +46,27 @@ interface UserRiskState {
   sessions: Map<string, RiskSession>; // tradingDate -> RiskSession
   accountSessions: Map<string, RiskSession>; // `${accountId}__${tradingDate}` -> RiskSession
   events: RiskEvent[];
+  recordedKeys: Set<string>;
   loadedFromFirestore?: boolean;
 }
 
 export class ServerRiskStore {
   private static userStates = new Map<string, UserRiskState>();
+  private static isPersistenceDegraded: boolean = false;
+  private static bufferedEvents: { userId: string; event: RiskEvent }[] = [];
+
+  public static getIsPersistenceDegraded(): boolean {
+    return this.isPersistenceDegraded;
+  }
+
+  public static getBufferedEventsCount(): number {
+    return this.bufferedEvents.length;
+  }
+
+  public static clearBufferedEventsForTesting(): void {
+    this.bufferedEvents = [];
+    this.isPersistenceDegraded = false;
+  }
 
   /**
    * Resolves the authoritative account ID for a user.
@@ -86,6 +105,7 @@ export class ServerRiskStore {
         sessions: new Map(),
         accountSessions: new Map(),
         events: [],
+        recordedKeys: new Set(),
         loadedFromFirestore: false,
       };
       this.userStates.set(userId, state);
@@ -206,12 +226,12 @@ export class ServerRiskStore {
     const isAngelOne = resolvedAccountId === DEFAULT_ANGELONE_ACCOUNT_ID || resolvedAccountId.includes('angelone');
     if (isAngelOne) {
       sanitized.broker = 'angelone';
-      // Phase 8C: Default to OBSERVE_ONLY, but permit explicit ENFORCE configuration for Angel One
+      // Phase 9: Default to ENFORCE for Angel One risk monitoring and enforcement
       const requestedMode = rawInput?.executionMode;
       if (requestedMode === 'ENFORCE' || requestedMode === 'OBSERVE_ONLY') {
         sanitized.executionMode = requestedMode;
       } else {
-        sanitized.executionMode = currentConfig.executionMode || 'OBSERVE_ONLY';
+        sanitized.executionMode = currentConfig.executionMode || 'ENFORCE';
       }
       sanitized.accountId = resolvedAccountId;
       sanitized.scope = 'ACCOUNT';
@@ -458,10 +478,14 @@ export class ServerRiskStore {
             transaction.set(sessionDocRef, evaluation.session);
           }
 
-          // Record transition events in Firestore transaction
+          // Record transition events in Firestore transaction using deterministic doc ID
           for (const event of evaluation.transitionEvents) {
-            const eventRef = adminDb.collection(`users/${userId}/riskEvents`).doc();
-            transaction.set(eventRef, event);
+            const idempotencyKey = event.idempotencyKey || `${resolvedAccountId}__${event.timestamp}__${event.type}`;
+            const sanitizedDocId = idempotencyKey.replace(/[^a-zA-Z0-9_\-]/g, '_').slice(0, 120);
+            const eventRef = adminDb.collection(`users/${userId}/riskEvents`).doc(sanitizedDocId);
+            event.persisted = true;
+            event.persistenceStatus = 'durable';
+            transaction.set(eventRef, sanitizeRiskEvent(event), { merge: true });
           }
 
           return evaluation;
@@ -473,16 +497,53 @@ export class ServerRiskStore {
           userState.sessions.set(tradingDate, txResult.session);
         }
         for (const event of txResult.transitionEvents) {
-          userState.events.push(event);
+          const key = event.idempotencyKey || `${resolvedAccountId}__${event.timestamp}__${event.type}`;
+          if (!userState.recordedKeys.has(key)) {
+            userState.recordedKeys.add(key);
+            userState.events.push(event);
+          }
         }
         return txResult;
       } catch (err) {
-        console.error('[RiskStore] evaluatePnlResult Admin transaction failed:', err);
-        throw new Error(
-          `FIRESTORE_PERSISTENCE_FAILURE: Authoritative RiskSession evaluation failed to persist to Firestore: ${
-            err instanceof Error ? err.message : String(err)
-          }`
-        );
+        console.error('[RiskStore] evaluatePnlResult Admin transaction failed:', err instanceof Error ? err.message : String(err));
+        
+        // Audit-event/persistence failure MUST NEVER prevent RiskEngine from creating or preserving a lock!
+        this.isPersistenceDegraded = true;
+
+        const existingSession =
+          userState.accountSessions.get(accountSessionKey) ||
+          (resolvedAccountId === DEFAULT_ACCOUNT_ID ? userState.sessions.get(tradingDate) : null) ||
+          null;
+        const activeConfig =
+          configOverride ||
+          userState.accountConfigs.get(resolvedAccountId) ||
+          userState.config;
+
+        const evaluation = RiskEngine.evaluate({
+          userId,
+          config: activeConfig,
+          pnlResult,
+          currentSession: existingSession,
+          evaluationTime,
+        });
+
+        userState.accountSessions.set(accountSessionKey, evaluation.session);
+        if (resolvedAccountId === DEFAULT_ACCOUNT_ID) {
+          userState.sessions.set(tradingDate, evaluation.session);
+        }
+
+        for (const event of evaluation.transitionEvents) {
+          event.persisted = false;
+          event.persistenceStatus = 'buffered';
+          const key = event.idempotencyKey || `${resolvedAccountId}__${event.timestamp}__${event.type}`;
+          if (!userState.recordedKeys.has(key)) {
+            userState.recordedKeys.add(key);
+            userState.events.push(event);
+            this.bufferedEvents.push({ userId, event });
+          }
+        }
+
+        return evaluation;
       }
     }
 
@@ -511,7 +572,7 @@ export class ServerRiskStore {
     }
 
     for (const event of result.transitionEvents) {
-      userState.events.push(event);
+      await this.recordEvent(userId, event);
       console.log(`[RiskStore] Transition Event [${event.type}] for user ${userId}: ${event.message}`);
     }
 
@@ -616,9 +677,11 @@ export class ServerRiskStore {
       }
     }
 
-    if (!session || (session.state === 'MARKET_CLOSED' && !isNseMarketClosed())) {
-      // Evaluate from current positions
-      const evalResult = await this.evaluateFromPositions(userId, new Date(), resolvedAccountId);
+    const now = new Date();
+    const marketClosed = isNseMarketClosed(now);
+    if (!session || (session.state === 'MARKET_CLOSED' && !marketClosed) || (session.state !== 'LOCKED' && marketClosed)) {
+      // Evaluate from current positions with current market state
+      const evalResult = await this.evaluateFromPositions(userId, now, resolvedAccountId);
       session = evalResult.session;
     }
 
@@ -664,55 +727,208 @@ export class ServerRiskStore {
     };
   }
 
-  public static async getAuditEvents(userId: string): Promise<RiskEvent[]> {
-    const userState = this.getOrCreateUserState(userId);
+  public static async reconcileBufferedEvents(targetUserId?: string): Promise<{ reconciled: number; failed: number }> {
     const adminDb = getAdminFirestore();
+    if (!adminDb) {
+      return { reconciled: 0, failed: this.bufferedEvents.length };
+    }
+
+    let reconciled = 0;
+    let failed = 0;
+    const remainingBuffer: { userId: string; event: RiskEvent }[] = [];
+
+    for (const item of this.bufferedEvents) {
+      if (targetUserId && item.userId !== targetUserId) {
+        remainingBuffer.push(item);
+        continue;
+      }
+
+      try {
+        const idempotencyKey = item.event.idempotencyKey || item.event.id || `${item.event.timestamp}_${item.event.type}`;
+        const sanitizedDocId = idempotencyKey.replace(/[^a-zA-Z0-9_\-]/g, '_').slice(0, 120);
+
+        item.event.persisted = true;
+        item.event.persistenceStatus = 'durable';
+
+        await adminDb
+          .collection(`users/${item.userId}/riskEvents`)
+          .doc(sanitizedDocId)
+          .set(sanitizeRiskEvent(item.event), { merge: true });
+
+        reconciled++;
+      } catch (err) {
+        console.error(`[RiskStore] Reconcile event failed for ${item.event.idempotencyKey}:`, err instanceof Error ? err.message : String(err));
+        item.event.persisted = false;
+        item.event.persistenceStatus = 'buffered';
+        remainingBuffer.push(item);
+        failed++;
+      }
+    }
+
+    this.bufferedEvents = remainingBuffer;
+    if (this.bufferedEvents.length === 0) {
+      this.isPersistenceDegraded = false;
+    }
+
+    return { reconciled, failed };
+  }
+
+  public static async getAuditEvents(
+    userId: string,
+    accountId?: string,
+    limit: number = 50
+  ): Promise<RiskEvent[]> {
+    const userState = this.getOrCreateUserState(userId);
+    const resolvedAccountId = accountId ? await this.resolveAccountId(userId, accountId) : undefined;
+    const adminDb = getAdminFirestore();
+
     if (adminDb) {
       try {
         const collRef = adminDb.collection(`users/${userId}/riskEvents`);
-        const snap = await collRef.orderBy('timestamp', 'desc').limit(100).get();
+        const fetchLimit = Math.min(100, Math.max(1, limit * 2));
+        const snap = await collRef.orderBy('timestamp', 'desc').limit(fetchLimit).get();
         const loadedEvents: RiskEvent[] = [];
         snap.forEach((docSnap) => {
-          loadedEvents.push(docSnap.data() as RiskEvent);
+          const data = docSnap.data() as RiskEvent;
+          data.persisted = true;
+          data.persistenceStatus = 'durable';
+          loadedEvents.push(data);
         });
-        loadedEvents.reverse();
-        
-        const existingKeys = new Set(userState.events.map(e => `${e.timestamp}_${e.message}`));
+
+        const existingKeys = new Set(
+          userState.events.map((e) => e.idempotencyKey || `${e.timestamp}_${e.message}`)
+        );
         for (const ev of loadedEvents) {
-          const key = `${ev.timestamp}_${ev.message}`;
+          const key = ev.idempotencyKey || `${ev.timestamp}_${ev.message}`;
           if (!existingKeys.has(key)) {
             userState.events.push(ev);
             existingKeys.add(key);
+            if (ev.idempotencyKey) {
+              userState.recordedKeys.add(ev.idempotencyKey);
+            }
           }
         }
-        userState.events.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
       } catch (err) {
-        console.error(`[RiskStore] getAuditEvents from Firestore failed:`, err);
+        console.error(`[RiskStore] getAuditEvents from Firestore failed:`, err instanceof Error ? err.message : String(err));
+        this.isPersistenceDegraded = true;
       }
     }
-    return [...userState.events];
+
+    let filtered = userState.events;
+    if (resolvedAccountId) {
+      filtered = filtered.filter((ev) => {
+        if (!ev.accountId) return resolvedAccountId === DEFAULT_ACCOUNT_ID;
+        return ev.accountId === resolvedAccountId;
+      });
+    }
+
+    const sanitized = filtered.map((ev) => sanitizeRiskEvent(ev));
+    sanitized.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+    return sanitized.slice(0, Math.min(100, Math.max(1, limit)));
   }
 
   public static recordEvent(
     userId: string,
-    eventInput: { type: RiskEvent['type']; message: string; timestamp?: string }
-  ): void {
+    eventInput: {
+      type: RiskEvent['type'];
+      message: string;
+      timestamp?: string;
+      accountId?: string;
+      broker?: string;
+      severity?: RiskEventSeverity;
+      idempotencyKey?: string;
+      metrics?: RiskEventMetrics;
+      details?: Record<string, any>;
+      persisted?: boolean;
+      persistenceStatus?: 'durable' | 'buffered' | 'failed';
+    }
+  ): RiskEvent {
     const userState = this.getOrCreateUserState(userId);
-    const event: RiskEvent = {
-      userId,
-      type: eventInput.type,
-      message: eventInput.message,
-      timestamp: eventInput.timestamp || new Date().toISOString(),
-    };
-    userState.events.push(event);
+    const timestamp = eventInput.timestamp || new Date().toISOString();
+    const resolvedAccountId = eventInput.accountId || DEFAULT_ACCOUNT_ID;
+    const broker =
+      eventInput.broker || (resolvedAccountId.includes('angelone') ? 'angelone' : 'zerodha');
+
+    const idempotencyKey =
+      eventInput.idempotencyKey ||
+      `${resolvedAccountId}__${timestamp}__${eventInput.type}__${eventInput.message.slice(0, 30)}`;
+
+    if (userState.recordedKeys.has(idempotencyKey)) {
+      const existing = userState.events.find((e) => e.idempotencyKey === idempotencyKey);
+      if (existing) return existing;
+    }
+    userState.recordedKeys.add(idempotencyKey);
+
+    let severity: RiskEventSeverity = eventInput.severity || 'info';
+    if (!eventInput.severity) {
+      if (
+        eventInput.type === 'LOSS_LIMIT_BREACHED' ||
+        eventInput.type === 'TRADING_LOCK_CREATED' ||
+        eventInput.type === 'UNRESOLVED_BREACH_RELOCKED' ||
+        eventInput.type === 'INVALID_PNL_REJECTED'
+      ) {
+        severity = 'critical';
+      } else if (
+        eventInput.type === 'RISK_WARNING_70' ||
+        eventInput.type === 'RISK_WARNING_90' ||
+        eventInput.type === 'RISK_WARNING' ||
+        eventInput.type === 'TRADING_LOCK_EXPIRED' ||
+        eventInput.type === 'STALE_DATA_DETECTED' ||
+        eventInput.type === 'BROKER_DISCONNECTED' ||
+        eventInput.type === 'AUTH_FAILURE' ||
+        eventInput.type === 'API_TIMEOUT'
+      ) {
+        severity = 'warning';
+      }
+    }
 
     const adminDb = getAdminFirestore();
+    const isDurableDirect = !!adminDb && eventInput.persisted !== false;
+
+    const rawEvent: RiskEvent = {
+      id: idempotencyKey,
+      userId,
+      accountId: resolvedAccountId,
+      broker,
+      type: eventInput.type,
+      severity,
+      message: eventInput.message,
+      timestamp,
+      idempotencyKey,
+      metrics: eventInput.metrics,
+      details: eventInput.details ? sanitizeObject(eventInput.details) : undefined,
+      persisted: isDurableDirect,
+      persistenceStatus: isDurableDirect ? 'durable' : (eventInput.persistenceStatus || 'buffered'),
+    };
+
+    const event = sanitizeRiskEvent(rawEvent);
+    userState.events.push(event);
+
     if (adminDb) {
-      adminDb.collection(`users/${userId}/riskEvents`).add(event)
+      const sanitizedDocId = idempotencyKey.replace(/[^a-zA-Z0-9_\-]/g, '_').slice(0, 120);
+      adminDb
+        .collection(`users/${userId}/riskEvents`)
+        .doc(sanitizedDocId)
+        .set(event, { merge: true })
+        .then(() => {
+          event.persisted = true;
+          event.persistenceStatus = 'durable';
+        })
         .catch((err) => {
-          console.error(`[RiskStore] recordEvent to Firestore failed:`, err);
+          console.error(`[RiskStore] recordEvent to Firestore failed for ${idempotencyKey}:`, err instanceof Error ? err.message : String(err));
+          event.persisted = false;
+          event.persistenceStatus = 'buffered';
+          this.isPersistenceDegraded = true;
+          this.bufferedEvents.push({ userId, event });
         });
+    } else {
+      event.persisted = false;
+      event.persistenceStatus = 'buffered';
+      this.isPersistenceDegraded = true;
+      this.bufferedEvents.push({ userId, event });
     }
+
+    return event;
   }
 
   /**
@@ -726,6 +942,15 @@ export class ServerRiskStore {
 
     userState.sessions.delete(today);
     userState.accountSessions.delete(accountSessionKey);
+
+    this.recordEvent(userId, {
+      accountId: resolvedAccountId,
+      broker: resolvedAccountId.includes('angelone') ? 'angelone' : 'zerodha',
+      type: 'AUTHORIZED_SESSION_RESET',
+      severity: 'info',
+      message: `Authorized session reset executed for account ${resolvedAccountId}. Risk state restored to baseline.`,
+      idempotencyKey: `${resolvedAccountId}__${today}__RESET_${Date.now()}`,
+    });
 
     const adminDb = getAdminFirestore();
     if (adminDb) {
@@ -753,5 +978,40 @@ export class ServerRiskStore {
    */
   public static reset() {
     this.userStates.clear();
+    this.bufferedEvents = [];
+    this.isPersistenceDegraded = false;
   }
+}
+
+function sanitizeObject(obj: any): any {
+  if (!obj || typeof obj !== 'object') return obj;
+  if (Array.isArray(obj)) return obj.map(sanitizeObject);
+  const sanitized: Record<string, any> = {};
+  for (const [key, value] of Object.entries(obj)) {
+    const lowerKey = key.toLowerCase();
+    if (
+      lowerKey.includes('token') ||
+      lowerKey.includes('password') ||
+      lowerKey.includes('secret') ||
+      lowerKey.includes('credential') ||
+      lowerKey.includes('totp') ||
+      lowerKey.includes('apikey') ||
+      lowerKey.includes('client_id')
+    ) {
+      sanitized[key] = '[REDACTED]';
+    } else if (typeof value === 'object' && value !== null) {
+      sanitized[key] = sanitizeObject(value);
+    } else {
+      sanitized[key] = value;
+    }
+  }
+  return sanitized;
+}
+
+function sanitizeRiskEvent(event: RiskEvent): RiskEvent {
+  const sanitized = { ...event };
+  if (sanitized.details) {
+    sanitized.details = sanitizeObject(sanitized.details);
+  }
+  return sanitized;
 }

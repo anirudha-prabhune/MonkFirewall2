@@ -11,6 +11,7 @@ import { AngelOneSessionStore } from './sessionStore';
 import { MOCK_INSTRUMENT_MASTER } from '../../instruments/master';
 import { generateTotp } from './totp';
 import { checkIsAfterHours } from '../normalize';
+import { mockAngelOneAdapter } from './adapter';
 
 export interface AngelOneAuthParams {
   apiKey?: string;
@@ -47,11 +48,12 @@ export class LiveAngelOneAdapter implements BrokerAdapter {
   private credentials: AngelOneCredentials;
   private customFetch?: typeof fetch;
 
-  constructor(config = {}, customFetch?: typeof fetch) {
+  constructor(config: any = {}, customFetch?: typeof fetch) {
     this.credentials = new AngelOneCredentials(config);
-    this.customFetch = customFetch;
+    this.customFetch = customFetch || config?.customFetch;
   }
 
+  private authRequiredUsers = new Set<string>();
   private timeoutMs: number = 8000;
 
   public setTimeoutMs(ms: number) {
@@ -227,6 +229,7 @@ export class LiveAngelOneAdapter implements BrokerAdapter {
         options.connectionId
       );
 
+      this.authRequiredUsers.delete(trimmedUserId);
       return {
         success: true,
         session: {
@@ -244,7 +247,25 @@ export class LiveAngelOneAdapter implements BrokerAdapter {
   }
 
   public async getConnectionStatus(userId = 'default_trader'): Promise<BrokerConnectionStatus> {
+    const trimmedUserId = userId.trim();
     const session = await AngelOneSessionStore.loadSession(userId);
+    if (session && session.authState === 'AUTHENTICATED' && !session.isExpired) {
+      this.authRequiredUsers.delete(trimmedUserId);
+    }
+    if (this.authRequiredUsers.has(trimmedUserId)) {
+      return {
+        broker: 'angelone',
+        status: 'AUTHENTICATION_REQUIRED',
+        isMock: false,
+        message: 'Angel One session expired or unauthorized. Re-authentication required.',
+        timestamp: new Date().toISOString(),
+        configured: true,
+        authenticated: false,
+        authenticationRequired: true,
+        credentials: this.credentials.getDiagnostic(),
+      };
+    }
+
     const storedApiKey = await AngelOneSessionStore.loadApiKey(userId);
     const configured = Boolean(storedApiKey || this.credentials.isConfigured() || (session && session.authState === 'AUTHENTICATED'));
     if (!configured) {
@@ -322,11 +343,25 @@ export class LiveAngelOneAdapter implements BrokerAdapter {
       });
 
       if (!response.ok) {
+        if (response.status === 401 || response.status === 403) {
+          this.authRequiredUsers.add(userId.trim());
+          try {
+            await AngelOneSessionStore.invalidateSession(userId);
+          } catch {}
+          throw new Error(`SmartAPI getPosition HTTP ${response.status}: Session unauthorized or expired. Re-authentication required.`);
+        }
         throw new Error(`SmartAPI getPosition HTTP ${response.status}`);
       }
 
       const data: any = await response.json();
       if (!data.status && data.message) {
+        if (data.errorcode === 'AG8001' || /token|session|unauthorized/i.test(data.message)) {
+          this.authRequiredUsers.add(userId.trim());
+          try {
+            await AngelOneSessionStore.invalidateSession(userId);
+          } catch {}
+          throw new Error(`SmartAPI error: ${data.message}. Re-authentication required.`);
+        }
         throw new Error(`SmartAPI error: ${data.message}`);
       }
 

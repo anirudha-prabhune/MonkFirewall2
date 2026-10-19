@@ -70,7 +70,7 @@ export const DEFAULT_ANGELONE_RISK_CONFIG: AccountRiskConfig = {
   userId: '',
   broker: 'angelone',
   scope: 'ACCOUNT',
-  executionMode: 'OBSERVE_ONLY',
+  executionMode: 'ENFORCE',
 };
 
 export interface RiskSession {

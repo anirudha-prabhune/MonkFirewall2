@@ -13,6 +13,7 @@ import { ZerodhaCredentialManager } from './brokers/zerodha/credentials';
 import { liveZerodhaAdapter } from './brokers/zerodha/liveAdapter';
 import { mockZerodhaAdapter } from './brokers/mock/adapter';
 import { liveAngelOneAdapter } from './brokers/angelone/liveAdapter';
+import { mockAngelOneAdapter } from './brokers/angelone/adapter';
 import { AngelOneSessionStore } from './brokers/angelone/sessionStore';
 import { normalizePositions } from './brokers/normalize';
 import { BrokerInstrument, LivePositionsResponse } from './brokers/types';
@@ -108,21 +109,26 @@ apiRouter.get('/positions/fno', async (req: Request, res: Response) => {
     if (!userId) return;
 
     const accountId = (req.query?.accountId as string) || (req.headers['x-account-id'] as string) || undefined;
-    const isAngelOne = (accountId && (accountId === 'acc_mt_angelone_default' || accountId.includes('angelone'))) || req.query?.broker === 'angelone';
+    const isAngelOne = (accountId && (accountId === 'acc_mt_angelone_default' || accountId.includes('angelone'))) || req.query?.broker === 'angelone' || req.headers['x-broker'] === 'angelone';
 
     if (isAngelOne) {
       const connStatus = await liveAngelOneAdapter.getConnectionStatus(userId);
-      if (connStatus.status === 'CONNECTED' && connStatus.authenticated) {
-        const rawPositions = await liveAngelOneAdapter.getPositions(userId);
-        const instruments = await liveAngelOneAdapter.getInstruments(userId);
-        const instrumentMap = new Map<number, BrokerInstrument>(instruments.map((i: BrokerInstrument) => [i.instrumentToken, i]));
-        const normalized = normalizePositions(rawPositions, instrumentMap, 'ANGELONE_LIVE');
-        const fnoPositions = normalized.filter((p) => p.isFno === true && !p.unknownInstrument);
-        return sendJson(res, {
-          dataSource: 'ANGELONE_LIVE',
-          count: fnoPositions.length,
-          positions: fnoPositions,
-        });
+      const isAngelConnected = connStatus.authenticated === true && (connStatus.status === 'CONNECTED' || connStatus.status === 'AUTHENTICATED');
+      if (isAngelConnected) {
+        try {
+          const rawPositions = await liveAngelOneAdapter.getPositions(userId);
+          const instruments = await liveAngelOneAdapter.getInstruments(userId);
+          const instrumentMap = new Map<number, BrokerInstrument>(instruments.map((i: BrokerInstrument) => [i.instrumentToken, i]));
+          const normalized = normalizePositions(rawPositions, instrumentMap, 'ANGELONE_LIVE');
+          const fnoPositions = normalized.filter((p) => p.isFno === true && !p.unknownInstrument);
+          return sendJson(res, {
+            dataSource: 'ANGELONE_LIVE',
+            count: fnoPositions.length,
+            positions: fnoPositions,
+          });
+        } catch (err: any) {
+          console.info('[AngelOne] Positions unavailable for session:', err?.message || err);
+        }
       }
       return sendJson(res, {
         dataSource: 'ANGELONE_LIVE',
@@ -383,26 +389,53 @@ apiRouter.get('/broker/live/positions', async (req: Request, res: Response) => {
     const userId = (req as any).userId || await authenticateRequest(req, res);
     if (!userId) return;
     const accountId = (req.query?.accountId as string) || (req.headers['x-account-id'] as string) || undefined;
-    const isAngelOne = (accountId && (accountId === 'acc_mt_angelone_default' || accountId.includes('angelone'))) || req.query?.broker === 'angelone';
+    const isAngelOne = (accountId && (accountId === 'acc_mt_angelone_default' || accountId.includes('angelone'))) || req.query?.broker === 'angelone' || req.headers['x-broker'] === 'angelone';
 
     if (isAngelOne) {
       const status = await liveAngelOneAdapter.getConnectionStatus(userId);
-      const rawPositions = await liveAngelOneAdapter.getPositions(userId);
-      const instruments = await liveAngelOneAdapter.getInstruments(userId);
-      const instrumentMap = new Map<number, BrokerInstrument>(instruments.map((i: BrokerInstrument) => [i.instrumentToken, i]));
-      const normalized = normalizePositions(rawPositions, instrumentMap, 'ANGELONE_LIVE');
-      const fnoPositions = normalized.filter((p) => p.isFno === true && !p.unknownInstrument);
-      const response: LivePositionsResponse = {
-        broker: 'angelone',
-        connectionStatus: status.status,
-        dataSource: 'ANGELONE_LIVE',
-        positionCount: normalized.length,
-        fnoPositionCount: fnoPositions.length,
-        positions: normalized,
-        timestamp: new Date().toISOString(),
-        diagnosticNote: 'Positions normalized via Angel One live adapter',
-      };
-      return sendJson(res, response);
+      if (status.status !== 'AUTHENTICATED' && status.status !== 'CONNECTED') {
+        return sendJson(res, {
+          broker: 'angelone',
+          connectionStatus: status.status,
+          dataSource: 'ANGELONE_LIVE',
+          positionCount: 0,
+          fnoPositionCount: 0,
+          positions: [],
+          timestamp: new Date().toISOString(),
+          diagnosticNote: 'Angel One not authenticated',
+        });
+      }
+      try {
+        const rawPositions = await liveAngelOneAdapter.getPositions(userId);
+        const instruments = await liveAngelOneAdapter.getInstruments(userId);
+        const instrumentMap = new Map<number, BrokerInstrument>(instruments.map((i: BrokerInstrument) => [i.instrumentToken, i]));
+        const normalized = normalizePositions(rawPositions, instrumentMap, 'ANGELONE_LIVE');
+        const fnoPositions = normalized.filter((p) => p.isFno === true && !p.unknownInstrument);
+        const response: LivePositionsResponse = {
+          broker: 'angelone',
+          connectionStatus: status.status,
+          dataSource: 'ANGELONE_LIVE',
+          positionCount: normalized.length,
+          fnoPositionCount: fnoPositions.length,
+          positions: normalized,
+          timestamp: new Date().toISOString(),
+          diagnosticNote: 'Positions normalized via Angel One live adapter',
+        };
+        return sendJson(res, response);
+      } catch (posErr: any) {
+        console.info('[AngelOne] Live diagnostic positions unavailable:', posErr?.message || posErr);
+        const updatedStatus = await liveAngelOneAdapter.getConnectionStatus(userId);
+        return sendJson(res, {
+          broker: 'angelone',
+          connectionStatus: updatedStatus.status,
+          dataSource: 'ANGELONE_LIVE',
+          positionCount: 0,
+          fnoPositionCount: 0,
+          positions: [],
+          timestamp: new Date().toISOString(),
+          diagnosticNote: posErr instanceof Error ? posErr.message : 'Failed to fetch live Angel One positions',
+        });
+      }
     }
 
     const livePositions = await BrokerService.getLiveDiagnosticPositions(userId);
@@ -420,7 +453,7 @@ apiRouter.get('/broker/live/capital', async (req: Request, res: Response) => {
 
     const accountId = (req.query?.accountId as string) || (req.headers['x-account-id'] as string) || undefined;
     const isExplicitMock = req.query?.mode === 'mock' || req.query?.broker === 'mock';
-    const isAngelOne = (accountId && (accountId === 'acc_mt_angelone_default' || accountId.includes('angelone'))) || req.query?.broker === 'angelone';
+    const isAngelOne = (accountId && (accountId === 'acc_mt_angelone_default' || accountId.includes('angelone'))) || req.query?.broker === 'angelone' || req.headers['x-broker'] === 'angelone';
 
     const capital = isExplicitMock
       ? await mockZerodhaAdapter.getCapital()
@@ -465,22 +498,49 @@ apiRouter.get('/broker/angelone/live/positions', async (req: Request, res: Respo
     const userId = (req as any).userId || await authenticateRequest(req, res);
     if (!userId) return;
     const status = await liveAngelOneAdapter.getConnectionStatus(userId);
-    const rawPositions = await liveAngelOneAdapter.getPositions(userId);
-    const instruments = await liveAngelOneAdapter.getInstruments(userId);
-    const instrumentMap = new Map<number, BrokerInstrument>(instruments.map((i: BrokerInstrument) => [i.instrumentToken, i]));
-    const normalized = normalizePositions(rawPositions, instrumentMap, 'ANGELONE_LIVE');
-    const fnoPositions = normalized.filter((p) => p.isFno === true && !p.unknownInstrument);
-    const response: LivePositionsResponse = {
-      broker: 'angelone',
-      connectionStatus: status.status,
-      dataSource: 'ANGELONE_LIVE',
-      positionCount: normalized.length,
-      fnoPositionCount: fnoPositions.length,
-      positions: normalized,
-      timestamp: new Date().toISOString(),
-      diagnosticNote: 'Positions normalized via Angel One live adapter',
-    };
-    sendJson(res, response);
+    if (status.status !== 'AUTHENTICATED' && status.status !== 'CONNECTED') {
+      return sendJson(res, {
+        broker: 'angelone',
+        connectionStatus: status.status,
+        dataSource: 'ANGELONE_LIVE',
+        positionCount: 0,
+        fnoPositionCount: 0,
+        positions: [],
+        timestamp: new Date().toISOString(),
+        diagnosticNote: 'Angel One not authenticated',
+      });
+    }
+    try {
+      const rawPositions = await liveAngelOneAdapter.getPositions(userId);
+      const instruments = await liveAngelOneAdapter.getInstruments(userId);
+      const instrumentMap = new Map<number, BrokerInstrument>(instruments.map((i: BrokerInstrument) => [i.instrumentToken, i]));
+      const normalized = normalizePositions(rawPositions, instrumentMap, 'ANGELONE_LIVE');
+      const fnoPositions = normalized.filter((p) => p.isFno === true && !p.unknownInstrument);
+      const response: LivePositionsResponse = {
+        broker: 'angelone',
+        connectionStatus: status.status,
+        dataSource: 'ANGELONE_LIVE',
+        positionCount: normalized.length,
+        fnoPositionCount: fnoPositions.length,
+        positions: normalized,
+        timestamp: new Date().toISOString(),
+        diagnosticNote: 'Positions normalized via Angel One live adapter',
+      };
+      sendJson(res, response);
+    } catch (posErr: any) {
+      console.info('[AngelOne] Live positions unavailable:', posErr?.message || posErr);
+      const updatedStatus = await liveAngelOneAdapter.getConnectionStatus(userId);
+      sendJson(res, {
+        broker: 'angelone',
+        connectionStatus: updatedStatus.status,
+        dataSource: 'ANGELONE_LIVE',
+        positionCount: 0,
+        fnoPositionCount: 0,
+        positions: [],
+        timestamp: new Date().toISOString(),
+        diagnosticNote: posErr instanceof Error ? posErr.message : 'Failed to fetch Angel One positions',
+      });
+    }
   } catch (err) {
     sendJson(res, { error: err instanceof Error ? err.message : 'Failed to fetch Angel One positions' }, 500);
   }
@@ -622,49 +682,55 @@ apiRouter.get('/pnl', async (req: Request, res: Response) => {
 
     const accountId = (req.query?.accountId as string) || (req.headers['x-account-id'] as string) || undefined;
     const config = await ServerRiskStore.getConfig(userId, accountId);
-    const isAngelOne = (accountId && (accountId === 'acc_mt_angelone_default' || accountId.includes('angelone'))) || req.query?.broker === 'angelone';
+    const isAngelOne = (accountId && (accountId === 'acc_mt_angelone_default' || accountId.includes('angelone'))) || req.query?.broker === 'angelone' || req.headers['x-broker'] === 'angelone';
 
     if (isAngelOne) {
       const connStatus = await liveAngelOneAdapter.getConnectionStatus(userId);
-      if (connStatus.status === 'CONNECTED' && connStatus.authenticated) {
-        const rawPositions = await liveAngelOneAdapter.getPositions(userId);
-        const instruments = await liveAngelOneAdapter.getInstruments(userId);
-        const instrumentMap = new Map<number, BrokerInstrument>(instruments.map((i: BrokerInstrument) => [i.instrumentToken, i]));
-        const normalized = normalizePositions(rawPositions, instrumentMap, 'ANGELONE_LIVE');
-        const fnoPositions = normalized.filter((p) => p.isFno === true && !p.unknownInstrument);
-        const pnlCalc = PnlEngine.calculate(fnoPositions, config);
-        const evalResult = await ServerRiskStore.evaluatePnlResult(userId, pnlCalc, new Date(), config, accountId);
-        const accountSession = evalResult.session;
+      const isAngelConnected = connStatus.authenticated === true && (connStatus.status === 'CONNECTED' || connStatus.status === 'AUTHENTICATED');
+      if (isAngelConnected) {
+        try {
+          const rawPositions = await liveAngelOneAdapter.getPositions(userId);
+          const instruments = await liveAngelOneAdapter.getInstruments(userId);
+          const instrumentMap = new Map<number, BrokerInstrument>(instruments.map((i: BrokerInstrument) => [i.instrumentToken, i]));
+          const normalized = normalizePositions(rawPositions, instrumentMap, 'ANGELONE_LIVE');
+          const fnoPositions = normalized.filter((p) => p.isFno === true && !p.unknownInstrument);
+          const pnlCalc = PnlEngine.calculate(fnoPositions, config);
+          const evalResult = await ServerRiskStore.evaluatePnlResult(userId, pnlCalc, new Date(), config, accountId);
+          const accountSession = evalResult.session;
 
-        return sendJson(res, {
-          tradingDate: pnlCalc.tradingDate,
-          realisedPnl: pnlCalc.realisedPnl,
-          unrealisedPnl: pnlCalc.unrealisedPnl,
-          totalPnl: pnlCalc.totalPnl,
-          grossTradingPnl: pnlCalc.grossTradingPnl,
-          dailyRealisedPnl: pnlCalc.dailyRealisedPnl,
-          dailyUnrealisedPnl: pnlCalc.dailyUnrealisedPnl,
-          fnoPositionCount: fnoPositions.length,
-          totalPositionCount: fnoPositions.length,
-          positions: fnoPositions,
-          source: 'ANGELONE_LIVE' as const,
-          dataSource: 'ANGELONE_LIVE' as const,
-          calculatedAt: new Date().toISOString(),
-          riskSession: accountSession,
-          shadowSession: accountSession,
-          state: accountSession.state,
-          currentPnl: pnlCalc.grossTradingPnl,
-          lossAmount: accountSession.lossAmount ?? (pnlCalc.grossTradingPnl < 0 ? Math.abs(pnlCalc.grossTradingPnl) : 0),
-          dailyLossLimit: config.dailyLossLimit,
-          executionMode: config.executionMode || 'OBSERVE_ONLY',
-          lossUtilizedPercent: evalResult.lossUtilizedPercent,
-          warningThreshold1: config.warningThreshold1,
-          warningThreshold2: config.warningThreshold2,
-          isBreached: accountSession.isBreached,
-        });
+          return sendJson(res, {
+            tradingDate: pnlCalc.tradingDate,
+            realisedPnl: pnlCalc.realisedPnl,
+            unrealisedPnl: pnlCalc.unrealisedPnl,
+            totalPnl: pnlCalc.totalPnl,
+            grossTradingPnl: pnlCalc.grossTradingPnl,
+            dailyRealisedPnl: pnlCalc.dailyRealisedPnl,
+            dailyUnrealisedPnl: pnlCalc.dailyUnrealisedPnl,
+            fnoPositionCount: fnoPositions.length,
+            totalPositionCount: fnoPositions.length,
+            positions: fnoPositions,
+            source: 'ANGELONE_LIVE' as const,
+            dataSource: 'ANGELONE_LIVE' as const,
+            calculatedAt: new Date().toISOString(),
+            riskSession: accountSession,
+            shadowSession: accountSession,
+            state: accountSession.state,
+            currentPnl: pnlCalc.grossTradingPnl,
+            lossAmount: accountSession.lossAmount ?? (pnlCalc.grossTradingPnl < 0 ? Math.abs(pnlCalc.grossTradingPnl) : 0),
+            dailyLossLimit: config.dailyLossLimit,
+            executionMode: config.executionMode || 'ENFORCE',
+            lossUtilizedPercent: evalResult.lossUtilizedPercent,
+            warningThreshold1: config.warningThreshold1,
+            warningThreshold2: config.warningThreshold2,
+            isBreached: accountSession.isBreached,
+          });
+        } catch (angelErr: any) {
+          console.info('[AngelOne] PnL positions unavailable:', angelErr?.message || angelErr);
+        }
       }
 
       // Angel One is not connected or not authenticated - return explicit disconnected state without Zerodha leakage
+      const latestConnStatus = await liveAngelOneAdapter.getConnectionStatus(userId);
       const accountSession = await ServerRiskStore.getSession(userId, undefined, accountId);
       return sendJson(res, {
         tradingDate: getTradingDateKolkata(),
@@ -686,9 +752,9 @@ apiRouter.get('/pnl', async (req: Request, res: Response) => {
         currentPnl: 0,
         lossAmount: accountSession?.lossAmount ?? 0,
         dailyLossLimit: config.dailyLossLimit,
-        executionMode: config.executionMode || 'OBSERVE_ONLY',
+        executionMode: config.executionMode || 'ENFORCE',
         broker: 'angelone',
-        connectionStatus: connStatus.status,
+        connectionStatus: latestConnStatus.status,
       });
     }
 
@@ -801,7 +867,7 @@ apiRouter.get('/pnl', async (req: Request, res: Response) => {
     }
     sendJson(res, pnlResult);
   } catch (err) {
-    console.error('[PNL_ROUTE_ERROR]', err);
+    console.error('[PnL] Calculation route error:', err);
     sendJson(res, { error: err instanceof Error ? err.message : 'Failed to calculate P&L' }, 500);
   }
 });
@@ -1214,15 +1280,22 @@ apiRouter.post('/risk/evaluate', async (req: Request, res: Response) => {
   }
 });
 
-// GET /api/risk/events - Transition Audit Trail
+// GET /api/risk/events - Transition Audit Trail & Activity Events
 apiRouter.get('/risk/events', async (req: Request, res: Response) => {
   try {
     const userId = (req as any).userId || await authenticateRequest(req, res);
     if (!userId) return;
-    const events = await ServerRiskStore.getAuditEvents(userId);
-    sendJson(res, { events });
+
+    const accountId = (req.query?.accountId as string) || (req.headers['x-account-id'] as string) || undefined;
+    const limit = Math.min(100, Math.max(1, parseInt(req.query?.limit as string || '50', 10) || 50));
+
+    const events = await ServerRiskStore.getAuditEvents(userId, accountId, limit);
+    const persistenceDegraded = ServerRiskStore.getIsPersistenceDegraded();
+    const bufferedCount = ServerRiskStore.getBufferedEventsCount();
+    sendJson(res, { events, count: events.length, accountId, persistenceDegraded, bufferedCount });
   } catch (err) {
-    sendJson(res, { error: err instanceof Error ? err.message : 'Failed to fetch audit events' }, 500);
+    console.error('[RiskEvents] Fetch route error:', err);
+    sendJson(res, { error: err instanceof Error ? err.message : 'Failed to fetch risk events' }, 500);
   }
 });
 

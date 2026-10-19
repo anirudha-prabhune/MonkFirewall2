@@ -34,11 +34,11 @@ export function isNseMarketClosed(date: Date = new Date()): boolean {
     process.env.NODE_ENV === 'test' ||
     process.argv.some(arg => arg.includes('test'))
   );
-
-  if (isRunningInTest || process.env.NODE_ENV !== 'production') {
-    return false; // Default to market being OPEN in development/preview and test environments
+  if (isRunningInTest) {
+    return false;
   }
 
+  // Always evaluate NSE market hours in Asia/Kolkata timezone (09:15 to 15:40 IST on weekdays)
   const parts = new Intl.DateTimeFormat('en-US', {
     timeZone: 'Asia/Kolkata',
     weekday: 'short',
@@ -97,19 +97,14 @@ export interface RiskSession {
 
 export type RiskSessionSnapshot = RiskSession;
 
-export type RiskEventType =
-  | 'CONFIG_UPDATED'
-  | 'RISK_WARNING'
-  | 'LOSS_LIMIT_BREACHED'
-  | 'TRADING_LOCK_CREATED'
-  | 'TRADING_LOCK_EXPIRED';
+import {
+  RiskEventType,
+  RiskEventSeverity,
+  RiskEventMetrics,
+  RiskEvent,
+} from '../../src/types/events';
 
-export interface RiskEvent {
-  userId: string;
-  type: RiskEventType;
-  message: string;
-  timestamp: string;
-}
+export type { RiskEventType, RiskEventSeverity, RiskEventMetrics, RiskEvent };
 
 export interface RiskEvaluationInput {
   userId?: string;
@@ -173,6 +168,7 @@ export class RiskEngine {
     const nowIso = evaluationTime.toISOString();
     const tradingDate = getTradingDateKolkata(evaluationTime);
     const userId = input.userId || 'default_trader';
+    const previousSession = input.currentSession;
 
     // Resolve configuration
     const config: RiskConfig = input.config || {
@@ -237,8 +233,15 @@ export class RiskEngine {
     const lossUtilizedPercent =
       config.dailyLossLimit > 0 ? (lossAmount / config.dailyLossLimit) * 100 : 0;
 
-    const previousSession = input.currentSession;
     const transitionEvents: RiskEvent[] = [];
+    const accountId = config.accountId;
+    const broker = config.broker || (accountId?.includes('angelone') ? 'angelone' : 'zerodha');
+    const defaultMetrics = {
+      lossAmount,
+      dailyLossLimit: config.dailyLossLimit,
+      lossUtilizedPercent,
+      currentPnl: grossTradingPnl,
+    };
 
     // Check if the previous session was locked on the SAME trading date
     const isRunningInTest = typeof process !== 'undefined' && (
@@ -352,9 +355,14 @@ export class RiskEngine {
       lockJustExpired = true;
       transitionEvents.push({
         userId,
+        accountId,
+        broker,
         type: 'TRADING_LOCK_EXPIRED',
+        severity: 'warning',
         message: `Trading lock expired at ${nowIso} after completing ${config.lockDurationMinutes}m lock duration.`,
         timestamp: nowIso,
+        idempotencyKey: `${accountId}__${effectiveTradingDate}__LOCK_EXPIRED_${previousSession?.lockUntil || nowIso}`,
+        metrics: defaultMetrics,
       });
     }
 
@@ -409,11 +417,16 @@ export class RiskEngine {
       if (config.executionMode === 'OBSERVE_ONLY') {
         transitionEvents.push({
           userId,
+          accountId,
+          broker,
           type: 'LOSS_LIMIT_BREACHED',
+          severity: 'warning',
           message: `[OBSERVE_ONLY] Daily loss limit of ₹${config.dailyLossLimit.toLocaleString(
             'en-IN'
           )} breached with loss ₹${lossAmount.toLocaleString('en-IN')}. Lock skipped for observe-only scope.`,
           timestamp: nowIso,
+          idempotencyKey: `${accountId}__${effectiveTradingDate}__OBSERVE_BREACH`,
+          metrics: defaultMetrics,
         });
 
         const session: RiskSession = {
@@ -472,20 +485,44 @@ export class RiskEngine {
         durationDesc = `${durationMinutes} minutes`;
       }
 
-      transitionEvents.push({
-        userId,
-        type: 'LOSS_LIMIT_BREACHED',
-        message: `Daily loss limit of ₹${config.dailyLossLimit.toLocaleString(
-          'en-IN'
-        )} breached with loss ₹${lossAmount.toLocaleString('en-IN')}.`,
-        timestamp: nowIso,
-      });
+      if (lockJustExpired) {
+        transitionEvents.push({
+          userId,
+          accountId,
+          broker,
+          type: 'UNRESOLVED_BREACH_RELOCKED',
+          severity: 'critical',
+          message: `Unresolved breach: Daily loss ₹${lossAmount.toLocaleString('en-IN')} remains above limit ₹${config.dailyLossLimit.toLocaleString('en-IN')} upon lock expiration. Firewall re-locked.`,
+          timestamp: nowIso,
+          idempotencyKey: `${accountId}__${effectiveTradingDate}__UNRESOLVED_RELOCK_${lockedAt}`,
+          metrics: defaultMetrics,
+        });
+      } else {
+        transitionEvents.push({
+          userId,
+          accountId,
+          broker,
+          type: 'LOSS_LIMIT_BREACHED',
+          severity: 'critical',
+          message: `Daily loss limit of ₹${config.dailyLossLimit.toLocaleString(
+            'en-IN'
+          )} breached with loss ₹${lossAmount.toLocaleString('en-IN')}.`,
+          timestamp: nowIso,
+          idempotencyKey: `${accountId}__${effectiveTradingDate}__BREACH_${lockedAt}`,
+          metrics: defaultMetrics,
+        });
+      }
 
       transitionEvents.push({
         userId,
+        accountId,
+        broker,
         type: 'TRADING_LOCK_CREATED',
+        severity: 'critical',
         message: `Trading lock established until ${lockUntil} (${durationDesc}).`,
         timestamp: nowIso,
+        idempotencyKey: `${accountId}__${effectiveTradingDate}__LOCK_CREATED_${lockedAt}`,
+        metrics: defaultMetrics,
       });
 
       const session: RiskSession = {
@@ -549,14 +586,39 @@ export class RiskEngine {
       }%)`;
     }
 
-    // Idempotency: Emit RISK_WARNING only when entering WARNING state
-    if (state === 'WARNING' && (!previousSession || previousSession.state !== 'WARNING')) {
-      transitionEvents.push({
-        userId,
-        type: 'RISK_WARNING',
-        message: `Risk warning: Daily loss reached ${lossUtilizedPercent.toFixed(1)}% of limit.`,
-        timestamp: nowIso,
-      });
+    // Idempotency: Emit RISK_WARNING when entering WARNING state or escalating from Threshold 1 to Threshold 2
+    if (state === 'WARNING') {
+      const isThresh2 = lossAmount >= warning2Amount;
+      const wasInWarning = previousSession?.state === 'WARNING';
+      const wasThresh2 = previousSession?.reason?.includes('Threshold 2');
+      const isNewWarningTransition = !wasInWarning || (isThresh2 && !wasThresh2);
+
+      if (isNewWarningTransition) {
+        const warnType: RiskEventType = isThresh2 ? 'RISK_WARNING_90' : 'RISK_WARNING_70';
+        const transitionRef = previousSession?.lastEvaluatedAt || nowIso;
+        transitionEvents.push({
+          userId,
+          accountId,
+          broker,
+          type: warnType,
+          severity: 'warning',
+          message: `Risk warning: Daily loss reached ${lossUtilizedPercent.toFixed(1)}% of limit (${isThresh2 ? 'Threshold 2' : 'Threshold 1'}).`,
+          timestamp: nowIso,
+          idempotencyKey: `${accountId}__${effectiveTradingDate}__WARNING_${isThresh2 ? 90 : 70}_${transitionRef}`,
+          metrics: defaultMetrics,
+        });
+        transitionEvents.push({
+          userId,
+          accountId,
+          broker,
+          type: 'RISK_WARNING',
+          severity: 'warning',
+          message: `Risk warning: Daily loss reached ${lossUtilizedPercent.toFixed(1)}% of limit (${isThresh2 ? 'Threshold 2' : 'Threshold 1'}).`,
+          timestamp: nowIso,
+          idempotencyKey: `${accountId}__${effectiveTradingDate}__RISK_WARNING_${transitionRef}`,
+          metrics: defaultMetrics,
+        });
+      }
     }
 
     const session: RiskSession = {

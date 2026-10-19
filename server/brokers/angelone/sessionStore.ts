@@ -36,11 +36,14 @@ const inMemoryTestStore = new Map<string, PersistedAngelOneSessionDoc>();
 const inMemoryTestApiKeyStore = new Map<string, PersistedAngelOneApiKeyDoc>();
 
 export class AngelOneSessionStore {
+  private static invalidatedUsers = new Set<string>();
+
   public static enableMockStoreForTesting(enabled: boolean): void {
     useMockStoreForTesting = enabled;
     if (!enabled) {
       inMemoryTestStore.clear();
       inMemoryTestApiKeyStore.clear();
+      this.invalidatedUsers.clear();
     }
   }
 
@@ -77,6 +80,7 @@ export class AngelOneSessionStore {
     const validityHours = options.validityHours || 24;
     const expiryUtc = new Date(now.getTime() + validityHours * 3600 * 1000);
 
+    this.invalidatedUsers.delete(userId.trim());
     const encrypted = CryptoService.encrypt(accessToken, userId.trim());
     const docPath = this.getSessionDocPath(userId, connectionId);
 
@@ -154,8 +158,20 @@ export class AngelOneSessionStore {
     if (!userId || !userId.trim()) {
       return null;
     }
-    const connectionId = options.connectionId || DEFAULT_CONNECTION_ID;
+    const trimmedUserId = userId.trim();
     const now = options.evaluationTime || new Date();
+    if (this.invalidatedUsers.has(trimmedUserId)) {
+      return {
+        accessToken: '',
+        sessionVersion: 0,
+        issuedAt: now.toISOString(),
+        expiresAt: now.toISOString(),
+        authState: 'AUTHENTICATION_REQUIRED',
+        isExpired: true,
+      };
+    }
+
+    const connectionId = options.connectionId || DEFAULT_CONNECTION_ID;
     const docPath = this.getSessionDocPath(userId, connectionId);
     let docData: PersistedAngelOneSessionDoc | null = null;
 
@@ -231,6 +247,7 @@ export class AngelOneSessionStore {
     if (!userId || !userId.trim()) {
       return { invalidated: false };
     }
+    this.invalidatedUsers.add(userId.trim());
     const docPath = this.getSessionDocPath(userId, connectionId);
     const now = new Date().toISOString();
 

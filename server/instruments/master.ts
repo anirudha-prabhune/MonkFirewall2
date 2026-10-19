@@ -224,6 +224,32 @@ export const MOCK_INSTRUMENT_MASTER: BrokerInstrument[] = [
     tickSize: 0.05,
     lotSize: 1,
   },
+  // 11. Angel One NIFTY CALL OPTION (Mock)
+  {
+    instrumentToken: 999001,
+    exchange: 'NFO',
+    tradingsymbol: 'NIFTY26OCT24000CE',
+    name: 'NIFTY 26 OCT 24000 CE',
+    segment: 'NFO-OPT',
+    instrumentType: 'CE',
+    expiry: '2026-10-29',
+    strike: 24000,
+    tickSize: 0.05,
+    lotSize: 25,
+  },
+  // 12. Angel One BANKNIFTY CALL OPTION (Mock)
+  {
+    instrumentToken: 99001,
+    exchange: 'NFO',
+    tradingsymbol: 'BANKNIFTY26OCT45000CE',
+    name: 'BANKNIFTY 26 OCT 45000 CE',
+    segment: 'NFO-OPT',
+    instrumentType: 'OPT',
+    expiry: '2026-10-26',
+    strike: 45000,
+    tickSize: 0.05,
+    lotSize: 15,
+  },
 ];
 
 export const MOCK_INSTRUMENT_MAP = new Map<number, BrokerInstrument>(

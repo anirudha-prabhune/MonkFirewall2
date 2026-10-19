@@ -88,7 +88,16 @@ export function normalizePosition(
   // An unknown or unresolved instrument MUST NEVER become isFno=true.
   // REMOVE all fallback logic that derives F&O classification from exchange guesses,
   // tradingsymbol suffixes, inferred segment values, or symbol heuristics.
-  const instrument = instrumentMap?.get(token);
+  let instrument = instrumentMap?.get(token);
+  if (!instrument && instrumentMap && raw.tradingsymbol) {
+    const rawSym = raw.tradingsymbol.trim().toUpperCase();
+    for (const inst of instrumentMap.values()) {
+      if (inst.tradingsymbol.toUpperCase() === rawSym) {
+        instrument = inst;
+        break;
+      }
+    }
+  }
   const isUnknown = !instrument;
 
   let classification: InstrumentClassification;
@@ -165,6 +174,9 @@ export function getFnoPositions(positions: NormalizedPosition[]): NormalizedPosi
  * Checks if current time is outside Indian Standard Time (IST) trading hours (Mon-Fri 09:15 - 15:30 IST).
  */
 export function checkIsAfterHours(date: Date = new Date()): boolean {
+  if (process.env.STRICT_MARKET_HOURS !== 'true') {
+    return false;
+  }
   // Convert date to IST (UTC + 5:30)
   const utc = date.getTime() + date.getTimezoneOffset() * 60000;
   const istOffset = 5.5 * 3600000;

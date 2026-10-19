@@ -1,6 +1,6 @@
 import { doc, getDoc, onSnapshot } from 'firebase/firestore';
 import { db, getAuthHeaders } from './firebase';
-import { RiskConfig, DEFAULT_RISK_CONFIG } from '../types/risk';
+import { RiskConfig, DEFAULT_RISK_CONFIG, DEFAULT_ANGELONE_RISK_CONFIG, DEFAULT_ANGELONE_ACCOUNT_ID } from '../types/risk';
 import { handleFirestoreError, OperationType } from './firestoreErrors';
 import { validateRiskConfig } from '../utils/validation';
 
@@ -9,21 +9,27 @@ const LOCAL_STORAGE_KEY_PREFIX = 'trading_firewall_risk_config_';
 export async function getRiskConfig(userId: string, accountId?: string): Promise<RiskConfig> {
   const cacheKey = accountId ? `${userId}_${accountId}` : userId;
   if (userId.startsWith('mock-')) {
-    const raw = localStorage.getItem(`${LOCAL_STORAGE_KEY_PREFIX}${cacheKey}`);
-    if (raw) {
-      try {
-        const parsed = JSON.parse(raw);
-        const val = validateRiskConfig(parsed);
-        if (val.valid && val.sanitized) return val.sanitized;
-      } catch {
-        // fallback
+    if (typeof localStorage !== 'undefined') {
+      const raw = localStorage.getItem(`${LOCAL_STORAGE_KEY_PREFIX}${cacheKey}`);
+      if (raw) {
+        try {
+          const parsed = JSON.parse(raw);
+          const val = validateRiskConfig(parsed);
+          if (val.valid && val.sanitized) return val.sanitized;
+        } catch {
+          // fallback
+        }
       }
     }
+    const isAngel = accountId === DEFAULT_ANGELONE_ACCOUNT_ID || Boolean(accountId?.includes('angelone'));
+    const defaultCfg = isAngel ? DEFAULT_ANGELONE_RISK_CONFIG : DEFAULT_RISK_CONFIG;
     const initialConfig: RiskConfig = {
-      ...DEFAULT_RISK_CONFIG,
+      ...defaultCfg,
       updatedAt: new Date().toISOString(),
     };
-    localStorage.setItem(`${LOCAL_STORAGE_KEY_PREFIX}${cacheKey}`, JSON.stringify(initialConfig));
+    if (typeof localStorage !== 'undefined') {
+      localStorage.setItem(`${LOCAL_STORAGE_KEY_PREFIX}${cacheKey}`, JSON.stringify(initialConfig));
+    }
     return initialConfig;
   }
 
@@ -60,14 +66,19 @@ export async function getRiskConfig(userId: string, accountId?: string): Promise
       }
     }
 
+    const isAngel = accountId === DEFAULT_ANGELONE_ACCOUNT_ID || Boolean(accountId?.includes('angelone'));
+    const defaultCfg = isAngel ? DEFAULT_ANGELONE_RISK_CONFIG : DEFAULT_RISK_CONFIG;
+
     return {
-      ...DEFAULT_RISK_CONFIG,
+      ...defaultCfg,
       updatedAt: new Date().toISOString(),
     };
   } catch (error) {
     handleFirestoreError(error, OperationType.GET, path);
+    const isAngel = accountId === DEFAULT_ANGELONE_ACCOUNT_ID || Boolean(accountId?.includes('angelone'));
+    const defaultCfg = isAngel ? DEFAULT_ANGELONE_RISK_CONFIG : DEFAULT_RISK_CONFIG;
     return {
-      ...DEFAULT_RISK_CONFIG,
+      ...defaultCfg,
       updatedAt: new Date().toISOString(),
     };
   }
