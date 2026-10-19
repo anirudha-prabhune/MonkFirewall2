@@ -7,7 +7,7 @@ import {
   BrokerAccountCapital,
 } from '../types';
 import { AngelOneCredentials } from './credentials';
-import { AngelOneSessionStore } from './sessionStore';
+import { AngelOneSessionStore, normalizeAngelOneConnectionId } from './sessionStore';
 import { MOCK_INSTRUMENT_MASTER } from '../../instruments/master';
 import { generateTotp } from './totp';
 import { checkIsAfterHours } from '../normalize';
@@ -54,6 +54,10 @@ export class LiveAngelOneAdapter implements BrokerAdapter {
   }
 
   private authRequiredUsers = new Set<string>();
+
+  private getUserConnKey(userId: string, connectionId?: string): string {
+    return `${userId.trim()}:${normalizeAngelOneConnectionId(connectionId)}`;
+  }
   private timeoutMs: number = 8000;
 
   public setTimeoutMs(ms: number) {
@@ -111,14 +115,25 @@ export class LiveAngelOneAdapter implements BrokerAdapter {
 
     const trimmedUserId = userId.trim();
     const config = this.credentials.getConfig();
+    const savedCreds = await AngelOneSessionStore.loadCredentials(trimmedUserId, options.connectionId);
 
-    const apiKey = (params.apiKey !== undefined ? params.apiKey : (config.apiKey || '')).trim();
-    const clientCode = (params.clientCode !== undefined ? params.clientCode : (config.clientCode || '')).trim();
-    const password = (params.password !== undefined ? params.password : (config.password || '')).trim();
+    const apiKey = (params.apiKey !== undefined && params.apiKey !== ''
+      ? params.apiKey
+      : (savedCreds?.apiKey || config.apiKey || '')).trim();
+
+    const clientCode = (params.clientCode !== undefined && params.clientCode !== ''
+      ? params.clientCode
+      : (savedCreds?.clientCode || config.clientCode || '')).trim();
+
+    const password = (params.password !== undefined && params.password !== ''
+      ? params.password
+      : (savedCreds?.password || config.password || '')).trim();
 
     let totp = (params.totp?.trim() || '').trim();
     if (!totp) {
-      const totpSecret = (params.totpSecret !== undefined ? params.totpSecret : (config.totpSecret || '')).trim();
+      const totpSecret = (params.totpSecret !== undefined && params.totpSecret !== ''
+        ? params.totpSecret
+        : (savedCreds?.totpSecret || config.totpSecret || '')).trim();
       if (totpSecret) {
         try {
           totp = generateTotp(totpSecret);
@@ -151,6 +166,30 @@ export class LiveAngelOneAdapter implements BrokerAdapter {
     const fetchFn = (url: any, opts: any) => this.fetchWithTimeout(url, opts, options.customFetch);
 
     try {
+      const storedKey = await AngelOneSessionStore.loadApiKey(trimmedUserId, options.connectionId);
+      const isKeyMatch = Boolean(storedKey && apiKey === storedKey);
+      const maskedKey = apiKey.length > 6 ? `${apiKey.substring(0, 3)}...${apiKey.substring(apiKey.length - 3)}` : '***';
+
+      console.info('[SmartAPI Cloud Debug] Outbound loginByPassword:', {
+        url: 'https://apiconnect.angelbroking.com/rest/auth/angelbroking/user/v1/loginByPassword',
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+          'X-PrivateKey': `${maskedKey} (Length: ${apiKey.length}, MatchesStoredCredential: ${isKeyMatch})`,
+          'X-UserType': 'USER',
+          'X-SourceID': 'WEB',
+          'X-ClientLocalIP': '127.0.0.1',
+          'X-ClientPublicIP': '127.0.0.1',
+          'X-MACAddress': 'MAC',
+        },
+        payload: {
+          clientcode: clientCode,
+          password: '[REDACTED_PASSWORD]',
+          totp: '[REDACTED_TOTP]',
+        },
+      });
+
       const loginResponse = await fetchFn(
         'https://apiconnect.angelbroking.com/rest/auth/angelbroking/user/v1/loginByPassword',
         {
@@ -158,17 +197,18 @@ export class LiveAngelOneAdapter implements BrokerAdapter {
           headers: {
             'Content-Type': 'application/json',
             'Accept': 'application/json',
-            'X-PrivateKey': apiKey,
+            'X-PrivateKey': apiKey.trim(),
             'X-UserType': 'USER',
             'X-SourceID': 'WEB',
             'X-ClientLocalIP': '127.0.0.1',
             'X-ClientPublicIP': '127.0.0.1',
             'X-MACAddress': 'MAC',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
           },
           body: JSON.stringify({
-            clientcode: clientCode,
-            password,
-            totp,
+            clientcode: clientCode.trim(),
+            password: password.trim(),
+            totp: totp.trim(),
           }),
         }
       );
@@ -181,6 +221,10 @@ export class LiveAngelOneAdapter implements BrokerAdapter {
             errorMsg = errorBody.message;
           }
         } catch {}
+        console.info('[SmartAPI Cloud Debug] Upstream loginByPassword HTTP Error:', {
+          status: loginResponse.status,
+          errorMsg: sanitizeAngelOneErrorString(errorMsg),
+        });
         return {
           success: false,
           error: sanitizeAngelOneErrorString(errorMsg),
@@ -188,6 +232,13 @@ export class LiveAngelOneAdapter implements BrokerAdapter {
       }
 
       const authData: any = await loginResponse.json();
+      console.info('[SmartAPI Cloud Debug] Upstream loginByPassword Response:', {
+        status: loginResponse.status,
+        ok: loginResponse.ok,
+        statusFlag: authData?.status,
+        message: authData?.message ? sanitizeAngelOneErrorString(authData.message) : undefined,
+        errorcode: authData?.errorcode,
+      });
       if (!authData || !authData.status) {
         const errorMsg = authData?.message || 'SmartAPI authentication failed';
         return {
@@ -212,24 +263,55 @@ export class LiveAngelOneAdapter implements BrokerAdapter {
         };
       }
 
+      // Persist user's encrypted API key & full credentials FIRST to guarantee zero partial authentication persistence
+      try {
+        const totpSec = params.totpSecret || savedCreds?.totpSecret || config.totpSecret;
+        await AngelOneSessionStore.saveCredentials(
+          trimmedUserId,
+          {
+            apiKey,
+            clientCode,
+            password,
+            ...(totpSec ? { totpSecret: totpSec } : {}),
+          },
+          options.connectionId
+        );
+      } catch (keyErr: any) {
+        try {
+          await AngelOneSessionStore.invalidateSession(trimmedUserId, undefined, options.connectionId);
+        } catch {}
+        return {
+          success: false,
+          error: sanitizeAngelOneErrorString(keyErr?.message || 'Failed to persist credentials'),
+        };
+      }
+
       // Persist encrypted token to isolated session store (FAIL-CLOSED)
-      const saveResult = await AngelOneSessionStore.saveSession(
-        trimmedUserId,
-        liveAccessToken,
-        {
-          clientCode,
-          connectionId: options.connectionId,
-        }
-      );
+      let saveResult;
+      try {
+        saveResult = await AngelOneSessionStore.saveSession(
+          trimmedUserId,
+          liveAccessToken,
+          {
+            clientCode,
+            connectionId: options.connectionId,
+          }
+        );
+      } catch (sessionErr: any) {
+        // Roll back stored API key and session state if session persistence fails
+        try {
+          await AngelOneSessionStore.deleteApiKey(trimmedUserId, options.connectionId);
+        } catch {}
+        try {
+          await AngelOneSessionStore.invalidateSession(trimmedUserId, undefined, options.connectionId);
+        } catch {}
+        return {
+          success: false,
+          error: sanitizeAngelOneErrorString(sessionErr?.message || 'Failed to persist Angel One session'),
+        };
+      }
 
-      // Persist user's encrypted API key separately from session expiry
-      await AngelOneSessionStore.saveApiKey(
-        trimmedUserId,
-        apiKey,
-        options.connectionId
-      );
-
-      this.authRequiredUsers.delete(trimmedUserId);
+      this.authRequiredUsers.delete(this.getUserConnKey(trimmedUserId, options.connectionId));
       return {
         success: true,
         session: {
@@ -246,13 +328,19 @@ export class LiveAngelOneAdapter implements BrokerAdapter {
     }
   }
 
-  public async getConnectionStatus(userId = 'default_trader'): Promise<BrokerConnectionStatus> {
+  public async getConnectionStatus(
+    userId = 'default_trader',
+    options: { connectionId?: string } = {}
+  ): Promise<BrokerConnectionStatus> {
     const trimmedUserId = userId.trim();
-    const session = await AngelOneSessionStore.loadSession(userId);
+    const connectionId = options.connectionId;
+    const session = await AngelOneSessionStore.loadSession(userId, { connectionId });
+    const connKey = this.getUserConnKey(trimmedUserId, connectionId);
     if (session && session.authState === 'AUTHENTICATED' && !session.isExpired) {
-      this.authRequiredUsers.delete(trimmedUserId);
+      this.authRequiredUsers.delete(connKey);
     }
-    if (this.authRequiredUsers.has(trimmedUserId)) {
+
+    if (this.authRequiredUsers.has(connKey)) {
       return {
         broker: 'angelone',
         status: 'AUTHENTICATION_REQUIRED',
@@ -266,14 +354,15 @@ export class LiveAngelOneAdapter implements BrokerAdapter {
       };
     }
 
-    const storedApiKey = await AngelOneSessionStore.loadApiKey(userId);
-    const configured = Boolean(storedApiKey || this.credentials.isConfigured() || (session && session.authState === 'AUTHENTICATED'));
+    const storedApiKey = await AngelOneSessionStore.loadApiKey(userId, connectionId);
+    const hasApiKey = Boolean(storedApiKey || this.credentials.getConfig().apiKey);
+    const configured = Boolean(hasApiKey || (session && session.authState === 'AUTHENTICATED'));
     if (!configured) {
       return {
         broker: 'angelone',
         status: 'CONFIGURATION_ERROR',
         isMock: false,
-        message: 'Angel One API Key, Client Code, or Password not configured in environment or credentials.',
+        message: 'Angel One API Key not found in environment or credentials.',
         timestamp: new Date().toISOString(),
         configured: false,
         authenticated: false,
@@ -296,6 +385,20 @@ export class LiveAngelOneAdapter implements BrokerAdapter {
       };
     }
 
+    if (!hasApiKey) {
+      return {
+        broker: 'angelone',
+        status: 'CONFIGURATION_ERROR',
+        isMock: false,
+        message: 'Angel One API Key not found for user. Re-authentication required.',
+        timestamp: new Date().toISOString(),
+        configured: false,
+        authenticated: false,
+        authenticationRequired: true,
+        credentials: this.credentials.getDiagnostic(),
+      };
+    }
+
     return {
       broker: 'angelone',
       status: 'AUTHENTICATED',
@@ -311,58 +414,123 @@ export class LiveAngelOneAdapter implements BrokerAdapter {
     };
   }
 
-  public async getPositions(userId = 'default_trader'): Promise<RawBrokerPosition[]> {
-    const status = await this.getConnectionStatus(userId);
+  public async getPositions(
+    userId = 'default_trader',
+    options: { connectionId?: string } = {}
+  ): Promise<RawBrokerPosition[]> {
+    const connectionId = options.connectionId;
+    const status = await this.getConnectionStatus(userId, { connectionId });
     if (status.status !== 'AUTHENTICATED' && status.status !== 'CONNECTED') {
       throw new Error(`Angel One positions unavailable: ${status.message}`);
     }
 
-    const session = await AngelOneSessionStore.loadSession(userId);
+    const session = await AngelOneSessionStore.loadSession(userId, { connectionId });
     if (!session || !session.accessToken) {
       throw new Error('Angel One active session access token not found');
     }
 
-    let apiKey = await AngelOneSessionStore.loadApiKey(userId);
+    let apiKey = await AngelOneSessionStore.loadApiKey(userId, connectionId);
     if (!apiKey) {
       apiKey = this.credentials.getConfig().apiKey || '';
     }
 
+    if (!apiKey) {
+      throw new Error('Angel One API Key not found for user');
+    }
+
     try {
-      const response = await this.fetchWithTimeout('https://apiconnect.angelbroking.com/rest/secure/angelbroking/order/v1/getPosition', {
+      const storedKey = await AngelOneSessionStore.loadApiKey(userId, connectionId);
+      const isKeyMatch = Boolean(storedKey && apiKey === storedKey);
+      const maskedKey = apiKey.length > 6 ? `${apiKey.substring(0, 3)}...${apiKey.substring(apiKey.length - 3)}` : '***';
+
+      const authHeader = session.accessToken.startsWith('Bearer ')
+        ? session.accessToken
+        : `Bearer ${session.accessToken}`;
+
+      console.info('[SmartAPI Cloud Debug] Outbound getPosition / Positions:', {
+        url: 'https://apiconnect.angelbroking.com/rest/secure/angelbroking/order/v1/getPosition',
         method: 'GET',
         headers: {
-          'Authorization': `Bearer ${session.accessToken}`,
-          'X-PrivateKey': apiKey,
+          'Authorization': 'Bearer [REDACTED_JWT_TOKEN]',
+          'X-PrivateKey': `${maskedKey} (Length: ${apiKey.length}, MatchesStoredCredential: ${isKeyMatch})`,
           'X-UserType': 'USER',
           'X-SourceID': 'WEB',
           'X-ClientLocalIP': '127.0.0.1',
           'X-ClientPublicIP': '127.0.0.1',
           'X-MACAddress': 'MAC',
+          'Content-Type': 'application/json',
           'Accept': 'application/json',
+        },
+        requestBody: '[NO BODY / HTTP GET]',
+      });
+
+      const cleanApiKey = apiKey.trim();
+      const response = await this.fetchWithTimeout('https://apiconnect.angelbroking.com/rest/secure/angelbroking/order/v1/getPosition', {
+        method: 'GET',
+        headers: {
+          'Authorization': authHeader,
+          'X-PrivateKey': cleanApiKey,
+          'X-UserType': 'USER',
+          'X-SourceID': 'WEB',
+          'X-ClientLocalIP': '127.0.0.1',
+          'X-ClientPublicIP': '127.0.0.1',
+          'X-MACAddress': 'MAC',
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         },
       });
 
       if (!response.ok) {
-        if (response.status === 401 || response.status === 403) {
-          this.authRequiredUsers.add(userId.trim());
+        let errBody: any = {};
+        try {
+          errBody = await response.json();
+        } catch {}
+        const rawMsg = errBody?.message || errBody?.error || `HTTP ${response.status}`;
+        const errorCode = errBody?.errorcode || errBody?.code;
+        const sanitizedMsg = sanitizeAngelOneErrorString(rawMsg);
+        const codePrefix = errorCode ? ` [${errorCode}]` : '';
+        const httpPrefix = !rawMsg.includes(String(response.status)) ? ` (HTTP ${response.status})` : '';
+
+        console.info('[SmartAPI Cloud Debug] Upstream getPosition HTTP Error:', {
+          status: response.status,
+          errorCode: errorCode || 'NONE',
+          errorMsg: sanitizedMsg,
+        });
+
+        if (response.status === 401 || response.status === 403 || errorCode === 'AG8001' || errorCode === 'AG8002' || errorCode === 'AG8003' || errorCode === 'AB1010') {
+          this.authRequiredUsers.add(this.getUserConnKey(userId, connectionId));
           try {
-            await AngelOneSessionStore.invalidateSession(userId);
+            await AngelOneSessionStore.invalidateSession(userId, session.sessionVersion, connectionId);
           } catch {}
-          throw new Error(`SmartAPI getPosition HTTP ${response.status}: Session unauthorized or expired. Re-authentication required.`);
+          throw new Error(`SmartAPI getPosition${codePrefix}${httpPrefix}: ${sanitizedMsg}. Re-authentication required.`);
         }
-        throw new Error(`SmartAPI getPosition HTTP ${response.status}`);
+        throw new Error(`SmartAPI getPosition${codePrefix}${httpPrefix}: ${sanitizedMsg}`);
       }
 
       const data: any = await response.json();
-      if (!data.status && data.message) {
-        if (data.errorcode === 'AG8001' || /token|session|unauthorized/i.test(data.message)) {
-          this.authRequiredUsers.add(userId.trim());
+      console.info('[SmartAPI Cloud Debug] Upstream getPosition Response:', {
+        status: response.status,
+        ok: response.ok,
+        statusFlag: data?.status,
+        message: data?.message ? sanitizeAngelOneErrorString(data.message) : undefined,
+        errorcode: data?.errorcode,
+        positionCount: Array.isArray(data?.data) ? data.data.length : 0,
+      });
+      if (!data.status) {
+        const rawMsg = data.message || 'SmartAPI request failed';
+        const errorCode = data.errorcode;
+        const sanitizedMsg = sanitizeAngelOneErrorString(rawMsg);
+        const codePrefix = errorCode ? ` [${errorCode}]` : '';
+
+        if (errorCode === 'AG8001' || errorCode === 'AG8002' || errorCode === 'AG8003' || errorCode === 'AB1010' || /token|session|unauthorized|api\s*key|private\s*key/i.test(rawMsg)) {
+          this.authRequiredUsers.add(this.getUserConnKey(userId, connectionId));
           try {
-            await AngelOneSessionStore.invalidateSession(userId);
+            await AngelOneSessionStore.invalidateSession(userId, session.sessionVersion, connectionId);
           } catch {}
-          throw new Error(`SmartAPI error: ${data.message}. Re-authentication required.`);
+          throw new Error(`SmartAPI error${codePrefix}: ${sanitizedMsg}. Re-authentication required.`);
         }
-        throw new Error(`SmartAPI error: ${data.message}`);
+        throw new Error(`SmartAPI error${codePrefix}: ${sanitizedMsg}`);
       }
 
       const rawList = data.data || [];
@@ -420,8 +588,12 @@ export class LiveAngelOneAdapter implements BrokerAdapter {
     };
   }
 
-  public async getCapital(userId = 'default_trader'): Promise<BrokerAccountCapital> {
-    const status = await this.getConnectionStatus(userId);
+  public async getCapital(
+    userId = 'default_trader',
+    options: { connectionId?: string } = {}
+  ): Promise<BrokerAccountCapital> {
+    const connectionId = options.connectionId;
+    const status = await this.getConnectionStatus(userId, { connectionId });
     const isAfterHours = checkIsAfterHours();
 
     if (status.status !== 'AUTHENTICATED' && status.status !== 'CONNECTED') {
@@ -442,7 +614,7 @@ export class LiveAngelOneAdapter implements BrokerAdapter {
       };
     }
 
-    const session = await AngelOneSessionStore.loadSession(userId);
+    const session = await AngelOneSessionStore.loadSession(userId, { connectionId });
     if (!session || !session.accessToken) {
       return {
         broker: 'angelone',
@@ -461,7 +633,7 @@ export class LiveAngelOneAdapter implements BrokerAdapter {
       };
     }
 
-    let apiKey = await AngelOneSessionStore.loadApiKey(userId);
+    let apiKey = await AngelOneSessionStore.loadApiKey(userId, connectionId);
     if (!apiKey) {
       apiKey = this.credentials.getConfig().apiKey || '';
     }
@@ -485,27 +657,129 @@ export class LiveAngelOneAdapter implements BrokerAdapter {
     }
 
     try {
-      const response = await this.fetchWithTimeout('https://apiconnect.angelbroking.com/rest/secure/angelbroking/user/v1/getRMS', {
+      const storedKey = await AngelOneSessionStore.loadApiKey(userId, connectionId);
+      const isKeyMatch = Boolean(storedKey && apiKey === storedKey);
+      const maskedKey = apiKey.length > 6 ? `${apiKey.substring(0, 3)}...${apiKey.substring(apiKey.length - 3)}` : '***';
+
+      const authHeader = session.accessToken.startsWith('Bearer ')
+        ? session.accessToken
+        : `Bearer ${session.accessToken}`;
+
+      console.info('[SmartAPI Cloud Debug] Outbound getRMS / Capital:', {
+        url: 'https://apiconnect.angelbroking.com/rest/secure/angelbroking/user/v1/getRMS',
         method: 'GET',
         headers: {
-          'Authorization': `Bearer ${session.accessToken}`,
-          'X-PrivateKey': apiKey,
+          'Authorization': 'Bearer [REDACTED_JWT_TOKEN]',
+          'X-PrivateKey': `${maskedKey} (Length: ${apiKey.length}, MatchesStoredCredential: ${isKeyMatch})`,
           'X-UserType': 'USER',
           'X-SourceID': 'WEB',
           'X-ClientLocalIP': '127.0.0.1',
           'X-ClientPublicIP': '127.0.0.1',
           'X-MACAddress': 'MAC',
+          'Content-Type': 'application/json',
           'Accept': 'application/json',
+        },
+        requestBody: '[NO BODY / HTTP GET]',
+      });
+
+      const cleanApiKey = apiKey.trim();
+      const response = await this.fetchWithTimeout('https://apiconnect.angelbroking.com/rest/secure/angelbroking/user/v1/getRMS', {
+        method: 'GET',
+        headers: {
+          'Authorization': authHeader,
+          'X-PrivateKey': cleanApiKey,
+          'X-UserType': 'USER',
+          'X-SourceID': 'WEB',
+          'X-ClientLocalIP': '127.0.0.1',
+          'X-ClientPublicIP': '127.0.0.1',
+          'X-MACAddress': 'MAC',
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         },
       });
 
       if (!response.ok) {
-        throw new Error(`SmartAPI getRMS HTTP ${response.status}`);
+        let errBody: any = {};
+        try {
+          errBody = await response.json();
+        } catch {}
+        const rawMsg = errBody?.message || errBody?.error || `HTTP ${response.status}`;
+        const errorCode = errBody?.errorcode || errBody?.code;
+        const sanitizedMsg = sanitizeAngelOneErrorString(rawMsg);
+        const codePrefix = errorCode ? ` [${errorCode}]` : '';
+        const httpPrefix = !rawMsg.includes(String(response.status)) ? ` (HTTP ${response.status})` : '';
+
+        console.info('[SmartAPI Cloud Debug] Upstream getRMS HTTP Error:', {
+          status: response.status,
+          errorCode: errorCode || 'NONE',
+          errorMsg: sanitizedMsg,
+        });
+
+        if (response.status === 401 || response.status === 403 || errorCode === 'AG8001' || errorCode === 'AG8002' || errorCode === 'AG8003' || errorCode === 'AB1010') {
+          this.authRequiredUsers.add(this.getUserConnKey(userId, connectionId));
+          try {
+            await AngelOneSessionStore.invalidateSession(userId, session.sessionVersion, connectionId);
+          } catch {}
+          return {
+            broker: 'angelone',
+            dataSource: 'ANGELONE_LIVE',
+            connectionStatus: 'AUTHENTICATION_REQUIRED',
+            netBalance: null,
+            availableCash: null,
+            availableTradingMargin: null,
+            utilizedMargin: null,
+            withdrawableFunds: null,
+            currency: 'INR',
+            asOf: new Date().toISOString(),
+            isStale: true,
+            isAfterHours,
+            semanticNote: `SmartAPI getRMS${codePrefix}${httpPrefix}: ${sanitizedMsg}. Re-authentication required.`,
+          };
+        }
+
+        throw new Error(`SmartAPI getRMS${codePrefix}${httpPrefix}: ${sanitizedMsg}`);
       }
 
       const data: any = await response.json();
-      if (!data.status && data.message) {
-        throw new Error(`SmartAPI error: ${data.message}`);
+      console.info('[SmartAPI Cloud Debug] Upstream getRMS Response:', {
+        status: response.status,
+        ok: response.ok,
+        statusFlag: data?.status,
+        message: data?.message ? sanitizeAngelOneErrorString(data.message) : undefined,
+        errorcode: data?.errorcode,
+        netBalance: data?.data?.net,
+        availableCash: data?.data?.availablecash,
+      });
+      if (!data.status) {
+        const rawMsg = data.message || 'SmartAPI request failed';
+        const errorCode = data.errorcode;
+        const sanitizedMsg = sanitizeAngelOneErrorString(rawMsg);
+        const codePrefix = errorCode ? ` [${errorCode}]` : '';
+
+        if (errorCode === 'AG8001' || errorCode === 'AG8002' || errorCode === 'AG8003' || errorCode === 'AB1010' || /token|session|unauthorized|api\s*key|private\s*key/i.test(rawMsg)) {
+          this.authRequiredUsers.add(this.getUserConnKey(userId, connectionId));
+          try {
+            await AngelOneSessionStore.invalidateSession(userId, session.sessionVersion, connectionId);
+          } catch {}
+          return {
+            broker: 'angelone',
+            dataSource: 'ANGELONE_LIVE',
+            connectionStatus: 'AUTHENTICATION_REQUIRED',
+            netBalance: null,
+            availableCash: null,
+            availableTradingMargin: null,
+            utilizedMargin: null,
+            withdrawableFunds: null,
+            currency: 'INR',
+            asOf: new Date().toISOString(),
+            isStale: true,
+            isAfterHours,
+            semanticNote: `SmartAPI error${codePrefix}: ${sanitizedMsg}. Re-authentication required.`,
+          };
+        }
+
+        throw new Error(`SmartAPI error${codePrefix}: ${sanitizedMsg}`);
       }
 
       const rmsData = data.data || {};

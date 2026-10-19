@@ -317,7 +317,7 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
             console.warn('Failed to fetch Angel One positions:', err);
             return null;
           }),
-          fetchAngelOneStatus(user?.uid).catch((err) => {
+          fetchAngelOneStatus(user?.uid, accountToFetch).catch((err) => {
             console.warn('Failed to fetch Angel One status:', err);
             return null;
           }),
@@ -387,7 +387,7 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
     try {
       const [res, angelRes] = await Promise.all([
         fetchLiveBrokerStatus(user.uid),
-        fetchAngelOneStatus(user.uid),
+        fetchAngelOneStatus(user.uid, selectedAccountId),
       ]);
       setLiveBrokerStatus(res);
       setAngelOneStatus(angelRes);

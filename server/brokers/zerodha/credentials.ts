@@ -86,6 +86,25 @@ export class ZerodhaCredentialManager {
   }
 
   /**
+   * Resolves Zerodha credentials for a specific user and connection from Firestore,
+   * falling back to environment variables if no user-specific document exists.
+   */
+  public static async getCredentialsForUser(
+    userId = 'default_trader',
+    connectionId = 'zerodha'
+  ): Promise<ZerodhaCredentials> {
+    const stored = await ZerodhaSessionStore.loadCredentials(userId, connectionId);
+    if (stored && stored.apiKey && stored.apiSecret) {
+      return {
+        apiKey: stored.apiKey,
+        apiSecret: stored.apiSecret,
+        accessToken: this.getActiveAccessToken(userId) || undefined,
+      };
+    }
+    return this.getCredentials(userId);
+  }
+
+  /**
    * Validates whether mandatory persistent credentials (API Key + API Secret) are present.
    */
   public static validatePersistentConfig(): {
@@ -115,6 +134,44 @@ export class ZerodhaCredentialManager {
     return {
       configured: true,
       missing: [],
+    };
+  }
+
+  /**
+   * Validates persistent Zerodha credentials for a given user and connection.
+   */
+  public static async validatePersistentConfigForUser(
+    userId = 'default_trader',
+    connectionId = 'zerodha'
+  ): Promise<{
+    configured: boolean;
+    missing: string[];
+    error?: string;
+    creds?: ZerodhaCredentials;
+  }> {
+    const creds = await this.getCredentialsForUser(userId, connectionId);
+    const missing: string[] = [];
+
+    if (!creds.apiKey || creds.apiKey.trim().length === 0) {
+      missing.push('ZERODHA_API_KEY');
+    }
+    if (!creds.apiSecret || creds.apiSecret.trim().length === 0) {
+      missing.push('ZERODHA_API_SECRET');
+    }
+
+    if (missing.length > 0) {
+      return {
+        configured: false,
+        missing,
+        error: `Missing required Zerodha credentials: ${missing.join(', ')}`,
+        creds,
+      };
+    }
+
+    return {
+      configured: true,
+      missing: [],
+      creds,
     };
   }
 
@@ -463,6 +520,55 @@ export class ZerodhaCredentialManager {
     return { url, state };
   }
 
+  public static async getLoginUrlForUser(
+    redirectUrl?: string,
+    userId?: string,
+    connectionId = 'zerodha',
+    existingState?: string
+  ): Promise<string> {
+    const creds = userId ? await this.getCredentialsForUser(userId, connectionId) : this.getCredentials();
+    const apiKey = creds.apiKey;
+    if (!apiKey || apiKey.trim().length === 0) {
+      throw new Error('Cannot generate login URL: ZERODHA_API_KEY is not configured on server or in user credentials.');
+    }
+    const state = existingState || (userId && userId.trim() ? this.createOAuthState(userId.trim()) : undefined);
+
+    const defaultRedirect =
+      process.env.ZERODHA_REDIRECT_URI ||
+      process.env.ZERODHA_REDIRECT_URL ||
+      (process.env.APP_URL ? `${process.env.APP_URL.replace(/\/$/, '')}/api/broker/live/auth/callback` : undefined);
+
+    let effectiveRedirect = redirectUrl || defaultRedirect;
+
+    if (state && effectiveRedirect && !effectiveRedirect.includes('state=')) {
+      const sep = effectiveRedirect.includes('?') ? '&' : '?';
+      effectiveRedirect = `${effectiveRedirect}${sep}state=${encodeURIComponent(state)}`;
+    }
+
+    let url = `https://kite.zerodha.com/connect/login?v=3&api_key=${encodeURIComponent(apiKey.trim())}`;
+    if (effectiveRedirect) {
+      url += `&redirect_url=${encodeURIComponent(effectiveRedirect.trim())}`;
+      url += `&redirect_uri=${encodeURIComponent(effectiveRedirect.trim())}`;
+    }
+    if (state) {
+      url += `&state=${encodeURIComponent(state)}`;
+    }
+    return url;
+  }
+
+  public static async getLoginUrlWithStateForUser(
+    redirectUrl?: string,
+    userId?: string,
+    connectionId = 'zerodha'
+  ): Promise<{ url: string; state?: string }> {
+    let state: string | undefined;
+    if (userId && userId.trim()) {
+      state = this.createOAuthState(userId.trim());
+    }
+    const url = await this.getLoginUrlForUser(redirectUrl, userId, connectionId, state);
+    return { url, state };
+  }
+
   /**
    * Exchanges a one-time request_token for an active access_token via Kite Connect.
    *
@@ -516,8 +622,9 @@ export class ZerodhaCredentialManager {
       if (typeof options.timeoutMs === 'number' && options.timeoutMs > 0) timeoutMs = options.timeoutMs;
     }
 
-    const apiKey = process.env.ZERODHA_API_KEY || process.env.KITE_API_KEY;
-    const apiSecret = process.env.ZERODHA_API_SECRET || process.env.KITE_API_SECRET;
+    const userCreds = await this.getCredentialsForUser(userId, connectionId);
+    const apiKey = userCreds.apiKey;
+    const apiSecret = userCreds.apiSecret;
 
     if (!apiKey || !apiSecret) {
       return {

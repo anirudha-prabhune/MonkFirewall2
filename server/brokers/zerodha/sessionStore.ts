@@ -40,6 +40,15 @@ export interface PersistedZerodhaSessionDoc {
   sessionVersion: number;
 }
 
+export interface PersistedZerodhaCredentialsDoc {
+  provider: 'zerodha';
+  userId: string;
+  connectionId: string;
+  encryptedApiKey: EncryptedPayload;
+  encryptedApiSecret: EncryptedPayload;
+  updatedAt: string;
+}
+
 export interface DecryptedRuntimeSession {
   accessToken: string;
   sessionVersion: number;
@@ -95,9 +104,14 @@ export class SessionPersistenceError extends Error {
 
 // In-memory test store used STRICTLY for unit tests when enableMockStoreForTesting(true) is invoked
 const inMemoryTestStore = new Map<string, PersistedZerodhaSessionDoc>();
+const inMemoryTestCredentialsStore = new Map<string, PersistedZerodhaCredentialsDoc>();
 
 export function enableMockStoreForTesting(enable = true): void {
   useMockStoreForTesting = enable;
+  if (!enable) {
+    inMemoryTestStore.clear();
+    inMemoryTestCredentialsStore.clear();
+  }
 }
 
 export function isMockStoreEnabled(): boolean {
@@ -110,6 +124,7 @@ export function setAdminFirestoreForTesting(db: Firestore | null): void {
 
 export function clearMockStore(): void {
   inMemoryTestStore.clear();
+  inMemoryTestCredentialsStore.clear();
 }
 
 export function getMockStoreEntry(path: string): PersistedZerodhaSessionDoc | undefined {
@@ -509,5 +524,150 @@ export class ZerodhaSessionStore {
     };
     memCurrent.updatedAt = now;
     return { invalidated: true, currentVersion };
+  }
+
+  /**
+   * Helper to construct Zerodha credentials document path:
+   * users/{userId}/brokerConnections/{connectionId}/credentials/zerodha
+   */
+  public static getCredentialsDocPath(userId: string, connectionId = DEFAULT_CONNECTION_ID): string {
+    return `users/${userId.trim()}/brokerConnections/${connectionId.trim()}/credentials/zerodha`;
+  }
+
+  /**
+   * Encrypts and persists Zerodha API key and API secret in Firestore per user and connection.
+   */
+  public static async saveCredentials(
+    userId: string,
+    credentials: { apiKey: string; apiSecret: string },
+    connectionId = DEFAULT_CONNECTION_ID
+  ): Promise<void> {
+    if (!userId || !userId.trim()) {
+      throw new Error('UserId is required to save Zerodha credentials');
+    }
+    if (!credentials.apiKey || !credentials.apiKey.trim()) {
+      throw new Error('API Key is required to save Zerodha credentials');
+    }
+    if (!credentials.apiSecret || !credentials.apiSecret.trim()) {
+      throw new Error('API Secret is required to save Zerodha credentials');
+    }
+
+    const trimmedUserId = userId.trim();
+    const connId = connectionId.trim();
+    const now = new Date().toISOString();
+
+    const encryptedKey = CryptoService.encrypt(credentials.apiKey.trim(), trimmedUserId);
+    const encryptedSecret = CryptoService.encrypt(credentials.apiSecret.trim(), trimmedUserId);
+
+    const docPath = this.getCredentialsDocPath(trimmedUserId, connId);
+    const docData: PersistedZerodhaCredentialsDoc = {
+      provider: 'zerodha',
+      userId: trimmedUserId,
+      connectionId: connId,
+      encryptedApiKey: {
+        iv: encryptedKey.iv,
+        ciphertext: encryptedKey.ciphertext,
+        tag: encryptedKey.tag,
+        keyVersion: encryptedKey.keyVersion,
+      },
+      encryptedApiSecret: {
+        iv: encryptedSecret.iv,
+        ciphertext: encryptedSecret.ciphertext,
+        tag: encryptedSecret.tag,
+        keyVersion: encryptedSecret.keyVersion,
+      },
+      updatedAt: now,
+    };
+
+    if (!useMockStoreForTesting) {
+      const db = getAdminFirestore();
+      if (!db) {
+        throw new SessionPersistenceError('Authoritative Firestore instance is unavailable or unconfigured.');
+      }
+      try {
+        await db.doc(docPath).set(docData, { merge: true });
+      } catch (err: any) {
+        throw new SessionPersistenceError(`Failed to save Zerodha credentials at ${docPath}: ${err?.message || String(err)}`);
+      }
+      return;
+    }
+
+    inMemoryTestCredentialsStore.set(docPath, docData);
+  }
+
+  /**
+   * Loads and decrypts Zerodha API key and API secret for a given user and connection.
+   */
+  public static async loadCredentials(
+    userId: string,
+    connectionId = DEFAULT_CONNECTION_ID
+  ): Promise<{ apiKey: string; apiSecret: string } | null> {
+    if (!userId || !userId.trim()) {
+      return null;
+    }
+
+    const trimmedUserId = userId.trim();
+    const connId = connectionId.trim();
+    const docPath = this.getCredentialsDocPath(trimmedUserId, connId);
+
+    let docData: PersistedZerodhaCredentialsDoc | null = null;
+
+    if (!useMockStoreForTesting) {
+      const db = getAdminFirestore();
+      if (!db) {
+        return null;
+      }
+      try {
+        const snap = await db.doc(docPath).get();
+        if (snap.exists) {
+          docData = snap.data() as PersistedZerodhaCredentialsDoc;
+        }
+      } catch {
+        return null;
+      }
+    } else {
+      docData = inMemoryTestCredentialsStore.get(docPath) || null;
+    }
+
+    if (!docData || !docData.encryptedApiKey || !docData.encryptedApiSecret) {
+      return null;
+    }
+
+    try {
+      const apiKey = CryptoService.decrypt(docData.encryptedApiKey, trimmedUserId);
+      const apiSecret = CryptoService.decrypt(docData.encryptedApiSecret, trimmedUserId);
+      return { apiKey, apiSecret };
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Removes stored Zerodha credentials and invalidates active session for user and connection.
+   */
+  public static async deleteCredentials(
+    userId: string,
+    connectionId = DEFAULT_CONNECTION_ID
+  ): Promise<void> {
+    if (!userId || !userId.trim()) {
+      return;
+    }
+
+    const trimmedUserId = userId.trim();
+    const connId = connectionId.trim();
+    const docPath = this.getCredentialsDocPath(trimmedUserId, connId);
+
+    if (!useMockStoreForTesting) {
+      const db = getAdminFirestore();
+      if (db) {
+        try {
+          await db.doc(docPath).delete();
+        } catch {}
+      }
+    } else {
+      inMemoryTestCredentialsStore.delete(docPath);
+    }
+
+    await this.invalidateSession(trimmedUserId, undefined, connId);
   }
 }

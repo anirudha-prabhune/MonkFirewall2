@@ -128,6 +128,9 @@ export interface NormalizedPosition {
   realisedPnl: number;
   unrealisedPnl: number;
   totalPnl: number;
+  pnl?: number;
+  realised?: number;
+  unrealised?: number;
   m2m?: number;
   isFno: boolean;
   dataSource: 'MOCK_DATA' | 'ZERODHA_LIVE' | 'ANGELONE_LIVE';

@@ -1,5 +1,6 @@
 import { EncryptedPayload, CryptoService } from '../../security/crypto';
 import { getAdminFirestore } from '../zerodha/sessionStore';
+import { DEFAULT_ANGELONE_ACCOUNT_ID } from '../../../src/types/risk';
 
 export interface PersistedAngelOneSessionDoc {
   provider: 'angelone';
@@ -30,29 +31,60 @@ export interface PersistedAngelOneApiKeyDoc {
   updatedAt: string;
 }
 
-const DEFAULT_CONNECTION_ID = 'angelone_default';
+export interface PersistedAngelOneCredentialsDoc {
+  provider: 'angelone';
+  userId: string;
+  connectionId: string;
+  encryptedApiKey: EncryptedPayload;
+  encryptedClientCode: EncryptedPayload;
+  encryptedPassword: EncryptedPayload;
+  encryptedTotpSecret?: EncryptedPayload;
+  updatedAt: string;
+}
+
+const DEFAULT_CONNECTION_ID = DEFAULT_ANGELONE_ACCOUNT_ID; // 'acc_mt_angelone_default'
 let useMockStoreForTesting = false;
 const inMemoryTestStore = new Map<string, PersistedAngelOneSessionDoc>();
 const inMemoryTestApiKeyStore = new Map<string, PersistedAngelOneApiKeyDoc>();
+const inMemoryTestCredentialsStore = new Map<string, PersistedAngelOneCredentialsDoc>();
+
+export function normalizeAngelOneConnectionId(connectionId?: string): string {
+  if (
+    !connectionId ||
+    !connectionId.trim() ||
+    connectionId.trim() === 'angelone_default' ||
+    connectionId.trim() === DEFAULT_ANGELONE_ACCOUNT_ID
+  ) {
+    return DEFAULT_ANGELONE_ACCOUNT_ID;
+  }
+  return connectionId.trim();
+}
 
 export class AngelOneSessionStore {
   private static invalidatedUsers = new Set<string>();
+
+  private static getUserConnKey(userId: string, connectionId?: string): string {
+    return `${userId.trim()}:${normalizeAngelOneConnectionId(connectionId)}`;
+  }
 
   public static enableMockStoreForTesting(enabled: boolean): void {
     useMockStoreForTesting = enabled;
     if (!enabled) {
       inMemoryTestStore.clear();
       inMemoryTestApiKeyStore.clear();
+      inMemoryTestCredentialsStore.clear();
       this.invalidatedUsers.clear();
     }
   }
 
   public static getSessionDocPath(userId: string, connectionId = DEFAULT_CONNECTION_ID): string {
-    return `users/${userId.trim()}/brokerConnections/${connectionId}/runtimeSession/current`;
+    const connId = normalizeAngelOneConnectionId(connectionId);
+    return `users/${userId.trim()}/brokerConnections/${connId}/runtimeSession/current`;
   }
 
   public static getApiKeyDocPath(userId: string, connectionId = DEFAULT_CONNECTION_ID): string {
-    return `users/${userId.trim()}/brokerConnections/${connectionId}/credentials/apiKey`;
+    const connId = normalizeAngelOneConnectionId(connectionId);
+    return `users/${userId.trim()}/brokerConnections/${connId}/credentials/apiKey`;
   }
 
   private static getAdminFirestore(): any {
@@ -80,7 +112,7 @@ export class AngelOneSessionStore {
     const validityHours = options.validityHours || 24;
     const expiryUtc = new Date(now.getTime() + validityHours * 3600 * 1000);
 
-    this.invalidatedUsers.delete(userId.trim());
+    this.invalidatedUsers.delete(this.getUserConnKey(userId, connectionId));
     const encrypted = CryptoService.encrypt(accessToken, userId.trim());
     const docPath = this.getSessionDocPath(userId, connectionId);
 
@@ -159,8 +191,9 @@ export class AngelOneSessionStore {
       return null;
     }
     const trimmedUserId = userId.trim();
+    const connectionId = options.connectionId || DEFAULT_CONNECTION_ID;
     const now = options.evaluationTime || new Date();
-    if (this.invalidatedUsers.has(trimmedUserId)) {
+    if (this.invalidatedUsers.has(this.getUserConnKey(userId, connectionId))) {
       return {
         accessToken: '',
         sessionVersion: 0,
@@ -170,8 +203,6 @@ export class AngelOneSessionStore {
         isExpired: true,
       };
     }
-
-    const connectionId = options.connectionId || DEFAULT_CONNECTION_ID;
     const docPath = this.getSessionDocPath(userId, connectionId);
     let docData: PersistedAngelOneSessionDoc | null = null;
 
@@ -247,7 +278,7 @@ export class AngelOneSessionStore {
     if (!userId || !userId.trim()) {
       return { invalidated: false };
     }
-    this.invalidatedUsers.add(userId.trim());
+    this.invalidatedUsers.add(this.getUserConnKey(userId, connectionId));
     const docPath = this.getSessionDocPath(userId, connectionId);
     const now = new Date().toISOString();
 
@@ -377,14 +408,16 @@ export class AngelOneSessionStore {
     }
 
     if (!docData || !docData.encryptedApiKey) {
-      return null;
+      const fullCreds = await this.loadCredentials(userId, connectionId);
+      return fullCreds ? fullCreds.apiKey : null;
     }
 
     try {
       const apiKey = CryptoService.decrypt(docData.encryptedApiKey, trimmedUserId);
       return apiKey;
     } catch {
-      return null;
+      const fullCreds = await this.loadCredentials(userId, connectionId);
+      return fullCreds ? fullCreds.apiKey : null;
     }
   }
 
@@ -410,9 +443,184 @@ export class AngelOneSessionStore {
       try {
         await db.doc(docPath).delete();
       } catch {}
+    } else {
+      inMemoryTestApiKeyStore.delete(docPath);
+    }
+
+    await this.deleteCredentials(userId, connectionId);
+  }
+
+  /**
+   * Helper to construct Angel One credentials document path:
+   * users/{userId}/brokerConnections/{connectionId}/credentials/angelone
+   */
+  public static getCredentialsDocPath(userId: string, connectionId = DEFAULT_CONNECTION_ID): string {
+    const connId = normalizeAngelOneConnectionId(connectionId);
+    return `users/${userId.trim()}/brokerConnections/${connId}/credentials/angelone`;
+  }
+
+  /**
+   * Encrypts and persists Angel One credentials (apiKey, clientCode, password, totpSecret) per user and connection.
+   */
+  public static async saveCredentials(
+    userId: string,
+    credentials: { apiKey: string; clientCode: string; password: string; totpSecret?: string },
+    connectionId = DEFAULT_CONNECTION_ID
+  ): Promise<void> {
+    if (!userId || !userId.trim()) {
+      throw new Error('UserId is required to save Angel One credentials');
+    }
+    if (!credentials.apiKey || !credentials.apiKey.trim()) {
+      throw new Error('API Key is required to save Angel One credentials');
+    }
+    if (!credentials.clientCode || !credentials.clientCode.trim()) {
+      throw new Error('Client Code is required to save Angel One credentials');
+    }
+    if (!credentials.password || !credentials.password.trim()) {
+      throw new Error('Password is required to save Angel One credentials');
+    }
+
+    const trimmedUserId = userId.trim();
+    const connId = normalizeAngelOneConnectionId(connectionId);
+    const now = new Date().toISOString();
+
+    const encryptedKey = CryptoService.encrypt(credentials.apiKey.trim(), trimmedUserId);
+    const encryptedCode = CryptoService.encrypt(credentials.clientCode.trim(), trimmedUserId);
+    const encryptedPass = CryptoService.encrypt(credentials.password.trim(), trimmedUserId);
+    const encryptedTotp = credentials.totpSecret && credentials.totpSecret.trim()
+      ? CryptoService.encrypt(credentials.totpSecret.trim(), trimmedUserId)
+      : undefined;
+
+    const docPath = this.getCredentialsDocPath(trimmedUserId, connId);
+    const docData: PersistedAngelOneCredentialsDoc = {
+      provider: 'angelone',
+      userId: trimmedUserId,
+      connectionId: connId,
+      encryptedApiKey: {
+        iv: encryptedKey.iv,
+        ciphertext: encryptedKey.ciphertext,
+        tag: encryptedKey.tag,
+        keyVersion: encryptedKey.keyVersion,
+      },
+      encryptedClientCode: {
+        iv: encryptedCode.iv,
+        ciphertext: encryptedCode.ciphertext,
+        tag: encryptedCode.tag,
+        keyVersion: encryptedCode.keyVersion,
+      },
+      encryptedPassword: {
+        iv: encryptedPass.iv,
+        ciphertext: encryptedPass.ciphertext,
+        tag: encryptedPass.tag,
+        keyVersion: encryptedPass.keyVersion,
+      },
+      ...(encryptedTotp ? {
+        encryptedTotpSecret: {
+          iv: encryptedTotp.iv,
+          ciphertext: encryptedTotp.ciphertext,
+          tag: encryptedTotp.tag,
+          keyVersion: encryptedTotp.keyVersion,
+        }
+      } : {}),
+      updatedAt: now,
+    };
+
+    if (!useMockStoreForTesting) {
+      const db = this.getAdminFirestore();
+      if (!db) {
+        throw new Error('Firebase Admin Firestore not initialized');
+      }
+      try {
+        await db.doc(docPath).set(docData, { merge: true });
+      } catch (err: any) {
+        throw new Error(`Failed to save Angel One credentials: ${err?.message || String(err)}`);
+      }
+    } else {
+      inMemoryTestCredentialsStore.set(docPath, docData);
+    }
+
+    // Also synchronize saveApiKey
+    await this.saveApiKey(trimmedUserId, credentials.apiKey.trim(), connId);
+  }
+
+  /**
+   * Loads and decrypts stored Angel One credentials for a given user and connection.
+   */
+  public static async loadCredentials(
+    userId: string,
+    connectionId = DEFAULT_CONNECTION_ID
+  ): Promise<{ apiKey: string; clientCode: string; password: string; totpSecret?: string } | null> {
+    if (!userId || !userId.trim()) {
+      return null;
+    }
+
+    const trimmedUserId = userId.trim();
+    const connId = normalizeAngelOneConnectionId(connectionId);
+    const docPath = this.getCredentialsDocPath(trimmedUserId, connId);
+
+    let docData: PersistedAngelOneCredentialsDoc | null = null;
+
+    if (!useMockStoreForTesting) {
+      const db = this.getAdminFirestore();
+      if (!db) {
+        return null;
+      }
+      try {
+        const snap = await db.doc(docPath).get();
+        if (snap.exists) {
+          docData = snap.data() as PersistedAngelOneCredentialsDoc;
+        }
+      } catch {
+        return null;
+      }
+    } else {
+      docData = inMemoryTestCredentialsStore.get(docPath) || null;
+    }
+
+    if (!docData || !docData.encryptedApiKey || !docData.encryptedClientCode || !docData.encryptedPassword) {
+      return null;
+    }
+
+    try {
+      const apiKey = CryptoService.decrypt(docData.encryptedApiKey, trimmedUserId);
+      const clientCode = CryptoService.decrypt(docData.encryptedClientCode, trimmedUserId);
+      const password = CryptoService.decrypt(docData.encryptedPassword, trimmedUserId);
+      const totpSecret = docData.encryptedTotpSecret
+        ? CryptoService.decrypt(docData.encryptedTotpSecret, trimmedUserId)
+        : undefined;
+
+      return { apiKey, clientCode, password, totpSecret };
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Deletes stored Angel One credentials and invalidates active session for user and connection.
+   */
+  public static async deleteCredentials(
+    userId: string,
+    connectionId = DEFAULT_CONNECTION_ID
+  ): Promise<void> {
+    if (!userId || !userId.trim()) {
       return;
     }
 
-    inMemoryTestApiKeyStore.delete(docPath);
+    const trimmedUserId = userId.trim();
+    const connId = normalizeAngelOneConnectionId(connectionId);
+    const docPath = this.getCredentialsDocPath(trimmedUserId, connId);
+
+    if (!useMockStoreForTesting) {
+      const db = this.getAdminFirestore();
+      if (db) {
+        try {
+          await db.doc(docPath).delete();
+        } catch {}
+      }
+    } else {
+      inMemoryTestCredentialsStore.delete(docPath);
+    }
+
+    await this.invalidateSession(trimmedUserId, undefined, connId);
   }
 }

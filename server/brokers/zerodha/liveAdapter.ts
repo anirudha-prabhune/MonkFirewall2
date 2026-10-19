@@ -83,9 +83,13 @@ export class LiveZerodhaAdapter implements BrokerAdapter {
   /**
    * Retrieves live connection status using server-side credentials and persisted daily session.
    */
-  public async getConnectionStatus(userId = 'default_trader'): Promise<BrokerConnectionStatus> {
+  public async getConnectionStatus(
+    userId = 'default_trader',
+    options: { connectionId?: string } = {}
+  ): Promise<BrokerConnectionStatus> {
+    const connectionId = options.connectionId || 'zerodha';
     const presence = ZerodhaCredentialManager.getPresenceDiagnostic(userId);
-    const { apiKey } = ZerodhaCredentialManager.getCredentials(userId);
+    const { apiKey } = await ZerodhaCredentialManager.getCredentialsForUser(userId, connectionId);
 
     if (!apiKey || apiKey.trim().length === 0) {
       return {
@@ -101,9 +105,9 @@ export class LiveZerodhaAdapter implements BrokerAdapter {
       };
     }
 
-    const authSession = await ZerodhaCredentialManager.getAuthenticatedSession(userId);
+    const authSession = await ZerodhaCredentialManager.getAuthenticatedSession(userId, connectionId);
     if (!authSession) {
-      const persistentCheck = ZerodhaCredentialManager.validatePersistentConfig();
+      const persistentCheck = await ZerodhaCredentialManager.validatePersistentConfigForUser(userId, connectionId);
       if (!persistentCheck.configured) {
         return {
           broker: 'zerodha',
@@ -140,7 +144,7 @@ export class LiveZerodhaAdapter implements BrokerAdapter {
       });
 
       if (response.status === 401 || response.status === 403) {
-        await ZerodhaCredentialManager.handleTokenException(userId, authSession.sessionVersion);
+        await ZerodhaCredentialManager.handleTokenException(userId, authSession.sessionVersion, connectionId);
         return {
           broker: 'zerodha',
           status: 'AUTHENTICATION_ERROR',
@@ -186,7 +190,7 @@ export class LiveZerodhaAdapter implements BrokerAdapter {
         };
       }
 
-      await ZerodhaCredentialManager.handleTokenException(userId, authSession.sessionVersion);
+      await ZerodhaCredentialManager.handleTokenException(userId, authSession.sessionVersion, connectionId);
       return {
         broker: 'zerodha',
         status: 'AUTHENTICATION_ERROR',
@@ -217,18 +221,22 @@ export class LiveZerodhaAdapter implements BrokerAdapter {
   /**
    * Retrieves current positions via Kite Connect /portfolio/positions (READ-ONLY).
    */
-  public async getPositions(userId = 'default_trader'): Promise<RawBrokerPosition[]> {
-    const credCheck = ZerodhaCredentialManager.validatePersistentConfig();
+  public async getPositions(
+    userId = 'default_trader',
+    options: { connectionId?: string } = {}
+  ): Promise<RawBrokerPosition[]> {
+    const connectionId = options.connectionId || 'zerodha';
+    const credCheck = await ZerodhaCredentialManager.validatePersistentConfigForUser(userId, connectionId);
     if (!credCheck.configured) {
       throw new Error(`[LiveZerodhaAdapter] Cannot fetch positions: ${credCheck.error}`);
     }
 
-    const authSession = await ZerodhaCredentialManager.getAuthenticatedSession(userId);
+    const authSession = await ZerodhaCredentialManager.getAuthenticatedSession(userId, connectionId);
     if (!authSession) {
       throw new Error('[LiveZerodhaAdapter] Authentication failure: No active Zerodha access token. Please authenticate via Kite Connect.');
     }
 
-    const { apiKey } = ZerodhaCredentialManager.getCredentials(userId);
+    const { apiKey } = await ZerodhaCredentialManager.getCredentialsForUser(userId, connectionId);
 
     try {
       const response = await this.fetch('https://api.kite.trade/portfolio/positions', {
@@ -318,23 +326,27 @@ export class LiveZerodhaAdapter implements BrokerAdapter {
   /**
    * Retrieves and validates live instrument master records.
    */
-  public async getInstruments(userId = 'default_trader'): Promise<BrokerInstrument[]> {
+  public async getInstruments(
+    userId = 'default_trader',
+    options: { connectionId?: string } = {}
+  ): Promise<BrokerInstrument[]> {
+    const connectionId = options.connectionId || 'zerodha';
     const now = Date.now();
     if (this.cachedInstruments && now - this.instrumentCacheTimestamp < this.INSTRUMENT_CACHE_TTL_MS) {
       return this.cachedInstruments;
     }
 
-    const credCheck = ZerodhaCredentialManager.validatePersistentConfig();
+    const credCheck = await ZerodhaCredentialManager.validatePersistentConfigForUser(userId, connectionId);
     if (!credCheck.configured) {
       throw new Error(`[LiveZerodhaAdapter] Cannot fetch instruments: ${credCheck.error}`);
     }
 
-    const authSession = await ZerodhaCredentialManager.getAuthenticatedSession(userId);
+    const authSession = await ZerodhaCredentialManager.getAuthenticatedSession(userId, connectionId);
     if (!authSession) {
       throw new Error('[LiveZerodhaAdapter] Authentication failure: No active Zerodha access token. Please authenticate via Kite Connect.');
     }
 
-    const { apiKey } = ZerodhaCredentialManager.getCredentials(userId);
+    const { apiKey } = await ZerodhaCredentialManager.getCredentialsForUser(userId, connectionId);
 
     try {
       const response = await this.fetch('https://api.kite.trade/instruments', {
@@ -346,7 +358,7 @@ export class LiveZerodhaAdapter implements BrokerAdapter {
       });
 
       if (response.status === 401 || response.status === 403) {
-        await ZerodhaCredentialManager.handleTokenException(userId, authSession.sessionVersion);
+        await ZerodhaCredentialManager.handleTokenException(userId, authSession.sessionVersion, connectionId);
         throw new Error('[LiveZerodhaAdapter] Authentication failure: Invalid or expired access token. Please re-authenticate.');
       }
 
@@ -426,8 +438,13 @@ export class LiveZerodhaAdapter implements BrokerAdapter {
    * Retrieves instantaneous read-only LTP snapshot for a single F&O instrument (Phase 8A).
    * Strictly read-only: No orders, no risk mutation, no credentials exposed.
    */
-  public async getLtpSnapshot(instrumentToken: number, userId = 'default_trader'): Promise<LtpSnapshotResult> {
-    const instruments = await this.getInstruments(userId);
+  public async getLtpSnapshot(
+    instrumentToken: number,
+    userId = 'default_trader',
+    options: { connectionId?: string } = {}
+  ): Promise<LtpSnapshotResult> {
+    const connectionId = options.connectionId || 'zerodha';
+    const instruments = await this.getInstruments(userId, { connectionId });
     const instrument = instruments.find((i) => i.instrumentToken === instrumentToken);
 
     if (!instrument) {
@@ -439,17 +456,17 @@ export class LiveZerodhaAdapter implements BrokerAdapter {
       throw new Error(`[LiveZerodhaAdapter] Non-F&O instrument rejected: ${instrument.tradingsymbol} (${instrument.segment})`);
     }
 
-    const credCheck = ZerodhaCredentialManager.validatePersistentConfig();
+    const credCheck = await ZerodhaCredentialManager.validatePersistentConfigForUser(userId, connectionId);
     if (!credCheck.configured) {
       throw new Error(`[LiveZerodhaAdapter] Cannot fetch LTP snapshot: ${credCheck.error}`);
     }
 
-    const authSession = await ZerodhaCredentialManager.getAuthenticatedSession(userId);
+    const authSession = await ZerodhaCredentialManager.getAuthenticatedSession(userId, connectionId);
     if (!authSession) {
       throw new Error('[LiveZerodhaAdapter] Authentication failure: Missing or expired Zerodha session token.');
     }
 
-    const { apiKey } = ZerodhaCredentialManager.getCredentials(userId);
+    const { apiKey } = await ZerodhaCredentialManager.getCredentialsForUser(userId, connectionId);
     const queryParam = `${instrument.exchange}:${instrument.tradingsymbol}`;
 
     try {
@@ -463,7 +480,7 @@ export class LiveZerodhaAdapter implements BrokerAdapter {
       });
 
       if (response.status === 401 || response.status === 403) {
-        await ZerodhaCredentialManager.handleTokenException(userId, authSession.sessionVersion);
+        await ZerodhaCredentialManager.handleTokenException(userId, authSession.sessionVersion, connectionId);
         throw new Error('[LiveZerodhaAdapter] Authentication failure: Invalid or expired access token (HTTP 403 TokenException).');
       }
 
@@ -527,8 +544,12 @@ export class LiveZerodhaAdapter implements BrokerAdapter {
     }
   }
 
-  public async getCapital(userId = 'default_trader'): Promise<BrokerAccountCapital> {
-    const status = await this.getConnectionStatus(userId);
+  public async getCapital(
+    userId = 'default_trader',
+    options: { connectionId?: string } = {}
+  ): Promise<BrokerAccountCapital> {
+    const connectionId = options.connectionId || 'zerodha';
+    const status = await this.getConnectionStatus(userId, { connectionId });
     const isAfterHours = checkIsAfterHours();
 
     if (status.status !== 'AUTHENTICATED' && status.status !== 'CONNECTED') {
@@ -549,7 +570,7 @@ export class LiveZerodhaAdapter implements BrokerAdapter {
       };
     }
 
-    const authSession = await ZerodhaCredentialManager.getAuthenticatedSession(userId);
+    const authSession = await ZerodhaCredentialManager.getAuthenticatedSession(userId, connectionId);
     if (!authSession || !authSession.accessToken) {
       return {
         broker: 'zerodha',
@@ -568,7 +589,7 @@ export class LiveZerodhaAdapter implements BrokerAdapter {
       };
     }
 
-    const { apiKey } = ZerodhaCredentialManager.getCredentials(userId);
+    const { apiKey } = await ZerodhaCredentialManager.getCredentialsForUser(userId, connectionId);
 
     try {
       const response = await this.fetch('https://api.kite.trade/user/margins', {

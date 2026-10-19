@@ -119,10 +119,14 @@ export async function disconnectZerodhaSession(userId?: string): Promise<boolean
   }
 }
 
-export async function fetchAngelOneStatus(userId?: string): Promise<LiveBrokerStatusResponse | null> {
+export async function fetchAngelOneStatus(userId?: string, accountId?: string): Promise<LiveBrokerStatusResponse | null> {
   try {
-    const headers = await getAuthHeaders(userId ? { 'x-user-id': userId } : {});
-    const res = await fetch('/api/broker/angelone/live/status', { headers });
+    const customHeaders: Record<string, string> = {};
+    if (userId) customHeaders['x-user-id'] = userId;
+    if (accountId) customHeaders['x-account-id'] = accountId;
+    const headers = await getAuthHeaders(customHeaders);
+    const query = accountId ? `?accountId=${encodeURIComponent(accountId)}` : '';
+    const res = await fetch(`/api/broker/angelone/live/status${query}`, { headers });
     if (res.ok) {
       return await res.json();
     }

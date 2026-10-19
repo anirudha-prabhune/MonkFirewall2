@@ -10,11 +10,13 @@ import { MarketDataService } from './market/marketDataService';
 import { LivePnlValidationService } from './pnl/liveValidationService';
 import { ValidationSessionManager } from './pnl/validationSession';
 import { ZerodhaCredentialManager } from './brokers/zerodha/credentials';
+import { ZerodhaSessionStore } from './brokers/zerodha/sessionStore';
 import { liveZerodhaAdapter } from './brokers/zerodha/liveAdapter';
 import { mockZerodhaAdapter } from './brokers/mock/adapter';
 import { liveAngelOneAdapter } from './brokers/angelone/liveAdapter';
 import { mockAngelOneAdapter } from './brokers/angelone/adapter';
-import { AngelOneSessionStore } from './brokers/angelone/sessionStore';
+import { AngelOneSessionStore, normalizeAngelOneConnectionId } from './brokers/angelone/sessionStore';
+import { DEFAULT_ANGELONE_ACCOUNT_ID } from '../src/types/risk';
 import { normalizePositions } from './brokers/normalize';
 import { BrokerInstrument, LivePositionsResponse } from './brokers/types';
 import { ShadowRiskService } from './risk/shadowRiskService';
@@ -112,11 +114,11 @@ apiRouter.get('/positions/fno', async (req: Request, res: Response) => {
     const isAngelOne = (accountId && (accountId === 'acc_mt_angelone_default' || accountId.includes('angelone'))) || req.query?.broker === 'angelone' || req.headers['x-broker'] === 'angelone';
 
     if (isAngelOne) {
-      const connStatus = await liveAngelOneAdapter.getConnectionStatus(userId);
+      const connStatus = await liveAngelOneAdapter.getConnectionStatus(userId, { connectionId: accountId });
       const isAngelConnected = connStatus.authenticated === true && (connStatus.status === 'CONNECTED' || connStatus.status === 'AUTHENTICATED');
       if (isAngelConnected) {
         try {
-          const rawPositions = await liveAngelOneAdapter.getPositions(userId);
+          const rawPositions = await liveAngelOneAdapter.getPositions(userId, { connectionId: accountId });
           const instruments = await liveAngelOneAdapter.getInstruments(userId);
           const instrumentMap = new Map<number, BrokerInstrument>(instruments.map((i: BrokerInstrument) => [i.instrumentToken, i]));
           const normalized = normalizePositions(rawPositions, instrumentMap, 'ANGELONE_LIVE');
@@ -392,7 +394,7 @@ apiRouter.get('/broker/live/positions', async (req: Request, res: Response) => {
     const isAngelOne = (accountId && (accountId === 'acc_mt_angelone_default' || accountId.includes('angelone'))) || req.query?.broker === 'angelone' || req.headers['x-broker'] === 'angelone';
 
     if (isAngelOne) {
-      const status = await liveAngelOneAdapter.getConnectionStatus(userId);
+      const status = await liveAngelOneAdapter.getConnectionStatus(userId, { connectionId: accountId });
       if (status.status !== 'AUTHENTICATED' && status.status !== 'CONNECTED') {
         return sendJson(res, {
           broker: 'angelone',
@@ -406,7 +408,7 @@ apiRouter.get('/broker/live/positions', async (req: Request, res: Response) => {
         });
       }
       try {
-        const rawPositions = await liveAngelOneAdapter.getPositions(userId);
+        const rawPositions = await liveAngelOneAdapter.getPositions(userId, { connectionId: accountId });
         const instruments = await liveAngelOneAdapter.getInstruments(userId);
         const instrumentMap = new Map<number, BrokerInstrument>(instruments.map((i: BrokerInstrument) => [i.instrumentToken, i]));
         const normalized = normalizePositions(rawPositions, instrumentMap, 'ANGELONE_LIVE');
@@ -424,7 +426,7 @@ apiRouter.get('/broker/live/positions', async (req: Request, res: Response) => {
         return sendJson(res, response);
       } catch (posErr: any) {
         console.info('[AngelOne] Live diagnostic positions unavailable:', posErr?.message || posErr);
-        const updatedStatus = await liveAngelOneAdapter.getConnectionStatus(userId);
+        const updatedStatus = await liveAngelOneAdapter.getConnectionStatus(userId, { connectionId: accountId });
         return sendJson(res, {
           broker: 'angelone',
           connectionStatus: updatedStatus.status,
@@ -458,7 +460,7 @@ apiRouter.get('/broker/live/capital', async (req: Request, res: Response) => {
     const capital = isExplicitMock
       ? await mockZerodhaAdapter.getCapital()
       : isAngelOne
-      ? await liveAngelOneAdapter.getCapital(userId)
+      ? await liveAngelOneAdapter.getCapital(userId, { connectionId: accountId })
       : await liveZerodhaAdapter.getCapital(userId);
 
     sendJson(res, {
@@ -486,7 +488,8 @@ apiRouter.get('/broker/angelone/live/status', async (req: Request, res: Response
   try {
     const userId = (req as any).userId || await authenticateRequest(req, res);
     if (!userId) return;
-    const status = await liveAngelOneAdapter.getConnectionStatus(userId);
+    const accountId = (req.query?.accountId as string) || (req.headers['x-account-id'] as string) || undefined;
+    const status = await liveAngelOneAdapter.getConnectionStatus(userId, { connectionId: accountId });
     sendJson(res, status);
   } catch (err) {
     sendJson(res, { error: err instanceof Error ? err.message : 'Failed to retrieve Angel One status' }, 500);
@@ -497,7 +500,8 @@ apiRouter.get('/broker/angelone/live/positions', async (req: Request, res: Respo
   try {
     const userId = (req as any).userId || await authenticateRequest(req, res);
     if (!userId) return;
-    const status = await liveAngelOneAdapter.getConnectionStatus(userId);
+    const accountId = (req.query?.accountId as string) || (req.headers['x-account-id'] as string) || undefined;
+    const status = await liveAngelOneAdapter.getConnectionStatus(userId, { connectionId: accountId });
     if (status.status !== 'AUTHENTICATED' && status.status !== 'CONNECTED') {
       return sendJson(res, {
         broker: 'angelone',
@@ -511,7 +515,7 @@ apiRouter.get('/broker/angelone/live/positions', async (req: Request, res: Respo
       });
     }
     try {
-      const rawPositions = await liveAngelOneAdapter.getPositions(userId);
+      const rawPositions = await liveAngelOneAdapter.getPositions(userId, { connectionId: accountId });
       const instruments = await liveAngelOneAdapter.getInstruments(userId);
       const instrumentMap = new Map<number, BrokerInstrument>(instruments.map((i: BrokerInstrument) => [i.instrumentToken, i]));
       const normalized = normalizePositions(rawPositions, instrumentMap, 'ANGELONE_LIVE');
@@ -529,7 +533,7 @@ apiRouter.get('/broker/angelone/live/positions', async (req: Request, res: Respo
       sendJson(res, response);
     } catch (posErr: any) {
       console.info('[AngelOne] Live positions unavailable:', posErr?.message || posErr);
-      const updatedStatus = await liveAngelOneAdapter.getConnectionStatus(userId);
+      const updatedStatus = await liveAngelOneAdapter.getConnectionStatus(userId, { connectionId: accountId });
       sendJson(res, {
         broker: 'angelone',
         connectionStatus: updatedStatus.status,
@@ -550,7 +554,8 @@ apiRouter.get('/broker/angelone/live/capital', async (req: Request, res: Respons
   try {
     const userId = (req as any).userId || await authenticateRequest(req, res);
     if (!userId) return;
-    const capital = await liveAngelOneAdapter.getCapital(userId);
+    const accountId = (req.query?.accountId as string) || (req.headers['x-account-id'] as string) || undefined;
+    const capital = await liveAngelOneAdapter.getCapital(userId, { connectionId: accountId });
     sendJson(res, {
       success: true,
       broker: 'angelone',
@@ -574,14 +579,21 @@ apiRouter.post('/broker/angelone/live/auth/session', async (req: Request, res: R
     if (!userId) return;
 
     // Never accept client-supplied accessToken as proof of authentication
-    const { clientCode, password, totp, apiKey } = req.body || {};
+    const { clientCode, password, totp, apiKey, accountId, connectionId } = req.body || {};
+    const targetAccountId = accountId || connectionId || (req.headers['x-account-id'] as string) || undefined;
 
-    const authResult = await liveAngelOneAdapter.authenticate(userId, {
-      clientCode,
-      password,
-      totp,
-      apiKey,
-    });
+    const authResult = await liveAngelOneAdapter.authenticate(
+      userId,
+      {
+        clientCode,
+        password,
+        totp,
+        apiKey,
+      },
+      {
+        connectionId: targetAccountId,
+      }
+    );
 
     if (!authResult.success) {
       return sendJson(
@@ -619,12 +631,246 @@ apiRouter.post('/broker/angelone/live/auth/disconnect', async (req: Request, res
   try {
     const userId = (req as any).userId || await authenticateRequest(req, res);
     if (!userId) return;
-    await AngelOneSessionStore.invalidateSession(userId);
+    const accountId = (req.body?.accountId as string) || (req.query?.accountId as string) || (req.headers['x-account-id'] as string) || undefined;
+    await AngelOneSessionStore.invalidateSession(userId, undefined, accountId);
     sendJson(res, { success: true, status: 'AUTHENTICATION_REQUIRED', message: 'Angel One session invalidated.' });
   } catch (err) {
     sendJson(res, { error: err instanceof Error ? err.message : 'Failed to disconnect Angel One session' }, 500);
   }
 });
+
+// ============================================================================
+// UNIFIED BROKER ONBOARDING & CREDENTIAL MANAGEMENT (MONKFIREWALL2)
+// ============================================================================
+
+// Save/Onboard Broker Credentials: POST & PUT /api/broker/credentials & /api/broker/:broker/credentials
+const handleSaveCredentials = async (req: Request, res: Response) => {
+  try {
+    const userId = (req as any).userId || await authenticateRequest(req, res);
+    if (!userId) return;
+
+    const paramBroker = (req.params.broker || req.body?.broker || '').toLowerCase();
+    const accountId = (req.body?.accountId as string) || (req.body?.connectionId as string) || (req.query?.accountId as string) || (req.headers['x-account-id'] as string) || undefined;
+
+    if (paramBroker === 'zerodha') {
+      const { apiKey, apiSecret } = req.body || {};
+      if (!apiKey || !apiKey.trim() || !apiSecret || !apiSecret.trim()) {
+        return sendJson(res, { success: false, error: 'Both Zerodha API Key and API Secret are required.' }, 400);
+      }
+      const connectionId = accountId || 'zerodha';
+      await ZerodhaSessionStore.saveCredentials(userId, { apiKey: apiKey.trim(), apiSecret: apiSecret.trim() }, connectionId);
+      const diagnostic = ZerodhaCredentialManager.getPresenceDiagnostic(userId);
+      return sendJson(res, {
+        success: true,
+        broker: 'zerodha',
+        connectionId,
+        configured: true,
+        credentials: diagnostic,
+        message: 'Zerodha credentials encrypted and stored successfully.',
+      });
+    } else if (paramBroker === 'angelone') {
+      const { apiKey, clientCode, password, totpSecret } = req.body || {};
+      if (!apiKey || !apiKey.trim() || !clientCode || !clientCode.trim() || !password || !password.trim()) {
+        return sendJson(res, { success: false, error: 'Angel One API Key, Client Code, and Password are required.' }, 400);
+      }
+      const connectionId = accountId || DEFAULT_ANGELONE_ACCOUNT_ID;
+      await AngelOneSessionStore.saveCredentials(
+        userId,
+        {
+          apiKey: apiKey.trim(),
+          clientCode: clientCode.trim(),
+          password: password.trim(),
+          ...(totpSecret && totpSecret.trim() ? { totpSecret: totpSecret.trim() } : {}),
+        },
+        connectionId
+      );
+      const status = await liveAngelOneAdapter.getConnectionStatus(userId, { connectionId });
+      return sendJson(res, {
+        success: true,
+        broker: 'angelone',
+        connectionId,
+        configured: true,
+        credentials: {
+          apiKeyConfigured: true,
+          clientCodeConfigured: true,
+          passwordConfigured: true,
+          totpSecretConfigured: Boolean(totpSecret && totpSecret.trim()),
+        },
+        connectionStatus: status.status,
+        message: 'Angel One credentials encrypted and stored successfully.',
+      });
+    } else {
+      return sendJson(res, { success: false, error: 'Invalid broker specified. Supported brokers: zerodha, angelone.' }, 400);
+    }
+  } catch (err: any) {
+    sendJson(res, { success: false, error: ZerodhaCredentialManager.sanitizeErrorString(err?.message || 'Failed to save broker credentials') }, 500);
+  }
+};
+
+apiRouter.post('/broker/credentials', handleSaveCredentials);
+apiRouter.put('/broker/credentials', handleSaveCredentials);
+apiRouter.post('/broker/:broker/credentials', handleSaveCredentials);
+apiRouter.put('/broker/:broker/credentials', handleSaveCredentials);
+
+// Get Broker Credential Status: GET /api/broker/credentials & /api/broker/:broker/credentials
+const handleGetCredentials = async (req: Request, res: Response) => {
+  try {
+    const userId = (req as any).userId || await authenticateRequest(req, res);
+    if (!userId) return;
+
+    const rawParam = req.params.broker || req.query?.broker || '';
+    const paramBroker = (Array.isArray(rawParam) ? String(rawParam[0]) : String(rawParam)).toLowerCase();
+    const accountId = (req.query?.accountId as string) || (req.headers['x-account-id'] as string) || undefined;
+
+    if (!paramBroker || paramBroker === 'all') {
+      const zerodhaCreds = await ZerodhaSessionStore.loadCredentials(userId, accountId || 'zerodha');
+      const angelCreds = await AngelOneSessionStore.loadCredentials(userId, accountId || DEFAULT_ANGELONE_ACCOUNT_ID);
+      const zerodhaStatus = await liveZerodhaAdapter.getConnectionStatus(userId, { connectionId: accountId || 'zerodha' });
+      const angelStatus = await liveAngelOneAdapter.getConnectionStatus(userId, { connectionId: accountId || DEFAULT_ANGELONE_ACCOUNT_ID });
+
+      return sendJson(res, {
+        userId,
+        zerodha: {
+          configured: Boolean(zerodhaCreds || process.env.ZERODHA_API_KEY),
+          connectionStatus: zerodhaStatus.status,
+          diagnostic: ZerodhaCredentialManager.getPresenceDiagnostic(userId),
+        },
+        angelone: {
+          configured: Boolean(angelCreds),
+          connectionStatus: angelStatus.status,
+          diagnostic: {
+            apiKeyConfigured: Boolean(angelCreds?.apiKey),
+            clientCodeConfigured: Boolean(angelCreds?.clientCode),
+            passwordConfigured: Boolean(angelCreds?.password),
+            totpSecretConfigured: Boolean(angelCreds?.totpSecret),
+          },
+        },
+      });
+    }
+
+    if (paramBroker === 'zerodha') {
+      const connId = accountId || 'zerodha';
+      const zerodhaCreds = await ZerodhaSessionStore.loadCredentials(userId, connId);
+      const zerodhaStatus = await liveZerodhaAdapter.getConnectionStatus(userId, { connectionId: connId });
+      return sendJson(res, {
+        broker: 'zerodha',
+        connectionId: connId,
+        configured: Boolean(zerodhaCreds || process.env.ZERODHA_API_KEY),
+        connectionStatus: zerodhaStatus.status,
+        diagnostic: ZerodhaCredentialManager.getPresenceDiagnostic(userId),
+      });
+    } else if (paramBroker === 'angelone') {
+      const connId = accountId || DEFAULT_ANGELONE_ACCOUNT_ID;
+      const angelCreds = await AngelOneSessionStore.loadCredentials(userId, connId);
+      const angelStatus = await liveAngelOneAdapter.getConnectionStatus(userId, { connectionId: connId });
+      return sendJson(res, {
+        broker: 'angelone',
+        connectionId: connId,
+        configured: Boolean(angelCreds),
+        connectionStatus: angelStatus.status,
+        diagnostic: {
+          apiKeyConfigured: Boolean(angelCreds?.apiKey),
+          clientCodeConfigured: Boolean(angelCreds?.clientCode),
+          passwordConfigured: Boolean(angelCreds?.password),
+          totpSecretConfigured: Boolean(angelCreds?.totpSecret),
+        },
+      });
+    } else {
+      return sendJson(res, { success: false, error: 'Invalid broker specified. Supported brokers: zerodha, angelone.' }, 400);
+    }
+  } catch (err: any) {
+    sendJson(res, { error: err?.message || 'Failed to retrieve credential status' }, 500);
+  }
+};
+
+apiRouter.get('/broker/credentials', handleGetCredentials);
+apiRouter.get('/broker/:broker/credentials', handleGetCredentials);
+
+// Delete Broker Credentials: DELETE /api/broker/credentials & /api/broker/:broker/credentials
+const handleDeleteCredentials = async (req: Request, res: Response) => {
+  try {
+    const userId = (req as any).userId || await authenticateRequest(req, res);
+    if (!userId) return;
+
+    const paramBroker = (req.params.broker || req.body?.broker || req.query?.broker || '').toLowerCase();
+    const accountId = (req.body?.accountId as string) || (req.query?.accountId as string) || (req.headers['x-account-id'] as string) || undefined;
+
+    if (paramBroker === 'zerodha') {
+      const connId = accountId || 'zerodha';
+      await ZerodhaSessionStore.deleteCredentials(userId, connId);
+      return sendJson(res, {
+        success: true,
+        broker: 'zerodha',
+        connectionId: connId,
+        configured: false,
+        message: 'Zerodha credentials removed and runtime session invalidated.',
+      });
+    } else if (paramBroker === 'angelone') {
+      const connId = accountId || DEFAULT_ANGELONE_ACCOUNT_ID;
+      await AngelOneSessionStore.deleteCredentials(userId, connId);
+      return sendJson(res, {
+        success: true,
+        broker: 'angelone',
+        connectionId: connId,
+        configured: false,
+        message: 'Angel One credentials removed and runtime session invalidated.',
+      });
+    } else {
+      return sendJson(res, { success: false, error: 'Invalid broker specified. Supported brokers: zerodha, angelone.' }, 400);
+    }
+  } catch (err: any) {
+    sendJson(res, { error: err?.message || 'Failed to remove credentials' }, 500);
+  }
+};
+
+apiRouter.delete('/broker/credentials', handleDeleteCredentials);
+apiRouter.delete('/broker/:broker/credentials', handleDeleteCredentials);
+
+// Reconnect / Authenticate Broker Session: POST /api/broker/:broker/reconnect & /api/broker/:broker/connect
+const handleReconnectBroker = async (req: Request, res: Response) => {
+  try {
+    const userId = (req as any).userId || await authenticateRequest(req, res);
+    if (!userId) return;
+
+    const paramBroker = (req.params.broker || req.body?.broker || '').toLowerCase();
+    const accountId = (req.body?.accountId as string) || (req.query?.accountId as string) || (req.headers['x-account-id'] as string) || undefined;
+
+    if (paramBroker === 'zerodha') {
+      const connId = accountId || 'zerodha';
+      const redirectUrl = (req.body?.redirect_url || req.query?.redirect_url) as string | undefined;
+      const loginRes = await ZerodhaCredentialManager.getLoginUrlWithStateForUser(redirectUrl, userId, connId);
+      return sendJson(res, {
+        success: true,
+        broker: 'zerodha',
+        connectionId: connId,
+        loginUrl: loginRes.url,
+        state: loginRes.state,
+      });
+    } else if (paramBroker === 'angelone') {
+      const connId = accountId || DEFAULT_ANGELONE_ACCOUNT_ID;
+      const authResult = await liveAngelOneAdapter.authenticate(userId, req.body || {}, { connectionId: connId });
+      if (!authResult.success) {
+        return sendJson(res, { success: false, broker: 'angelone', error: authResult.error }, 401);
+      }
+      return sendJson(res, {
+        success: true,
+        broker: 'angelone',
+        connectionId: connId,
+        status: 'AUTHENTICATED',
+        sessionVersion: authResult.session?.sessionVersion,
+        expiresAt: authResult.session?.expiresAt,
+      });
+    } else {
+      return sendJson(res, { success: false, error: 'Invalid broker specified.' }, 400);
+    }
+  } catch (err: any) {
+    sendJson(res, { error: ZerodhaCredentialManager.sanitizeErrorString(err?.message || 'Failed to reconnect broker session') }, 500);
+  }
+};
+
+apiRouter.post('/broker/reconnect', handleReconnectBroker);
+apiRouter.post('/broker/:broker/reconnect', handleReconnectBroker);
+apiRouter.post('/broker/:broker/connect', handleReconnectBroker);
 
 // GET /api/broker/live/market-data/status - Phase 7 Read-Only Market Data Feed Status
 apiRouter.get('/broker/live/market-data/status', async (req: Request, res: Response) => {
@@ -685,11 +931,11 @@ apiRouter.get('/pnl', async (req: Request, res: Response) => {
     const isAngelOne = (accountId && (accountId === 'acc_mt_angelone_default' || accountId.includes('angelone'))) || req.query?.broker === 'angelone' || req.headers['x-broker'] === 'angelone';
 
     if (isAngelOne) {
-      const connStatus = await liveAngelOneAdapter.getConnectionStatus(userId);
+      const connStatus = await liveAngelOneAdapter.getConnectionStatus(userId, { connectionId: accountId });
       const isAngelConnected = connStatus.authenticated === true && (connStatus.status === 'CONNECTED' || connStatus.status === 'AUTHENTICATED');
       if (isAngelConnected) {
         try {
-          const rawPositions = await liveAngelOneAdapter.getPositions(userId);
+          const rawPositions = await liveAngelOneAdapter.getPositions(userId, { connectionId: accountId });
           const instruments = await liveAngelOneAdapter.getInstruments(userId);
           const instrumentMap = new Map<number, BrokerInstrument>(instruments.map((i: BrokerInstrument) => [i.instrumentToken, i]));
           const normalized = normalizePositions(rawPositions, instrumentMap, 'ANGELONE_LIVE');
@@ -730,7 +976,7 @@ apiRouter.get('/pnl', async (req: Request, res: Response) => {
       }
 
       // Angel One is not connected or not authenticated - return explicit disconnected state without Zerodha leakage
-      const latestConnStatus = await liveAngelOneAdapter.getConnectionStatus(userId);
+      const latestConnStatus = await liveAngelOneAdapter.getConnectionStatus(userId, { connectionId: accountId });
       const accountSession = await ServerRiskStore.getSession(userId, undefined, accountId);
       return sendJson(res, {
         tradingDate: getTradingDateKolkata(),

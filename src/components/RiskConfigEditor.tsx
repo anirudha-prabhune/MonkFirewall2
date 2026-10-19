@@ -88,7 +88,7 @@ export const RiskConfigEditor: React.FC<RiskConfigEditorProps> = ({
     activeAccountId.includes('angelone') ||
     formData.broker === 'angelone';
   const brokerName = isAngelOne ? 'Angel One' : 'Zerodha';
-  const executionMode = formData.executionMode || (isAngelOne ? 'OBSERVE_ONLY' : 'ENFORCE');
+  const executionMode = formData.executionMode || 'ENFORCE';
 
   // Load connected accounts if not provided as props
   useEffect(() => {
@@ -143,9 +143,7 @@ export const RiskConfigEditor: React.FC<RiskConfigEditorProps> = ({
             broker: (targetAccountId === DEFAULT_ANGELONE_ACCOUNT_ID || targetAccountId.includes('angelone'))
               ? 'angelone'
               : 'zerodha',
-            executionMode: (targetAccountId === DEFAULT_ANGELONE_ACCOUNT_ID || targetAccountId.includes('angelone'))
-              ? 'OBSERVE_ONLY'
-              : (loaded.executionMode || 'ENFORCE'),
+            executionMode: loaded.executionMode || 'ENFORCE',
           });
         }
       } catch (err) {
@@ -225,7 +223,7 @@ export const RiskConfigEditor: React.FC<RiskConfigEditorProps> = ({
         ...formData,
         accountId: targetAccountId,
         broker: isAngelOne ? 'angelone' : 'zerodha',
-        executionMode: formData.executionMode || (isAngelOne ? 'OBSERVE_ONLY' : 'ENFORCE'),
+        executionMode: formData.executionMode || 'ENFORCE',
       };
 
       const saved = await saveRiskConfig(user.uid, payload, targetAccountId);
