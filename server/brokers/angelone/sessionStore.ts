@@ -44,9 +44,9 @@ export interface PersistedAngelOneCredentialsDoc {
 
 const DEFAULT_CONNECTION_ID = DEFAULT_ANGELONE_ACCOUNT_ID; // 'acc_mt_angelone_default'
 let useMockStoreForTesting = false;
-const inMemoryTestStore = new Map<string, PersistedAngelOneSessionDoc>();
-const inMemoryTestApiKeyStore = new Map<string, PersistedAngelOneApiKeyDoc>();
-const inMemoryTestCredentialsStore = new Map<string, PersistedAngelOneCredentialsDoc>();
+export const inMemoryTestStore = new Map<string, PersistedAngelOneSessionDoc>();
+export const inMemoryTestApiKeyStore = new Map<string, PersistedAngelOneApiKeyDoc>();
+export const inMemoryTestCredentialsStore = new Map<string, PersistedAngelOneCredentialsDoc>();
 
 export function normalizeAngelOneConnectionId(connectionId?: string): string {
   if (
@@ -107,14 +107,14 @@ export class AngelOneSessionStore {
       throw new Error('Access token is required to persist Angel One session');
     }
 
-    const connectionId = options.connectionId || DEFAULT_CONNECTION_ID;
+    const connId = normalizeAngelOneConnectionId(options.connectionId);
     const now = new Date();
     const validityHours = options.validityHours || 24;
     const expiryUtc = new Date(now.getTime() + validityHours * 3600 * 1000);
 
-    this.invalidatedUsers.delete(this.getUserConnKey(userId, connectionId));
-    const encrypted = CryptoService.encrypt(accessToken, userId.trim(), 'angelone', connectionId);
-    const docPath = this.getSessionDocPath(userId, connectionId);
+    this.invalidatedUsers.delete(this.getUserConnKey(userId, connId));
+    const encrypted = CryptoService.encrypt(accessToken, userId.trim(), 'angelone', connId);
+    const docPath = this.getSessionDocPath(userId, connId);
 
     if (!useMockStoreForTesting) {
       const db = this.getAdminFirestore();
@@ -191,9 +191,9 @@ export class AngelOneSessionStore {
       return null;
     }
     const trimmedUserId = userId.trim();
-    const connectionId = options.connectionId || DEFAULT_CONNECTION_ID;
+    const connId = normalizeAngelOneConnectionId(options.connectionId);
     const now = options.evaluationTime || new Date();
-    if (this.invalidatedUsers.has(this.getUserConnKey(userId, connectionId))) {
+    if (this.invalidatedUsers.has(this.getUserConnKey(userId, connId))) {
       return {
         accessToken: '',
         sessionVersion: 0,
@@ -203,7 +203,7 @@ export class AngelOneSessionStore {
         isExpired: true,
       };
     }
-    const docPath = this.getSessionDocPath(userId, connectionId);
+    const docPath = this.getSessionDocPath(userId, connId);
     let docData: PersistedAngelOneSessionDoc | null = null;
 
     if (!useMockStoreForTesting) {
@@ -241,7 +241,7 @@ export class AngelOneSessionStore {
 
     const expiresAtDate = new Date(docData.expiresAt);
     if (isNaN(expiresAtDate.getTime()) || now.getTime() >= expiresAtDate.getTime()) {
-      await this.invalidateSession(userId, docData.sessionVersion, connectionId);
+      await this.invalidateSession(userId, docData.sessionVersion, connId);
       return {
         accessToken: '',
         sessionVersion: docData.sessionVersion,
@@ -254,7 +254,16 @@ export class AngelOneSessionStore {
     }
 
     try {
-      const accessToken = CryptoService.decrypt(docData.encryptedToken, userId.trim());
+      let accessToken: string;
+      try {
+        accessToken = CryptoService.decrypt(docData.encryptedToken, trimmedUserId, 'angelone', connId);
+      } catch {
+        try {
+          accessToken = CryptoService.decrypt(docData.encryptedToken, trimmedUserId, 'zerodha', connId);
+        } catch {
+          accessToken = CryptoService.decrypt(docData.encryptedToken, trimmedUserId, 'zerodha');
+        }
+      }
       return {
         accessToken,
         sessionVersion: docData.sessionVersion,
@@ -265,7 +274,7 @@ export class AngelOneSessionStore {
         isExpired: false,
       };
     } catch {
-      await this.invalidateSession(userId, docData.sessionVersion, connectionId);
+      await this.invalidateSession(userId, docData.sessionVersion, connId);
       return null;
     }
   }
@@ -278,8 +287,9 @@ export class AngelOneSessionStore {
     if (!userId || !userId.trim()) {
       return { invalidated: false };
     }
-    this.invalidatedUsers.add(this.getUserConnKey(userId, connectionId));
-    const docPath = this.getSessionDocPath(userId, connectionId);
+    const connId = normalizeAngelOneConnectionId(connectionId);
+    this.invalidatedUsers.add(this.getUserConnKey(userId, connId));
+    const docPath = this.getSessionDocPath(userId, connId);
     const now = new Date().toISOString();
 
     if (!useMockStoreForTesting) {
@@ -343,9 +353,10 @@ export class AngelOneSessionStore {
 
     const trimmedUserId = userId.trim();
     const trimmedApiKey = apiKey.trim();
+    const connId = normalizeAngelOneConnectionId(connectionId);
     const now = new Date().toISOString();
-    const encrypted = CryptoService.encrypt(trimmedApiKey, trimmedUserId);
-    const docPath = this.getApiKeyDocPath(trimmedUserId, connectionId);
+    const encrypted = CryptoService.encrypt(trimmedApiKey, trimmedUserId, 'angelone', connId);
+    const docPath = this.getApiKeyDocPath(trimmedUserId, connId);
 
     const docData: PersistedAngelOneApiKeyDoc = {
       provider: 'angelone',
@@ -387,7 +398,8 @@ export class AngelOneSessionStore {
     }
 
     const trimmedUserId = userId.trim();
-    const docPath = this.getApiKeyDocPath(trimmedUserId, connectionId);
+    const connId = normalizeAngelOneConnectionId(connectionId);
+    const docPath = this.getApiKeyDocPath(trimmedUserId, connId);
     let docData: PersistedAngelOneApiKeyDoc | null = null;
 
     if (!useMockStoreForTesting) {
@@ -408,15 +420,24 @@ export class AngelOneSessionStore {
     }
 
     if (!docData || !docData.encryptedApiKey) {
-      const fullCreds = await this.loadCredentials(userId, connectionId);
+      const fullCreds = await this.loadCredentials(userId, connId);
       return fullCreds ? fullCreds.apiKey : null;
     }
 
     try {
-      const apiKey = CryptoService.decrypt(docData.encryptedApiKey, trimmedUserId);
+      let apiKey: string;
+      try {
+        apiKey = CryptoService.decrypt(docData.encryptedApiKey, trimmedUserId, 'angelone', connId);
+      } catch {
+        try {
+          apiKey = CryptoService.decrypt(docData.encryptedApiKey, trimmedUserId, 'zerodha', connId);
+        } catch {
+          apiKey = CryptoService.decrypt(docData.encryptedApiKey, trimmedUserId, 'zerodha');
+        }
+      }
       return apiKey;
     } catch {
-      const fullCreds = await this.loadCredentials(userId, connectionId);
+      const fullCreds = await this.loadCredentials(userId, connId);
       return fullCreds ? fullCreds.apiKey : null;
     }
   }
@@ -433,7 +454,8 @@ export class AngelOneSessionStore {
     }
 
     const trimmedUserId = userId.trim();
-    const docPath = this.getApiKeyDocPath(trimmedUserId, connectionId);
+    const connId = normalizeAngelOneConnectionId(connectionId);
+    const docPath = this.getApiKeyDocPath(trimmedUserId, connId);
 
     if (!useMockStoreForTesting) {
       const db = this.getAdminFirestore();
@@ -447,7 +469,7 @@ export class AngelOneSessionStore {
       inMemoryTestApiKeyStore.delete(docPath);
     }
 
-    await this.deleteCredentials(userId, connectionId);
+    await this.deleteCredentials(userId, connId);
   }
 
   /**
@@ -484,11 +506,11 @@ export class AngelOneSessionStore {
     const connId = normalizeAngelOneConnectionId(connectionId);
     const now = new Date().toISOString();
 
-    const encryptedKey = CryptoService.encrypt(credentials.apiKey.trim(), trimmedUserId);
-    const encryptedCode = CryptoService.encrypt(credentials.clientCode.trim(), trimmedUserId);
-    const encryptedPass = CryptoService.encrypt(credentials.password.trim(), trimmedUserId);
+    const encryptedKey = CryptoService.encrypt(credentials.apiKey.trim(), trimmedUserId, 'angelone', connId);
+    const encryptedCode = CryptoService.encrypt(credentials.clientCode.trim(), trimmedUserId, 'angelone', connId);
+    const encryptedPass = CryptoService.encrypt(credentials.password.trim(), trimmedUserId, 'angelone', connId);
     const encryptedTotp = credentials.totpSecret && credentials.totpSecret.trim()
-      ? CryptoService.encrypt(credentials.totpSecret.trim(), trimmedUserId)
+      ? CryptoService.encrypt(credentials.totpSecret.trim(), trimmedUserId, 'angelone', connId)
       : undefined;
 
     const docPath = this.getCredentialsDocPath(trimmedUserId, connId);
@@ -582,11 +604,23 @@ export class AngelOneSessionStore {
     }
 
     try {
-      const apiKey = CryptoService.decrypt(docData.encryptedApiKey, trimmedUserId);
-      const clientCode = CryptoService.decrypt(docData.encryptedClientCode, trimmedUserId);
-      const password = CryptoService.decrypt(docData.encryptedPassword, trimmedUserId);
+      const decryptField = (payload: EncryptedPayload): string => {
+        try {
+          return CryptoService.decrypt(payload, trimmedUserId, 'angelone', connId);
+        } catch {
+          try {
+            return CryptoService.decrypt(payload, trimmedUserId, 'zerodha', connId);
+          } catch {
+            return CryptoService.decrypt(payload, trimmedUserId, 'zerodha');
+          }
+        }
+      };
+
+      const apiKey = decryptField(docData.encryptedApiKey);
+      const clientCode = decryptField(docData.encryptedClientCode);
+      const password = decryptField(docData.encryptedPassword);
       const totpSecret = docData.encryptedTotpSecret
-        ? CryptoService.decrypt(docData.encryptedTotpSecret, trimmedUserId)
+        ? decryptField(docData.encryptedTotpSecret)
         : undefined;
 
       return { apiKey, clientCode, password, totpSecret };
