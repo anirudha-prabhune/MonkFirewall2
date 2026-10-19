@@ -113,7 +113,7 @@ export class AngelOneSessionStore {
     const expiryUtc = new Date(now.getTime() + validityHours * 3600 * 1000);
 
     this.invalidatedUsers.delete(this.getUserConnKey(userId, connectionId));
-    const encrypted = CryptoService.encrypt(accessToken, userId.trim());
+    const encrypted = CryptoService.encrypt(accessToken, userId.trim(), 'angelone', connectionId);
     const docPath = this.getSessionDocPath(userId, connectionId);
 
     if (!useMockStoreForTesting) {

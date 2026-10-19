@@ -51,6 +51,7 @@ export class CryptoService {
     const envKey =
       process.env[`SESSION_ENCRYPTION_KEY_${version}`] ||
       process.env.SESSION_ENCRYPTION_KEY ||
+      process.env.BROKER_ENCRYPTION_KEY ||
       process.env.ZERODHA_ENCRYPTION_KEY;
 
     if (envKey && envKey.trim().length > 0) {
@@ -72,7 +73,14 @@ export class CryptoService {
       return crypto.createHash('sha256').update(clean).digest();
     }
 
-    // Server-side fallback derivation: combine server-side secrets (never client-accessible)
+    // REQUIREMENT 1: In production, hardcoded and broker-secret-derived encryption-key fallbacks are disabled.
+    // Require a dedicated managed encryption key and fail closed if unavailable.
+    const isProduction = process.env.NODE_ENV === 'production';
+    if (isProduction) {
+      return null;
+    }
+
+    // Fallback derivation strictly for non-production/test environments
     const serverSecretSeed =
       process.env.ZERODHA_API_SECRET ||
       process.env.KITE_API_SECRET ||
@@ -83,25 +91,37 @@ export class CryptoService {
 
   /**
    * Generates the Authenticated Associated Data (AAD) string.
-   * Binds the ciphertext strictly to userId, provider ('zerodha'), and keyVersion.
-   * Format: `${userId}:${provider}:${keyVersion}`
+   * Binds the ciphertext strictly to userId, provider/broker, connectionId (optional), and keyVersion.
+   * Format with connectionId: `${userId}:${provider}:${connectionId}:${keyVersion}`
+   * Legacy format: `${userId}:${provider}:${keyVersion}`
    */
-  public static computeAad(userId: string, provider = CRYPTO_PROVIDER, keyVersion = CURRENT_KEY_VERSION): string {
+  public static computeAad(
+    userId: string,
+    provider = CRYPTO_PROVIDER,
+    connectionId?: string,
+    keyVersion = CURRENT_KEY_VERSION
+  ): string {
     if (!userId || typeof userId !== 'string') {
       throw new Error('CryptoService: userId is required for AAD binding.');
     }
-    return `${userId.trim()}:${provider}:${keyVersion}`;
+    const cleanUser = userId.trim();
+    const cleanProvider = provider.trim();
+    if (connectionId && connectionId.trim()) {
+      return `${cleanUser}:${cleanProvider}:${connectionId.trim()}:${keyVersion}`;
+    }
+    return `${cleanUser}:${cleanProvider}:${keyVersion}`;
   }
 
   /**
    * Encrypts plaintext with AES-256-GCM.
    * Generates a unique 12-byte random IV for every encryption.
-   * Returns Base64-encoded binary values.
+   * Binds AAD including provider and connectionId.
    */
   public static encrypt(
     plaintext: string,
     userId: string,
     provider = CRYPTO_PROVIDER,
+    connectionId?: string,
     keyVersion = CURRENT_KEY_VERSION
   ): EncryptedPayload {
     if (typeof plaintext !== 'string' || plaintext.length === 0) {
@@ -122,7 +142,7 @@ export class CryptoService {
     const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
 
     // Bind AAD
-    const aad = this.computeAad(userId, provider, keyVersion);
+    const aad = this.computeAad(userId, provider, connectionId, keyVersion);
     cipher.setAAD(Buffer.from(aad, 'utf8'));
 
     const ciphertext = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
@@ -139,13 +159,14 @@ export class CryptoService {
 
   /**
    * Decrypts an EncryptedPayload using AES-256-GCM.
-   * Validates authentication tag and AAD (${userId}:${provider}:${keyVersion}).
-   * Throws DecryptionError on tampering or wrong userId/provider/keyVersion.
+   * Validates authentication tag and AAD.
+   * Supports backward-compatible migration from legacy AAD.
    */
   public static decrypt(
     payload: EncryptedPayload,
     userId: string,
-    provider = CRYPTO_PROVIDER
+    provider = CRYPTO_PROVIDER,
+    connectionId?: string
   ): string {
     if (!payload || !payload.iv || !payload.ciphertext || !payload.tag) {
       throw new DecryptionError('CryptoService: Malformed encrypted payload.');
@@ -175,18 +196,32 @@ export class CryptoService {
       throw new DecryptionError(`CryptoService: Invalid auth tag length (${tag.length} bytes, expected 16).`);
     }
 
+    // Try primary connection-bound AAD first
+    const primaryAad = this.computeAad(userId, provider, connectionId, payload.keyVersion);
     try {
       const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
       decipher.setAuthTag(tag);
-
-      // Reconstruct expected AAD
-      const aad = this.computeAad(userId, provider, payload.keyVersion);
-      decipher.setAAD(Buffer.from(aad, 'utf8'));
+      decipher.setAAD(Buffer.from(primaryAad, 'utf8'));
 
       const decrypted = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
 
       return decrypted.toString('utf8');
-    } catch (err) {
+    } catch (primaryErr) {
+      // REQUIREMENT 4: Backward-compatible migration.
+      // If connectionId was provided and primary connection-bound AAD fails, try legacy AAD without connectionId
+      if (connectionId) {
+        try {
+          const legacyAad = this.computeAad(userId, provider, undefined, payload.keyVersion);
+          const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+          decipher.setAuthTag(tag);
+          decipher.setAAD(Buffer.from(legacyAad, 'utf8'));
+
+          const decrypted = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+
+          return decrypted.toString('utf8');
+        } catch {}
+      }
+
       throw new DecryptionError(
         'CryptoService: Decryption failed (integrity tag mismatch, AAD mismatch, or tampered payload).'
       );

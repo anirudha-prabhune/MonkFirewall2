@@ -46,6 +46,7 @@ export interface CachedRuntimeSession {
   tradingDateKolkata: string;
   brokerUserId?: string;
   userId: string;
+  connectionId?: string;
   cachedAtMs: number;
 }
 
@@ -69,7 +70,7 @@ export type HttpFetchFn = (url: string, options?: any) => Promise<{
 
 export class ZerodhaCredentialManager {
   // In-memory optional short-lived cache (TTL: 30 seconds for Cloud Run performance optimization)
-  private static cachedSession: CachedRuntimeSession | null = null;
+  private static cachedSessions: Map<string, CachedRuntimeSession> = new Map();
   private static readonly RAM_CACHE_TTL_MS = 30 * 1000;
   private static authState: BrokerAuthState = 'DISCONNECTED';
 
@@ -98,9 +99,19 @@ export class ZerodhaCredentialManager {
       return {
         apiKey: stored.apiKey,
         apiSecret: stored.apiSecret,
-        accessToken: this.getActiveAccessToken(userId) || undefined,
+        accessToken: this.getActiveAccessToken(userId, connectionId) || undefined,
       };
     }
+
+    const isProduction = process.env.NODE_ENV === 'production';
+    if (isProduction) {
+      return {
+        apiKey: undefined,
+        apiSecret: undefined,
+        accessToken: this.getActiveAccessToken(userId, connectionId) || undefined,
+      };
+    }
+
     return this.getCredentials(userId);
   }
 
@@ -188,26 +199,24 @@ export class ZerodhaCredentialManager {
     connectionId = 'zerodha'
   ): Promise<ActiveSessionResult | null> {
     const now = Date.now();
+    const cacheKey = `${userId}:${connectionId}`;
 
     // 1. Check optional RAM cache
-    if (
-      this.cachedSession &&
-      this.cachedSession.userId === userId &&
-      now - this.cachedSession.cachedAtMs < this.RAM_CACHE_TTL_MS
-    ) {
-      const expiresAtMs = new Date(this.cachedSession.expiresAt).getTime();
+    const cached = this.cachedSessions.get(cacheKey);
+    if (cached && now - cached.cachedAtMs < this.RAM_CACHE_TTL_MS) {
+      const expiresAtMs = new Date(cached.expiresAt).getTime();
       if (!isNaN(expiresAtMs) && now < expiresAtMs) {
         return {
-          accessToken: this.cachedSession.accessToken,
-          sessionVersion: this.cachedSession.sessionVersion,
+          accessToken: cached.accessToken,
+          sessionVersion: cached.sessionVersion,
           source: 'RAM_CACHE',
-          expiresAt: this.cachedSession.expiresAt,
-          tradingDateKolkata: this.cachedSession.tradingDateKolkata,
-          brokerUserId: this.cachedSession.brokerUserId,
+          expiresAt: cached.expiresAt,
+          tradingDateKolkata: cached.tradingDateKolkata,
+          brokerUserId: cached.brokerUserId,
         };
       }
       // Expired cache -> evict
-      this.cachedSession = null;
+      this.cachedSessions.delete(cacheKey);
     }
 
     // 2. Load from authoritative Firestore session store
@@ -218,7 +227,7 @@ export class ZerodhaCredentialManager {
 
       if (persisted && persisted.authState === 'AUTHENTICATED' && !persisted.isExpired && persisted.accessToken) {
         // Update short-lived RAM cache
-        this.cachedSession = {
+        this.cachedSessions.set(cacheKey, {
           accessToken: persisted.accessToken,
           sessionVersion: persisted.sessionVersion,
           issuedAt: persisted.issuedAt,
@@ -226,8 +235,9 @@ export class ZerodhaCredentialManager {
           tradingDateKolkata: persisted.tradingDateKolkata,
           brokerUserId: persisted.brokerUserId,
           userId,
+          connectionId,
           cachedAtMs: now,
-        };
+        });
         this.authState = 'AUTHENTICATED';
 
         return {
@@ -272,12 +282,16 @@ export class ZerodhaCredentialManager {
    * Synchronous accessor for backward-compatibility.
    * Checks RAM cache first, then dev/test environment override.
    */
-  public static getActiveAccessToken(userId?: string): string | null {
-    if (this.cachedSession?.accessToken) {
-      if (!userId || this.cachedSession.userId === userId) {
-        return this.cachedSession.accessToken;
+  public static getActiveAccessToken(userId?: string, connectionId = 'zerodha'): string | null {
+    if (userId) {
+      const cached = this.cachedSessions.get(`${userId}:${connectionId}`);
+      if (cached?.accessToken) return cached.accessToken;
+    } else {
+      for (const cached of this.cachedSessions.values()) {
+        if (cached?.accessToken) return cached.accessToken;
       }
     }
+
     // Fall back to DEV_ENV token strictly in explicit non-production/test/dev mode
     const isProduction = process.env.NODE_ENV === 'production';
     const isExplicitNonProd = !isProduction && (
@@ -308,15 +322,17 @@ export class ZerodhaCredentialManager {
       userId?: string;
       userName?: string;
     } | null,
-    userId = 'default_trader'
+    userId = 'default_trader',
+    connectionId = 'zerodha'
   ): void {
+    const cacheKey = `${userId}:${connectionId}`;
     if (!session) {
-      this.cachedSession = null;
+      this.cachedSessions.delete(cacheKey);
       this.authState = 'AUTHENTICATION_REQUIRED';
       return;
     }
     const now = Date.now();
-    this.cachedSession = {
+    this.cachedSessions.set(cacheKey, {
       accessToken: session.accessToken,
       sessionVersion: session.sessionVersion ?? 1,
       issuedAt: session.authenticatedAt || new Date().toISOString(),
@@ -324,26 +340,31 @@ export class ZerodhaCredentialManager {
       tradingDateKolkata: new Date().toISOString().split('T')[0],
       brokerUserId: session.userId,
       userId,
+      connectionId,
       cachedAtMs: now,
-    };
+    });
     this.authState = 'AUTHENTICATED';
   }
 
   /**
    * Retrieves active runtime session metadata (sanitized).
    */
-  public static getRuntimeSession(): {
+  public static getRuntimeSession(
+    userId = 'default_trader',
+    connectionId = 'zerodha'
+  ): {
     sessionVersion: number;
     authenticatedAt: string;
     expiresAt: string;
     userId?: string;
   } | null {
-    if (!this.cachedSession) return null;
+    const cached = this.cachedSessions.get(`${userId}:${connectionId}`);
+    if (!cached) return null;
     return {
-      sessionVersion: this.cachedSession.sessionVersion,
-      authenticatedAt: this.cachedSession.issuedAt,
-      expiresAt: this.cachedSession.expiresAt,
-      userId: this.cachedSession.brokerUserId,
+      sessionVersion: cached.sessionVersion,
+      authenticatedAt: cached.issuedAt,
+      expiresAt: cached.expiresAt,
+      userId: cached.brokerUserId,
     };
   }
 
@@ -361,7 +382,7 @@ export class ZerodhaCredentialManager {
     failedSessionVersion?: number,
     connectionId = 'zerodha'
   ): Promise<{ invalidated: boolean; preservedNewerVersion?: number }> {
-    this.cachedSession = null;
+    this.cachedSessions.delete(`${userId}:${connectionId}`);
     this.authState = 'AUTHENTICATION_REQUIRED';
 
     const result = await ZerodhaSessionStore.invalidateSession(userId, failedSessionVersion, connectionId);
@@ -375,7 +396,7 @@ export class ZerodhaCredentialManager {
     userId = 'default_trader',
     connectionId = 'zerodha'
   ): Promise<void> {
-    this.cachedSession = null;
+    this.cachedSessions.delete(`${userId}:${connectionId}`);
     this.authState = 'AUTHENTICATION_REQUIRED';
     await ZerodhaSessionStore.invalidateSession(userId, undefined, connectionId);
   }
@@ -384,7 +405,11 @@ export class ZerodhaCredentialManager {
    * Synchronous session invalidation for backward-compatibility.
    */
   public static invalidateSession(userId = 'default_trader'): void {
-    this.cachedSession = null;
+    for (const key of this.cachedSessions.keys()) {
+      if (key.startsWith(`${userId}:`)) {
+        this.cachedSessions.delete(key);
+      }
+    }
     this.authState = 'AUTHENTICATION_REQUIRED';
     ZerodhaSessionStore.invalidateSession(userId).catch(() => {});
   }
@@ -687,7 +712,8 @@ export class ZerodhaCredentialManager {
         });
       } catch (persistErr: any) {
         // FAIL-CLOSED: Authentication must NOT report AUTHENTICATED unless encrypted session is successfully persisted.
-        this.cachedSession = null;
+        this.cachedSessions.delete(`${userId}:${connectionId}`);
+
         this.setAuthState('AUTHENTICATION_REQUIRED');
         const persistMsg = persistErr instanceof SessionPersistenceError
           ? persistErr.message
@@ -700,7 +726,8 @@ export class ZerodhaCredentialManager {
 
       // Update short-lived local RAM cache ONLY upon successful persistence
       const now = Date.now();
-      this.cachedSession = {
+      this.cachedSessions.set(`${userId}:${connectionId}`,
+ {
         accessToken: rawAccessToken,
         sessionVersion: persistenceResult.sessionVersion,
         issuedAt: new Date(now).toISOString(),
@@ -708,8 +735,9 @@ export class ZerodhaCredentialManager {
         tradingDateKolkata: persistenceResult.tradingDateKolkata,
         brokerUserId,
         userId,
+        connectionId,
         cachedAtMs: now,
-      };
+      });
       this.authState = 'AUTHENTICATED';
 
       // Return strictly sanitized status metadata (ZERO token, ZERO ciphertext, ZERO keys)
@@ -725,7 +753,8 @@ export class ZerodhaCredentialManager {
         },
       };
     } catch (err: any) {
-      this.cachedSession = null;
+      this.cachedSessions.delete(`${userId}:${connectionId}`);
+
       this.setAuthState('AUTHENTICATION_ERROR');
       const isTimeout = err?.name === 'TimeoutError' || err?.name === 'AbortError' || effectiveSignal.aborted;
       const rawMsg = isTimeout
@@ -756,9 +785,8 @@ export class ZerodhaCredentialManager {
     const apiSecretConfigured = Boolean(apiSecret && apiSecret.trim().length > 0);
     const accessTokenConfigured = Boolean(activeToken && activeToken.trim().length > 0);
 
-    const hasMatchingUserCache = Boolean(
-      this.cachedSession && (!userId || this.cachedSession.userId === userId)
-    );
+    const userCached = Array.from(this.cachedSessions.values()).find(s => !userId || s.userId === userId);
+    const hasMatchingUserCache = Boolean(userCached);
     const isAuth = this.authState === 'AUTHENTICATED' && (accessTokenConfigured || hasMatchingUserCache);
     const isAuthRequired = !isAuth || this.authState === 'AUTHENTICATION_REQUIRED';
 
@@ -774,9 +802,9 @@ export class ZerodhaCredentialManager {
       accessTokenConfigured,
       authenticated: isAuth,
       authenticationRequired: isAuthRequired,
-      authenticatedAt: hasMatchingUserCache ? this.cachedSession?.issuedAt || null : null,
-      expiresAt: hasMatchingUserCache ? this.cachedSession?.expiresAt || null : null,
-      sessionVersion: hasMatchingUserCache ? this.cachedSession?.sessionVersion : undefined,
+      authenticatedAt: userCached?.issuedAt || null,
+      expiresAt: userCached?.expiresAt || null,
+      sessionVersion: userCached?.sessionVersion,
       sessionSource,
     };
   }
@@ -793,11 +821,13 @@ export class ZerodhaCredentialManager {
     if (creds.apiSecret && creds.apiSecret.length > 0) {
       sanitized = sanitized.split(creds.apiSecret).join('[REDACTED_API_SECRET]');
     }
-    if (this.cachedSession?.accessToken && this.cachedSession.accessToken.length > 0) {
-      sanitized = sanitized.split(this.cachedSession.accessToken).join('[REDACTED_ACCESS_TOKEN]');
+    for (const cached of this.cachedSessions.values()) {
+      if (cached.accessToken && cached.accessToken.length > 0) {
+        sanitized = sanitized.split(cached.accessToken).join('[REDACTED_ACCESS_TOKEN]');
+      }
     }
     const token = this.getActiveAccessToken();
-    if (token && token.length > 0 && token !== this.cachedSession?.accessToken) {
+    if (token && token.length > 0) {
       sanitized = sanitized.split(token).join('[REDACTED_ACCESS_TOKEN]');
     }
     return sanitized;

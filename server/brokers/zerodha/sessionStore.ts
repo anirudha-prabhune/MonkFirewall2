@@ -233,8 +233,8 @@ export class ZerodhaSessionStore {
     const now = options.evaluationTime || new Date();
     const { expiryUtc, tradingDateKolkata } = getApplicationSessionExpiry(now);
 
-    // Encrypt the access_token with AAD binding ${userId}:zerodha:1
-    const encrypted: EncryptedPayload = CryptoService.encrypt(accessToken.trim(), userId.trim());
+    // Encrypt the access_token with AAD binding ${userId}:zerodha:${connectionId}:1
+    const encrypted: EncryptedPayload = CryptoService.encrypt(accessToken.trim(), userId.trim(), 'zerodha', connectionId);
 
     const docPath = this.getSessionDocPath(userId, connectionId);
 
@@ -406,7 +406,7 @@ export class ZerodhaSessionStore {
 
     // Decrypt the access_token
     try {
-      const accessToken = CryptoService.decrypt(docData.encryptedToken, userId.trim());
+      const accessToken = CryptoService.decrypt(docData.encryptedToken, userId.trim(), 'zerodha', connectionId);
       return {
         accessToken,
         sessionVersion: docData.sessionVersion,
@@ -556,8 +556,8 @@ export class ZerodhaSessionStore {
     const connId = connectionId.trim();
     const now = new Date().toISOString();
 
-    const encryptedKey = CryptoService.encrypt(credentials.apiKey.trim(), trimmedUserId);
-    const encryptedSecret = CryptoService.encrypt(credentials.apiSecret.trim(), trimmedUserId);
+    const encryptedKey = CryptoService.encrypt(credentials.apiKey.trim(), trimmedUserId, 'zerodha', connId);
+    const encryptedSecret = CryptoService.encrypt(credentials.apiSecret.trim(), trimmedUserId, 'zerodha', connId);
 
     const docPath = this.getCredentialsDocPath(trimmedUserId, connId);
     const docData: PersistedZerodhaCredentialsDoc = {
@@ -634,8 +634,8 @@ export class ZerodhaSessionStore {
     }
 
     try {
-      const apiKey = CryptoService.decrypt(docData.encryptedApiKey, trimmedUserId);
-      const apiSecret = CryptoService.decrypt(docData.encryptedApiSecret, trimmedUserId);
+      const apiKey = CryptoService.decrypt(docData.encryptedApiKey, trimmedUserId, 'zerodha', connId);
+      const apiSecret = CryptoService.decrypt(docData.encryptedApiSecret, trimmedUserId, 'zerodha', connId);
       return { apiKey, apiSecret };
     } catch {
       return null;
