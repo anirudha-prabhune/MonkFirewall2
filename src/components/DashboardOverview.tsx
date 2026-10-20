@@ -329,7 +329,19 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
         if (reqId !== positionsRequestIdRef.current || activeBrokerRef.current !== 'angelone') {
           return;
         }
-        if (angelStat) {
+        if (angelPositionsRes?.connectionStatus === 'AUTHENTICATION_REQUIRED' || angelPositionsRes?.connectionStatus === 'CONFIGURATION_ERROR') {
+          setAngelOneStatus({
+            broker: 'angelone',
+            status: angelPositionsRes.connectionStatus,
+            configured: angelPositionsRes.connectionStatus !== 'CONFIGURATION_ERROR',
+            authenticated: false,
+            authenticationRequired: true,
+            message: angelPositionsRes.diagnosticNote || 'Angel One session expired or unauthorized. Re-authentication required.',
+            timestamp: new Date().toISOString(),
+            isMock: false,
+            mode: 'live',
+          });
+        } else if (angelStat) {
           setAngelOneStatus(angelStat);
         }
         if (pnl) {

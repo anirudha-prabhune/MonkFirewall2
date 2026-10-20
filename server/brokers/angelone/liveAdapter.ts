@@ -501,7 +501,7 @@ export class LiveAngelOneAdapter implements BrokerAdapter {
         if (response.status === 401 || response.status === 403 || errorCode === 'AG8001' || errorCode === 'AG8002' || errorCode === 'AG8003' || errorCode === 'AB1010') {
           this.authRequiredUsers.add(this.getUserConnKey(userId, connectionId));
           try {
-            await AngelOneSessionStore.invalidateSession(userId, session.sessionVersion, connectionId);
+            await AngelOneSessionStore.invalidateSession(userId, undefined, connectionId);
           } catch {}
           throw new Error(`SmartAPI getPosition${codePrefix}${httpPrefix}: ${sanitizedMsg}. Re-authentication required.`);
         }
@@ -526,7 +526,7 @@ export class LiveAngelOneAdapter implements BrokerAdapter {
         if (errorCode === 'AG8001' || errorCode === 'AG8002' || errorCode === 'AG8003' || errorCode === 'AB1010' || /token|session|unauthorized|api\s*key|private\s*key/i.test(rawMsg)) {
           this.authRequiredUsers.add(this.getUserConnKey(userId, connectionId));
           try {
-            await AngelOneSessionStore.invalidateSession(userId, session.sessionVersion, connectionId);
+            await AngelOneSessionStore.invalidateSession(userId, undefined, connectionId);
           } catch {}
           throw new Error(`SmartAPI error${codePrefix}: ${sanitizedMsg}. Re-authentication required.`);
         }
@@ -719,7 +719,7 @@ export class LiveAngelOneAdapter implements BrokerAdapter {
         if (response.status === 401 || response.status === 403 || errorCode === 'AG8001' || errorCode === 'AG8002' || errorCode === 'AG8003' || errorCode === 'AB1010') {
           this.authRequiredUsers.add(this.getUserConnKey(userId, connectionId));
           try {
-            await AngelOneSessionStore.invalidateSession(userId, session.sessionVersion, connectionId);
+            await AngelOneSessionStore.invalidateSession(userId, undefined, connectionId);
           } catch {}
           return {
             broker: 'angelone',
@@ -760,7 +760,7 @@ export class LiveAngelOneAdapter implements BrokerAdapter {
         if (errorCode === 'AG8001' || errorCode === 'AG8002' || errorCode === 'AG8003' || errorCode === 'AB1010' || /token|session|unauthorized|api\s*key|private\s*key/i.test(rawMsg)) {
           this.authRequiredUsers.add(this.getUserConnKey(userId, connectionId));
           try {
-            await AngelOneSessionStore.invalidateSession(userId, session.sessionVersion, connectionId);
+            await AngelOneSessionStore.invalidateSession(userId, undefined, connectionId);
           } catch {}
           return {
             broker: 'angelone',
