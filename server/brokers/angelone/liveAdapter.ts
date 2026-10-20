@@ -336,9 +336,6 @@ export class LiveAngelOneAdapter implements BrokerAdapter {
     const connectionId = options.connectionId;
     const session = await AngelOneSessionStore.loadSession(userId, { connectionId });
     const connKey = this.getUserConnKey(trimmedUserId, connectionId);
-    if (session && session.authState === 'AUTHENTICATED' && !session.isExpired) {
-      this.authRequiredUsers.delete(connKey);
-    }
 
     if (this.authRequiredUsers.has(connKey)) {
       return {
@@ -355,14 +352,17 @@ export class LiveAngelOneAdapter implements BrokerAdapter {
     }
 
     const storedApiKey = await AngelOneSessionStore.loadApiKey(userId, connectionId);
-    const hasApiKey = Boolean(storedApiKey || this.credentials.getConfig().apiKey);
-    const configured = Boolean(hasApiKey || (session && session.authState === 'AUTHENTICATED'));
+    const isProduction = process.env.NODE_ENV === 'production';
+    const effectiveApiKey = storedApiKey || (!isProduction && !session ? this.credentials.getConfig().apiKey : null);
+    const hasApiKey = Boolean(effectiveApiKey);
+    const configured = Boolean(hasApiKey);
+
     if (!configured) {
       return {
         broker: 'angelone',
         status: 'CONFIGURATION_ERROR',
         isMock: false,
-        message: 'Angel One API Key not found in environment or credentials.',
+        message: 'Angel One API Key not found for user account.',
         timestamp: new Date().toISOString(),
         configured: false,
         authenticated: false,
@@ -385,12 +385,12 @@ export class LiveAngelOneAdapter implements BrokerAdapter {
       };
     }
 
-    if (!hasApiKey) {
+    if (!storedApiKey && (isProduction || session)) {
       return {
         broker: 'angelone',
         status: 'CONFIGURATION_ERROR',
         isMock: false,
-        message: 'Angel One API Key not found for user. Re-authentication required.',
+        message: 'Angel One stored API Key not found for user account.',
         timestamp: new Date().toISOString(),
         configured: false,
         authenticated: false,
@@ -429,13 +429,12 @@ export class LiveAngelOneAdapter implements BrokerAdapter {
       throw new Error('Angel One active session access token not found');
     }
 
-    let apiKey = await AngelOneSessionStore.loadApiKey(userId, connectionId);
-    if (!apiKey) {
-      apiKey = this.credentials.getConfig().apiKey || '';
-    }
+    const storedApiKey = await AngelOneSessionStore.loadApiKey(userId, connectionId);
+    const isProduction = process.env.NODE_ENV === 'production';
+    const apiKey = storedApiKey || (!isProduction ? (this.credentials.getConfig().apiKey || '') : '');
 
     if (!apiKey) {
-      throw new Error('Angel One API Key not found for user');
+      throw new Error('Angel One stored API Key not found for user account');
     }
 
     try {
@@ -492,13 +491,12 @@ export class LiveAngelOneAdapter implements BrokerAdapter {
         const codePrefix = errorCode ? ` [${errorCode}]` : '';
         const httpPrefix = !rawMsg.includes(String(response.status)) ? ` (HTTP ${response.status})` : '';
 
-        console.info('[SmartAPI Cloud Debug] Upstream getPosition HTTP Error:', {
-          status: response.status,
-          errorCode: errorCode || 'NONE',
-          errorMsg: sanitizedMsg,
-        });
-
         if (response.status === 401 || response.status === 403 || errorCode === 'AG8001' || errorCode === 'AG8002' || errorCode === 'AG8003' || errorCode === 'AB1010') {
+          console.info('[SmartAPI Cloud Debug] Upstream getPosition Session Expired (HTTP 401/403):', {
+            status: response.status,
+            errorCode: errorCode || 'NONE',
+            errorMsg: sanitizedMsg,
+          });
           this.authRequiredUsers.add(this.getUserConnKey(userId, connectionId));
           try {
             await AngelOneSessionStore.invalidateSession(userId, undefined, connectionId);
@@ -633,10 +631,9 @@ export class LiveAngelOneAdapter implements BrokerAdapter {
       };
     }
 
-    let apiKey = await AngelOneSessionStore.loadApiKey(userId, connectionId);
-    if (!apiKey) {
-      apiKey = this.credentials.getConfig().apiKey || '';
-    }
+    const storedApiKey = await AngelOneSessionStore.loadApiKey(userId, connectionId);
+    const isProduction = process.env.NODE_ENV === 'production';
+    const apiKey = storedApiKey || (!isProduction ? (this.credentials.getConfig().apiKey || '') : '');
 
     if (!apiKey) {
       return {
@@ -652,7 +649,7 @@ export class LiveAngelOneAdapter implements BrokerAdapter {
         asOf: new Date().toISOString(),
         isStale: true,
         isAfterHours,
-        semanticNote: 'Angel One API Key not found for user',
+        semanticNote: 'Angel One stored API Key not found for user account',
       };
     }
 
