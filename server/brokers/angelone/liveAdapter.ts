@@ -54,6 +54,13 @@ export class LiveAngelOneAdapter implements BrokerAdapter {
   }
 
   private authRequiredUsers = new Set<string>();
+  private configErrorMap = new Map<string, string>();
+
+  public clearUserErrorState(userId: string, connectionId?: string): void {
+    const connKey = this.getUserConnKey(userId.trim(), connectionId);
+    this.authRequiredUsers.delete(connKey);
+    this.configErrorMap.delete(connKey);
+  }
 
   private getUserConnKey(userId: string, connectionId?: string): string {
     return `${userId.trim()}:${normalizeAngelOneConnectionId(connectionId)}`;
@@ -311,7 +318,7 @@ export class LiveAngelOneAdapter implements BrokerAdapter {
         };
       }
 
-      this.authRequiredUsers.delete(this.getUserConnKey(trimmedUserId, options.connectionId));
+      this.clearUserErrorState(trimmedUserId, options.connectionId);
       return {
         success: true,
         session: {
@@ -336,6 +343,20 @@ export class LiveAngelOneAdapter implements BrokerAdapter {
     const connectionId = options.connectionId;
     const session = await AngelOneSessionStore.loadSession(userId, { connectionId });
     const connKey = this.getUserConnKey(trimmedUserId, connectionId);
+
+    if (this.configErrorMap.has(connKey)) {
+      return {
+        broker: 'angelone',
+        status: 'CONFIGURATION_ERROR',
+        isMock: false,
+        message: this.configErrorMap.get(connKey) || 'Angel One API Key or account configuration error.',
+        timestamp: new Date().toISOString(),
+        configured: false,
+        authenticated: false,
+        authenticationRequired: true,
+        credentials: this.credentials.getDiagnostic(),
+      };
+    }
 
     if (this.authRequiredUsers.has(connKey)) {
       return {
@@ -491,21 +512,10 @@ export class LiveAngelOneAdapter implements BrokerAdapter {
         const codePrefix = errorCode ? ` [${errorCode}]` : '';
         const httpPrefix = !rawMsg.includes(String(response.status)) ? ` (HTTP ${response.status})` : '';
 
-        const isTokenExpired = response.status === 401 || response.status === 403 || errorCode === 'AG8001' || errorCode === 'AG8002' || errorCode === 'AG8003' || /token|session|unauthorized|jwt|forbidden|403/i.test(rawMsg);
         const isApiKeyError = errorCode === 'AB1010' || /private\s*key|api\s*key|invalid\s*key/i.test(rawMsg);
+        const isTokenExpired = !isApiKeyError && (response.status === 401 || errorCode === 'AG8001' || errorCode === 'AG8002' || errorCode === 'AG8003' || /token|session|unauthorized|jwt|expired/i.test(rawMsg));
 
-        if (isTokenExpired) {
-          console.info('[SmartAPI Cloud Debug] Upstream getPosition Session Expired:', {
-            status: response.status,
-            errorCode: errorCode || 'NONE',
-            errorMsg: sanitizedMsg,
-          });
-          this.authRequiredUsers.add(this.getUserConnKey(userId, connectionId));
-          try {
-            await AngelOneSessionStore.invalidateSession(userId, undefined, connectionId);
-          } catch {}
-          throw new Error(`SmartAPI getPosition${codePrefix}${httpPrefix}: ${sanitizedMsg}. Re-authentication required.`);
-        }
+        const connKey = this.getUserConnKey(userId, connectionId);
 
         if (isApiKeyError) {
           console.warn('[SmartAPI Cloud Debug] Upstream getPosition API Key Error:', {
@@ -513,8 +523,23 @@ export class LiveAngelOneAdapter implements BrokerAdapter {
             errorCode: errorCode || 'NONE',
             errorMsg: sanitizedMsg,
           });
-          this.authRequiredUsers.add(this.getUserConnKey(userId, connectionId));
+          this.configErrorMap.set(connKey, `SmartAPI getPosition API Key Error${codePrefix}${httpPrefix}: ${sanitizedMsg}`);
+          this.authRequiredUsers.delete(connKey);
           throw new Error(`SmartAPI getPosition${codePrefix}${httpPrefix}: ${sanitizedMsg}. Invalid API key configuration.`);
+        }
+
+        if (isTokenExpired) {
+          console.info('[SmartAPI Cloud Debug] Upstream getPosition Session Expired:', {
+            status: response.status,
+            errorCode: errorCode || 'NONE',
+            errorMsg: sanitizedMsg,
+          });
+          this.authRequiredUsers.add(connKey);
+          this.configErrorMap.delete(connKey);
+          try {
+            await AngelOneSessionStore.invalidateSession(userId, undefined, connectionId);
+          } catch {}
+          throw new Error(`SmartAPI getPosition${codePrefix}${httpPrefix}: ${sanitizedMsg}. Re-authentication required.`);
         }
 
         console.warn('[SmartAPI Cloud Debug] Upstream getPosition HTTP Error:', {
@@ -541,20 +566,24 @@ export class LiveAngelOneAdapter implements BrokerAdapter {
         const sanitizedMsg = sanitizeAngelOneErrorString(rawMsg);
         const codePrefix = errorCode ? ` [${errorCode}]` : '';
 
-        const isTokenExpired = errorCode === 'AG8001' || errorCode === 'AG8002' || errorCode === 'AG8003' || /token|session|unauthorized|jwt/i.test(rawMsg);
         const isApiKeyError = errorCode === 'AB1010' || /private\s*key|api\s*key|invalid\s*key/i.test(rawMsg);
+        const isTokenExpired = !isApiKeyError && (errorCode === 'AG8001' || errorCode === 'AG8002' || errorCode === 'AG8003' || /token|session|unauthorized|jwt|expired/i.test(rawMsg));
+
+        const connKey = this.getUserConnKey(userId, connectionId);
+
+        if (isApiKeyError) {
+          this.configErrorMap.set(connKey, `SmartAPI error${codePrefix}: ${sanitizedMsg}`);
+          this.authRequiredUsers.delete(connKey);
+          throw new Error(`SmartAPI error${codePrefix}: ${sanitizedMsg}. Invalid API key configuration.`);
+        }
 
         if (isTokenExpired) {
-          this.authRequiredUsers.add(this.getUserConnKey(userId, connectionId));
+          this.authRequiredUsers.add(connKey);
+          this.configErrorMap.delete(connKey);
           try {
             await AngelOneSessionStore.invalidateSession(userId, undefined, connectionId);
           } catch {}
           throw new Error(`SmartAPI error${codePrefix}: ${sanitizedMsg}. Re-authentication required.`);
-        }
-
-        if (isApiKeyError) {
-          this.authRequiredUsers.add(this.getUserConnKey(userId, connectionId));
-          throw new Error(`SmartAPI error${codePrefix}: ${sanitizedMsg}. Invalid API key configuration.`);
         }
 
         throw new Error(`SmartAPI error${codePrefix}: ${sanitizedMsg}`);
@@ -742,8 +771,34 @@ export class LiveAngelOneAdapter implements BrokerAdapter {
           errorMsg: sanitizedMsg,
         });
 
-        if (response.status === 401 || response.status === 403 || errorCode === 'AG8001' || errorCode === 'AG8002' || errorCode === 'AG8003' || errorCode === 'AB1010') {
-          this.authRequiredUsers.add(this.getUserConnKey(userId, connectionId));
+        const isApiKeyError = errorCode === 'AB1010' || /private\s*key|api\s*key|invalid\s*key/i.test(rawMsg);
+        const isTokenExpired = !isApiKeyError && (response.status === 401 || errorCode === 'AG8001' || errorCode === 'AG8002' || errorCode === 'AG8003' || /token|session|unauthorized|jwt|expired/i.test(rawMsg));
+
+        const connKey = this.getUserConnKey(userId, connectionId);
+
+        if (isApiKeyError) {
+          this.configErrorMap.set(connKey, `SmartAPI getRMS API Key Error${codePrefix}${httpPrefix}: ${sanitizedMsg}`);
+          this.authRequiredUsers.delete(connKey);
+          return {
+            broker: 'angelone',
+            dataSource: 'ANGELONE_LIVE',
+            connectionStatus: 'CONFIGURATION_ERROR',
+            netBalance: null,
+            availableCash: null,
+            availableTradingMargin: null,
+            utilizedMargin: null,
+            withdrawableFunds: null,
+            currency: 'INR',
+            asOf: new Date().toISOString(),
+            isStale: true,
+            isAfterHours,
+            semanticNote: `SmartAPI getRMS${codePrefix}${httpPrefix}: ${sanitizedMsg}. Invalid API key configuration.`,
+          };
+        }
+
+        if (isTokenExpired) {
+          this.authRequiredUsers.add(connKey);
+          this.configErrorMap.delete(connKey);
           try {
             await AngelOneSessionStore.invalidateSession(userId, undefined, connectionId);
           } catch {}
@@ -783,8 +838,34 @@ export class LiveAngelOneAdapter implements BrokerAdapter {
         const sanitizedMsg = sanitizeAngelOneErrorString(rawMsg);
         const codePrefix = errorCode ? ` [${errorCode}]` : '';
 
-        if (errorCode === 'AG8001' || errorCode === 'AG8002' || errorCode === 'AG8003' || errorCode === 'AB1010' || /token|session|unauthorized|api\s*key|private\s*key/i.test(rawMsg)) {
-          this.authRequiredUsers.add(this.getUserConnKey(userId, connectionId));
+        const isApiKeyError = errorCode === 'AB1010' || /private\s*key|api\s*key|invalid\s*key/i.test(rawMsg);
+        const isTokenExpired = !isApiKeyError && (errorCode === 'AG8001' || errorCode === 'AG8002' || errorCode === 'AG8003' || /token|session|unauthorized|jwt|expired/i.test(rawMsg));
+
+        const connKey = this.getUserConnKey(userId, connectionId);
+
+        if (isApiKeyError) {
+          this.configErrorMap.set(connKey, `SmartAPI error${codePrefix}: ${sanitizedMsg}`);
+          this.authRequiredUsers.delete(connKey);
+          return {
+            broker: 'angelone',
+            dataSource: 'ANGELONE_LIVE',
+            connectionStatus: 'CONFIGURATION_ERROR',
+            netBalance: null,
+            availableCash: null,
+            availableTradingMargin: null,
+            utilizedMargin: null,
+            withdrawableFunds: null,
+            currency: 'INR',
+            asOf: new Date().toISOString(),
+            isStale: true,
+            isAfterHours,
+            semanticNote: `SmartAPI error${codePrefix}: ${sanitizedMsg}. Invalid API key configuration.`,
+          };
+        }
+
+        if (isTokenExpired) {
+          this.authRequiredUsers.add(connKey);
+          this.configErrorMap.delete(connKey);
           try {
             await AngelOneSessionStore.invalidateSession(userId, undefined, connectionId);
           } catch {}
