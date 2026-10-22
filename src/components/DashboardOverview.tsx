@@ -26,6 +26,7 @@ import {
   DEFAULT_ANGELONE_RISK_CONFIG,
   DEFAULT_ACCOUNT_ID,
   DEFAULT_ANGELONE_ACCOUNT_ID,
+  DEFAULT_SIMULATION_ACCOUNT_ID,
 } from '../types/risk';
 import { formatINR, getISTReadableDate, getISTTimestamp, getFriendlyAccountLabel } from '../utils/formatters';
 import { validateBrokerCapitalPayload } from '../utils/brokerCapitalState';
@@ -138,10 +139,49 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
   const capitalRequestIdRef = useRef<number>(0);
   const positionsRequestIdRef = useRef<number>(0);
   const activeBrokerRef = useRef<'zerodha' | 'angelone'>('zerodha');
+  const activeAccountIdRef = useRef<string>(selectedAccountIdProp || DEFAULT_ACCOUNT_ID);
+  const activeUserUidRef = useRef<string | undefined>(user?.uid);
+  const angelOneCircuitBrokenRef = useRef<boolean>(false);
+  const lastUserUidRef = useRef<string | undefined>(user?.uid);
+  const lastBrokerRef = useRef<'zerodha' | 'angelone'>('zerodha');
+  const lastAccountIdRef = useRef<string>(selectedAccountIdProp || DEFAULT_ACCOUNT_ID);
 
   useEffect(() => {
     activeBrokerRef.current = selectedBroker;
   }, [selectedBroker]);
+
+  // Demo Identity Detection: Only mock/sandbox accounts are locked into demo identity
+  const isDemoIdentity = Boolean(user?.isSandbox || user?.uid === 'mock-trader-sandbox' || user?.uid?.startsWith('mock-'));
+
+  // Explicit Demo Mode State: Opt-in simulation mode. Normal authenticated users default to Live Mode.
+  const [explicitDemoMode, setExplicitDemoMode] = useState<boolean>(() => {
+    if (typeof window === 'undefined') return false;
+    if (user?.isSandbox || user?.uid === 'mock-trader-sandbox' || user?.uid?.startsWith('mock-')) {
+      return true;
+    }
+    return localStorage.getItem('trading_firewall_explicit_demo') === 'true';
+  });
+
+  useEffect(() => {
+    if (isDemoIdentity) {
+      setExplicitDemoMode(true);
+    } else {
+      setExplicitDemoMode(localStorage.getItem('trading_firewall_explicit_demo') === 'true');
+    }
+  }, [user?.uid, isDemoIdentity]);
+
+  const handleToggleDemoMode = (enableDemo: boolean) => {
+    if (isDemoIdentity) return;
+    setExplicitDemoMode(enableDemo);
+    if (enableDemo) {
+      localStorage.setItem('trading_firewall_explicit_demo', 'true');
+    } else {
+      localStorage.removeItem('trading_firewall_explicit_demo');
+    }
+  };
+
+  const isSimulationMode = isDemoIdentity || explicitDemoMode;
+  const isLiveMode = !isSimulationMode;
 
   // Demo / Simulation Controls State
   const [isDemoControlsOpen, setIsDemoControlsOpen] = useState<boolean>(false);
@@ -209,7 +249,7 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
       .finally(() => {
         setAccountsLoading(false);
       });
-  }, [user]);
+  }, [user?.uid]);
 
   // IST Clock update loop
   useEffect(() => {
@@ -226,10 +266,12 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
     const isAngel = selectedAccountId === DEFAULT_ANGELONE_ACCOUNT_ID || selectedAccountId.includes('angelone');
     const defaultPendingConfig = isAngel ? DEFAULT_ANGELONE_RISK_CONFIG : DEFAULT_RISK_CONFIG;
 
+    const effectiveAccountForRisk = isSimulationMode ? DEFAULT_SIMULATION_ACCOUNT_ID : selectedAccountId;
+
     // Immediately reflect account-scoped default configuration while in flight
     setAccountRiskConfig(defaultPendingConfig);
 
-    getRiskConfig(user.uid, selectedAccountId)
+    getRiskConfig(user.uid, effectiveAccountForRisk)
       .then((cfg) => setAccountRiskConfig(cfg))
       .catch(() => setAccountRiskConfig(defaultPendingConfig));
 
@@ -237,7 +279,7 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
       user.uid,
       (cfg) => setAccountRiskConfig(cfg),
       undefined,
-      selectedAccountId
+      effectiveAccountForRisk
     );
 
     const unsubSession = subscribeRiskSession(
@@ -245,44 +287,57 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
       (updatedSession) => {
         setSession(updatedSession);
       },
-      selectedAccountId
+      effectiveAccountForRisk
     );
 
     return () => {
       unsubConfig();
       unsubSession();
     };
-  }, [user, selectedAccountId]);
+  }, [user?.uid, user?.isSandbox, selectedAccountId, isSimulationMode]);
 
   // Load Account Capital (Phase 5B & Phase 6C.1 Race Remediation & Phase 7D Multi-Account)
   const loadAccountCapital = useCallback(async (targetBroker?: 'zerodha' | 'angelone', targetAccountId?: string) => {
     const brokerToFetch = targetBroker || activeBrokerRef.current;
     const accountToFetch = targetAccountId || selectedAccountId;
+    const uid = user?.uid;
+    if (!uid) return;
+
+    if (brokerToFetch === 'angelone' && angelOneCircuitBrokenRef.current) {
+      return;
+    }
+
     const reqId = ++capitalRequestIdRef.current;
     setLoadingCapital(true);
 
     try {
       if (brokerToFetch === 'angelone') {
-        const res = await fetchAngelOneCapital(user?.uid, accountToFetch);
-        // Guard against race conditions:
-        // 1. Sequence check: Ensure this is still the most recent request
-        // 2. Active broker check: Ensure the active broker hasn't changed
-        if (reqId !== capitalRequestIdRef.current || activeBrokerRef.current !== 'angelone') {
+        const res = await fetchAngelOneCapital(uid, accountToFetch);
+        // Guard against race conditions & stale requests:
+        if (
+          reqId !== capitalRequestIdRef.current ||
+          activeBrokerRef.current !== 'angelone' ||
+          activeAccountIdRef.current !== accountToFetch ||
+          activeUserUidRef.current !== uid
+        ) {
           return;
         }
-        // 3. DataSource & broker validation: Angel One must return ANGELONE_LIVE and angelone broker
         if (res?.capital && !validateBrokerCapitalPayload('angelone', res.capital)) {
           setCapital(null);
           return;
         }
         setCapital(res?.capital || null);
       } else {
-        const res = await fetchLiveCapital(user?.uid, accountToFetch);
-        // Guard against race conditions:
-        if (reqId !== capitalRequestIdRef.current || activeBrokerRef.current !== 'zerodha') {
+        const res = await fetchLiveCapital(uid, accountToFetch);
+        // Guard against race conditions & stale requests:
+        if (
+          reqId !== capitalRequestIdRef.current ||
+          activeBrokerRef.current !== 'zerodha' ||
+          activeAccountIdRef.current !== accountToFetch ||
+          activeUserUidRef.current !== uid
+        ) {
           return;
         }
-        // DataSource & broker validation: Zerodha must return ZERODHA_LIVE or MOCK_DATA and zerodha broker
         if (res?.capital && !validateBrokerCapitalPayload('zerodha', res.capital)) {
           setCapital(null);
           return;
@@ -291,45 +346,67 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
       }
     } catch (err) {
       console.warn('Failed to load account capital:', err);
-      // Clear capital on error only if this request is still the active one
-      if (reqId === capitalRequestIdRef.current && activeBrokerRef.current === brokerToFetch) {
+      if (
+        reqId === capitalRequestIdRef.current &&
+        activeBrokerRef.current === brokerToFetch &&
+        activeAccountIdRef.current === accountToFetch &&
+        activeUserUidRef.current === uid
+      ) {
         setCapital(null);
       }
     } finally {
-      if (reqId === capitalRequestIdRef.current && activeBrokerRef.current === brokerToFetch) {
+      if (
+        reqId === capitalRequestIdRef.current &&
+        activeBrokerRef.current === brokerToFetch &&
+        activeAccountIdRef.current === accountToFetch &&
+        activeUserUidRef.current === uid
+      ) {
         setLoadingCapital(false);
       }
     }
   }, [user?.uid, selectedAccountId]);
 
   // Load Positions and P&L (Phase 6C.1 & Phase 7D Race-Protected)
-  const loadPositionsAndPnl = useCallback(async (targetBroker?: 'zerodha' | 'angelone', targetAccountId?: string) => {
+  const loadPositionsAndPnl = useCallback(async (targetBroker?: 'zerodha' | 'angelone', targetAccountId?: string, isExplicitReconnect = false) => {
     const brokerToFetch = targetBroker || activeBrokerRef.current;
     const accountToFetch = targetAccountId || selectedAccountId;
+    const uid = user?.uid;
+    if (!uid) return;
+
+    if (brokerToFetch === 'angelone' && angelOneCircuitBrokenRef.current && !isExplicitReconnect) {
+      return;
+    }
+
     const reqId = ++positionsRequestIdRef.current;
     setLoadingPositions(true);
 
     try {
       loadAccountCapital(brokerToFetch, accountToFetch);
       if (brokerToFetch === 'angelone') {
-        const [angelPositionsRes, angelStat, pnl] = await Promise.all([
-          fetchAngelOnePositions(user?.uid, accountToFetch).catch((err) => {
+        const effectiveAccount = isSimulationMode ? DEFAULT_SIMULATION_ACCOUNT_ID : accountToFetch;
+        const [angelPositionsRes, pnl] = await Promise.all([
+          fetchAngelOnePositions(uid, effectiveAccount).catch((err) => {
             console.warn('Failed to fetch Angel One positions:', err);
             return null;
           }),
-          fetchAngelOneStatus(user?.uid, accountToFetch).catch((err) => {
-            console.warn('Failed to fetch Angel One status:', err);
-            return null;
-          }),
-          fetchGrossPnl(user?.uid, accountToFetch, 'angelone').catch((err) => {
+          fetchGrossPnl(uid, effectiveAccount, 'angelone').catch((err) => {
             console.warn('Failed to fetch Angel One P&L:', err);
             return null;
           }),
         ]);
-        if (reqId !== positionsRequestIdRef.current || activeBrokerRef.current !== 'angelone') {
+        if (
+          reqId !== positionsRequestIdRef.current ||
+          activeBrokerRef.current !== 'angelone' ||
+          activeAccountIdRef.current !== accountToFetch ||
+          activeUserUidRef.current !== uid
+        ) {
           return;
         }
-        if (angelPositionsRes?.connectionStatus === 'AUTHENTICATION_REQUIRED' || angelPositionsRes?.connectionStatus === 'CONFIGURATION_ERROR') {
+        if (
+          angelPositionsRes?.connectionStatus === 'AUTHENTICATION_REQUIRED' ||
+          angelPositionsRes?.connectionStatus === 'CONFIGURATION_ERROR'
+        ) {
+          angelOneCircuitBrokenRef.current = true;
           setAngelOneStatus({
             broker: 'angelone',
             status: angelPositionsRes.connectionStatus,
@@ -341,8 +418,6 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
             isMock: false,
             mode: 'live',
           });
-        } else if (angelStat) {
-          setAngelOneStatus(angelStat);
         }
         if (pnl) {
           setPnlResult(pnl);
@@ -351,62 +426,96 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
           }
         }
 
-        const isAngelConnected =
-          angelStat?.authenticated === true &&
-          (angelStat?.status === 'AUTHENTICATED' || angelStat?.status === 'CONNECTED');
+        const isAngelResConnected =
+          angelPositionsRes?.connectionStatus === 'AUTHENTICATED' ||
+          angelPositionsRes?.connectionStatus === 'CONNECTED';
 
-        if (isAngelConnected && angelPositionsRes && Array.isArray(angelPositionsRes.positions)) {
+        if (isAngelResConnected && angelPositionsRes && Array.isArray(angelPositionsRes.positions)) {
           setFnoPositions(angelPositionsRes.positions as NormalizedPosition[]);
-        } else {
-          // Angel One disconnected, expired, error, or missing positions -> clear positions immediately.
-          // Do NOT silently fall back to Zerodha or mock positions!
+        } else if (
+          angelPositionsRes?.connectionStatus === 'AUTHENTICATION_REQUIRED' ||
+          angelPositionsRes?.connectionStatus === 'DISCONNECTED' ||
+          angelPositionsRes?.connectionStatus === 'CONFIGURATION_ERROR' ||
+          (!isAngelResConnected && !isSimulationMode)
+        ) {
           setFnoPositions([]);
         }
       } else {
+        const isZerodhaLive = liveBrokerStatus?.authenticated === true && (liveBrokerStatus?.status === 'CONNECTED' || liveBrokerStatus?.status === 'AUTHENTICATED');
+        const effectiveAccount = isSimulationMode ? DEFAULT_SIMULATION_ACCOUNT_ID : accountToFetch;
         const [pos, status, pnl] = await Promise.all([
-          fetchFnoPositions(user?.uid, accountToFetch),
+          fetchFnoPositions(uid, effectiveAccount),
           fetchBrokerStatus(),
-          fetchGrossPnl(user?.uid, accountToFetch, 'zerodha'),
+          fetchGrossPnl(uid, effectiveAccount, 'zerodha'),
         ]);
-        if (reqId !== positionsRequestIdRef.current || activeBrokerRef.current !== 'zerodha') {
+        if (
+          reqId !== positionsRequestIdRef.current ||
+          activeBrokerRef.current !== 'zerodha' ||
+          activeAccountIdRef.current !== accountToFetch ||
+          activeUserUidRef.current !== uid
+        ) {
           return;
         }
-        setFnoPositions(pos);
+        if (!isZerodhaLive && !isSimulationMode) {
+          setFnoPositions([]);
+        } else {
+          setFnoPositions(pos);
+        }
         setBrokerStatus(status);
-        setPnlResult(pnl);
-        if (pnl && (pnl.riskSession || pnl.shadowSession)) {
-          setSession(pnl.riskSession || pnl.shadowSession);
+        if (pnl) {
+          setPnlResult(pnl);
+          if (pnl.riskSession || pnl.shadowSession) {
+            setSession(pnl.riskSession || pnl.shadowSession);
+          }
         }
       }
     } catch (err) {
-      console.error('Failed to load positions & PnL:', err);
-      if (reqId === positionsRequestIdRef.current && activeBrokerRef.current === brokerToFetch) {
+      console.warn('Failed to load positions & PnL:', err);
+      if (
+        reqId === positionsRequestIdRef.current &&
+        activeBrokerRef.current === brokerToFetch &&
+        activeAccountIdRef.current === accountToFetch &&
+        activeUserUidRef.current === uid
+      ) {
         if (brokerToFetch === 'angelone') {
           setFnoPositions([]);
-          setPnlResult(null);
         }
       }
     } finally {
-      if (reqId === positionsRequestIdRef.current && activeBrokerRef.current === brokerToFetch) {
+      if (
+        reqId === positionsRequestIdRef.current &&
+        activeBrokerRef.current === brokerToFetch &&
+        activeAccountIdRef.current === accountToFetch &&
+        activeUserUidRef.current === uid
+      ) {
         setLoadingPositions(false);
       }
     }
-  }, [user?.uid, selectedAccountId, loadAccountCapital]);
+  }, [user?.uid, selectedAccountId, loadAccountCapital, isSimulationMode]);
 
   // Load Live Diagnostics
   const loadLiveDiagnostics = useCallback(async () => {
-    if (!user) return;
+    const uid = user?.uid;
+    if (!uid) return;
     try {
-      const [res, angelRes] = await Promise.all([
-        fetchLiveBrokerStatus(user.uid),
-        fetchAngelOneStatus(user.uid, selectedAccountId),
-      ]);
-      setLiveBrokerStatus(res);
-      setAngelOneStatus(angelRes);
+      if (activeBrokerRef.current === 'angelone') {
+        if (!angelOneCircuitBrokenRef.current) {
+          const angelRes = await fetchAngelOneStatus(uid, selectedAccountId);
+          if (angelRes) {
+            setAngelOneStatus(angelRes);
+            if (angelRes.status === 'AUTHENTICATION_REQUIRED' || angelRes.status === 'CONFIGURATION_ERROR') {
+              angelOneCircuitBrokenRef.current = true;
+            }
+          }
+        }
+      } else {
+        const res = await fetchLiveBrokerStatus(uid);
+        setLiveBrokerStatus(res);
+      }
     } catch (err) {
-      console.error('Failed to fetch live broker status:', err);
+      console.warn('Failed to fetch live broker status:', err);
     }
-  }, [user]);
+  }, [user?.uid, selectedAccountId]);
 
   // Handle immediate switch of active broker (Phase 6C.1)
   const handleSelectBroker = (broker: 'zerodha' | 'angelone') => {
@@ -415,6 +524,7 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
     capitalRequestIdRef.current += 1;
     positionsRequestIdRef.current += 1;
     activeBrokerRef.current = broker;
+    angelOneCircuitBrokenRef.current = false;
 
     // Clear displayed capital immediately upon broker switch (set to null and loading state)
     setCapital(null);
@@ -433,6 +543,9 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
     );
     const targetAccountId = matchingAcc ? matchingAcc.connectionId : (broker === 'angelone' ? DEFAULT_ANGELONE_ACCOUNT_ID : DEFAULT_ACCOUNT_ID);
 
+    activeAccountIdRef.current = targetAccountId;
+    lastBrokerRef.current = broker;
+    lastAccountIdRef.current = targetAccountId;
     setSelectedBroker(broker);
     setSelectedAccountId(targetAccountId);
   };
@@ -459,34 +572,68 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
         : 'zerodha';
 
     activeBrokerRef.current = targetBroker;
+    activeAccountIdRef.current = newAccountId;
+    angelOneCircuitBrokenRef.current = false;
+    lastBrokerRef.current = targetBroker;
+    lastAccountIdRef.current = newAccountId;
     setSelectedBroker(targetBroker);
     setSelectedAccountId(newAccountId);
   };
 
   useEffect(() => {
-    // When selectedBroker, selectedAccountId or user changes, clear state immediately to prevent stale/cross-broker display
+    const currentUid = user?.uid;
+    const isNewUser = currentUid !== lastUserUidRef.current;
+    const isNewBroker = selectedBroker !== lastBrokerRef.current;
+    const isNewAccount = selectedAccountId !== lastAccountIdRef.current;
+
+    activeBrokerRef.current = selectedBroker;
+    activeAccountIdRef.current = selectedAccountId;
+    activeUserUidRef.current = currentUid;
+    lastUserUidRef.current = currentUid;
+    lastBrokerRef.current = selectedBroker;
+    lastAccountIdRef.current = selectedAccountId;
+
+    // Invalidate any prior in-flight requests
     capitalRequestIdRef.current += 1;
     positionsRequestIdRef.current += 1;
-    activeBrokerRef.current = selectedBroker;
-    setCapital(null);
-    setLoadingCapital(true);
-    setFnoPositions([]);
-    if (selectedBroker === 'angelone') {
-      setPnlResult(null);
+
+    // Clear state ONLY on explicit user change or account/broker switch
+    if (isNewUser || isNewBroker || isNewAccount) {
+      setCapital(null);
+      setLoadingCapital(true);
+      setFnoPositions([]);
+      if (selectedBroker === 'angelone') {
+        setPnlResult(null);
+      }
+      setLoadingPositions(true);
     }
-    setLoadingPositions(true);
 
     loadPositionsAndPnl(selectedBroker, selectedAccountId);
     loadLiveDiagnostics();
+
     const interval = setInterval(() => {
-      loadPositionsAndPnl(activeBrokerRef.current, selectedAccountId);
+      // If Angel One circuit breaker is tripped, do not execute automated polling
+      if (activeBrokerRef.current === 'angelone' && angelOneCircuitBrokenRef.current) {
+        return;
+      }
+      loadPositionsAndPnl(activeBrokerRef.current, activeAccountIdRef.current);
       loadLiveDiagnostics();
     }, 30000);
-    return () => clearInterval(interval);
-  }, [user, selectedBroker, selectedAccountId, loadPositionsAndPnl, loadLiveDiagnostics]);
+
+    return () => {
+      clearInterval(interval);
+      // Invalidate in-flight requests on teardown
+      capitalRequestIdRef.current += 1;
+      positionsRequestIdRef.current += 1;
+    };
+  }, [user?.uid, selectedBroker, selectedAccountId, loadPositionsAndPnl, loadLiveDiagnostics]);
 
   // Handle Kite Login
   const handleKiteLogin = async () => {
+    if (isSimulationMode || user?.isSandbox) {
+      setKiteAuthMessage({ type: 'error', text: 'Broker connection actions are disabled in Demo Mode.' });
+      return;
+    }
     if (!user) return;
     setAuthenticatingKite(true);
     setKiteAuthMessage(null);
@@ -513,6 +660,10 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
   // Handle Manual Token Submission
   const handleManualTokenSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (isSimulationMode || user?.isSandbox) {
+      setKiteAuthMessage({ type: 'error', text: 'Broker connection actions are disabled in Demo Mode.' });
+      return;
+    }
     if (!user || !manualToken.trim()) return;
     setSubmittingToken(true);
     setKiteAuthMessage(null);
@@ -580,6 +731,10 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
 
   // Handle Kite Disconnect
   const handleKiteDisconnect = async () => {
+    if (isSimulationMode || user?.isSandbox) {
+      setKiteAuthMessage({ type: 'error', text: 'Broker connection actions are disabled in Demo Mode.' });
+      return;
+    }
     if (!user) return;
     setDisconnectingKite(true);
     setKiteAuthMessage(null);
@@ -610,6 +765,10 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
   // Handle Angel One Connect Submission
   const handleAngelOneConnect = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (isSimulationMode || user?.isSandbox) {
+      setAngelOneAuthMessage({ type: 'error', text: 'Broker connection actions are disabled in Demo Mode.' });
+      return;
+    }
     if (!user || !angelOneClientCode.trim()) return;
     setAuthenticatingAngelOne(true);
     setAngelOneAuthMessage(null);
@@ -632,7 +791,8 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
         setAngelOnePassword('');
         setAngelOneTotp('');
         setAngelOneApiKey('');
-        await Promise.all([loadLiveDiagnostics(), loadPositionsAndPnl()]);
+        angelOneCircuitBrokenRef.current = false;
+        await Promise.all([loadLiveDiagnostics(), loadPositionsAndPnl('angelone', selectedAccountId, true)]);
       } else {
         setAngelOneAuthMessage({
           type: 'error',
@@ -651,17 +811,22 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
 
   // Handle Angel One Disconnect
   const handleAngelOneDisconnect = async () => {
+    if (isSimulationMode || user?.isSandbox) {
+      setAngelOneAuthMessage({ type: 'error', text: 'Broker connection actions are disabled in Demo Mode.' });
+      return;
+    }
     if (!user) return;
     setDisconnectingAngelOne(true);
     setAngelOneAuthMessage(null);
     try {
       const success = await disconnectAngelOneSession(user.uid);
       if (success) {
+        angelOneCircuitBrokenRef.current = true;
         setAngelOneAuthMessage({
           type: 'success',
           text: 'Angel One session disconnected. Switched to simulation mode.',
         });
-        await Promise.all([loadLiveDiagnostics(), loadPositionsAndPnl()]);
+        await Promise.all([loadLiveDiagnostics(), loadPositionsAndPnl('angelone', selectedAccountId, true)]);
       } else {
         setAngelOneAuthMessage({
           type: 'error',
@@ -683,19 +848,40 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
     setEvaluatingDemo(true);
     setDemoMessage(null);
     try {
+      const simAccountId = DEFAULT_SIMULATION_ACCOUNT_ID;
       const headers = await getAuthHeaders({
         'Content-Type': 'application/json',
         ...(user?.uid ? { 'x-user-id': user.uid } : {}),
-        'x-account-id': selectedAccountId,
+        'x-account-id': simAccountId,
       });
-      const res = await fetch(`/api/risk/evaluate?accountId=${encodeURIComponent(selectedAccountId)}`, {
+      const res = await fetch(`/api/risk/evaluate?accountId=${encodeURIComponent(simAccountId)}`, {
         method: 'POST',
         headers,
-        body: JSON.stringify({ pnl: targetPnl, accountId: selectedAccountId }),
+        body: JSON.stringify({ pnl: targetPnl, accountId: simAccountId }),
       });
       const data = await res.json();
       if (res.ok && data.session) {
         setSession(data.session);
+        setPnlResult({
+          tradingDate: data.session.tradingDate,
+          realisedPnl: targetPnl,
+          unrealisedPnl: 0,
+          totalPnl: targetPnl,
+          grossTradingPnl: targetPnl,
+          includedRealisedPnl: targetPnl,
+          includedUnrealisedPnl: 0,
+          dailyRealisedPnl: targetPnl,
+          dailyUnrealisedPnl: 0,
+          fnoPositionCount: 0,
+          totalPositionCount: 0,
+          positions: [],
+          source: 'SYNTHETIC_SIMULATION' as const,
+          dataSource: 'SYNTHETIC_SIMULATION' as const,
+          calculatedAt: new Date().toISOString(),
+          riskSession: data.session,
+          shadowSession: data.session,
+          isSimulated: true,
+        });
         setDemoMessage(`SIMULATION: Applied ${label} (${formatINR(targetPnl)}). Risk State: ${data.session.state}`);
       } else {
         setDemoMessage(data.error || 'Simulation evaluation failed');
@@ -711,21 +897,23 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
     setEvaluatingDemo(true);
     setDemoMessage(null);
     try {
+      const simAccountId = DEFAULT_SIMULATION_ACCOUNT_ID;
       const headers = await getAuthHeaders({
         'Content-Type': 'application/json',
         ...(user?.uid ? { 'x-user-id': user.uid } : {}),
-        'x-account-id': selectedAccountId,
+        'x-account-id': simAccountId,
       });
-      const res = await fetch(`/api/risk/evaluate?accountId=${encodeURIComponent(selectedAccountId)}`, {
+      const res = await fetch(`/api/risk/evaluate?accountId=${encodeURIComponent(simAccountId)}`, {
         method: 'POST',
         headers,
-        body: JSON.stringify({ reset: true, accountId: selectedAccountId }),
+        body: JSON.stringify({ reset: true, accountId: simAccountId }),
       });
       const data = await res.json();
       if (res.ok && data.session) {
         setSession(data.session);
+        setPnlResult(null);
         setDemoMessage('SIMULATION: Reset to baseline demo state.');
-        loadPositionsAndPnl();
+        loadPositionsAndPnl(undefined, simAccountId);
       } else {
         setDemoMessage(data.error || 'Failed to reset demo state');
       }
@@ -781,8 +969,6 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
       : isCurrentBrokerConnected;
 
   const isAngelLive = isAngelOneConnected && (pnlResult?.dataSource === 'ANGELONE_LIVE' || isPositionsLiveSourced);
-  const isLiveMode = selectedBroker === 'angelone' ? isAngelLive : (isPnlLiveSourced && isPositionsLiveSourced);
-  const isSimulationMode = !isLiveMode;
 
   // 3. Authoritative P&L Values
   // In LIVE MODE: Must display the validated live values from the frozen broker pipeline:
@@ -846,6 +1032,11 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
               <span className="text-xs font-mono font-bold uppercase tracking-widest px-2 py-0.5 rounded bg-white/50 dark:bg-black/20 border border-current/20">
                 Firewall Status
               </span>
+              {(session.isSimulated || pnlResult?.isSimulated) && (
+                <span className="text-xs font-mono font-bold uppercase tracking-widest px-2 py-0.5 rounded bg-purple-500/30 text-purple-900 dark:text-purple-200 border border-purple-500/40">
+                  SIMULATION
+                </span>
+              )}
               <span className="text-xs font-mono opacity-80">{tradingDate}</span>
             </div>
             <h1 className="text-2xl sm:text-3xl font-black tracking-tight mt-1 uppercase font-mono">
@@ -873,48 +1064,50 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
         </div>
       </div>
 
-      {/* Account Selector Bar */}
-      <div className="bg-white dark:bg-[#1F2633] p-4 rounded-xl border border-[#98C1D9]/40 dark:border-[#3D4A5E] shadow-xs flex flex-col sm:flex-row items-center justify-between gap-4">
-        <div className="flex items-center space-x-3">
-          <div className="p-2.5 rounded-xl bg-[#3D5A80]/10 text-[#3D5A80] dark:text-[#98C1D9]">
-            <Layers className="w-5 h-5" />
-          </div>
-          <div>
-            <h3 className="text-xs font-bold uppercase tracking-wider text-[#293241] dark:text-[#E0FBFC]">
-              Active Trading Account
-            </h3>
-            <p className="text-[11px] text-[#5C6B7E] dark:text-[#98C1D9] font-mono">
-              {getFriendlyAccountLabel(selectedAccountId, activeBrokerRef.current)} ({selectedAccountId})
-            </p>
-          </div>
-        </div>
-        <div className="flex items-center space-x-3 w-full sm:w-auto">
-          {accountsLoading ? (
-            <div className="text-xs text-[#3D5A80] dark:text-[#98C1D9] flex items-center space-x-2 font-mono px-3 py-2">
-              <RefreshCw className="w-3.5 h-3.5 animate-spin text-[#EE6C4D]" />
-              <span>DISCOVERING ACCOUNTS...</span>
+      {/* Account Selector Bar (Hidden in Simulation Mode) */}
+      {!isSimulationMode && (
+        <div className="bg-white dark:bg-[#1F2633] p-4 rounded-xl border border-[#98C1D9]/40 dark:border-[#3D4A5E] shadow-xs flex flex-col sm:flex-row items-center justify-between gap-4">
+          <div className="flex items-center space-x-3">
+            <div className="p-2.5 rounded-xl bg-[#3D5A80]/10 text-[#3D5A80] dark:text-[#98C1D9]">
+              <Layers className="w-5 h-5" />
             </div>
-          ) : (
-            <select
-              value={selectedAccountId}
-              onChange={(e) => handleSelectAccount(e.target.value)}
-              className="w-full sm:w-64 text-xs font-medium px-3 py-2 rounded-lg bg-slate-50 dark:bg-[#19202B] border border-[#98C1D9]/40 dark:border-[#3D4A5E] text-[#293241] dark:text-[#E0FBFC] focus:outline-hidden focus:border-[#3D5A80] cursor-pointer"
-            >
-              {connectedAccounts.map((acc) => {
-                const isZerodhaLive = acc.connection.broker === 'zerodha' && (isZerodhaConnected || liveBrokerStatus?.authenticated || isPnlLiveSourced);
-                const isAngelLive = acc.connection.broker === 'angelone' && (isAngelOneConnected || angelOneStatus?.authenticated);
-                const effectiveStatus = (isZerodhaLive || isAngelLive) ? 'CONNECTED' : acc.connection.status;
-                const label = getFriendlyAccountLabel(acc.connectionId, acc.connection.broker);
-                return (
-                  <option key={acc.connectionId} value={acc.connectionId}>
-                    {label} ({effectiveStatus})
-                  </option>
-                );
-              })}
-            </select>
-          )}
+            <div>
+              <h3 className="text-xs font-bold uppercase tracking-wider text-[#293241] dark:text-[#E0FBFC]">
+                Active Trading Account
+              </h3>
+              <p className="text-[11px] text-[#5C6B7E] dark:text-[#98C1D9] font-mono">
+                {getFriendlyAccountLabel(selectedAccountId, activeBrokerRef.current)} ({selectedAccountId})
+              </p>
+            </div>
+          </div>
+          <div className="flex items-center space-x-3 w-full sm:w-auto">
+            {accountsLoading ? (
+              <div className="text-xs text-[#3D5A80] dark:text-[#98C1D9] flex items-center space-x-2 font-mono px-3 py-2">
+                <RefreshCw className="w-3.5 h-3.5 animate-spin text-[#EE6C4D]" />
+                <span>DISCOVERING ACCOUNTS...</span>
+              </div>
+            ) : (
+              <select
+                value={selectedAccountId}
+                onChange={(e) => handleSelectAccount(e.target.value)}
+                className="w-full sm:w-64 text-xs font-medium px-3 py-2 rounded-lg bg-slate-50 dark:bg-[#19202B] border border-[#98C1D9]/40 dark:border-[#3D4A5E] text-[#293241] dark:text-[#E0FBFC] focus:outline-hidden focus:border-[#3D5A80] cursor-pointer"
+              >
+                {connectedAccounts.map((acc) => {
+                  const isZerodhaLive = acc.connection.broker === 'zerodha' && (isZerodhaConnected || liveBrokerStatus?.authenticated || isPnlLiveSourced);
+                  const isAngelLive = acc.connection.broker === 'angelone' && (isAngelOneConnected || angelOneStatus?.authenticated);
+                  const effectiveStatus = (isZerodhaLive || isAngelLive) ? 'CONNECTED' : acc.connection.status;
+                  const label = getFriendlyAccountLabel(acc.connectionId, acc.connection.broker);
+                  return (
+                    <option key={acc.connectionId} value={acc.connectionId}>
+                      {label} ({effectiveStatus})
+                    </option>
+                  );
+                })}
+              </select>
+            )}
+          </div>
         </div>
-      </div>
+      )}
 
       {/* Auth / Operational Notification Banner */}
       {kiteAuthMessage && (
@@ -1490,18 +1683,42 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
 
           <span className="text-slate-300 dark:text-[#3D4A5E] hidden sm:inline">|</span>
 
-          {/* Mode Indicator (Rules 1, 2, 6, 7) */}
-          <div className="flex items-center space-x-1.5 font-mono">
+          {/* Mode Indicator & Mode Switcher */}
+          <div className="flex items-center space-x-2 font-mono">
             <span className="text-[#5C6B7E] dark:text-[#98C1D9]">Mode:</span>
             {isLiveMode ? (
-              <span className="font-bold text-emerald-600 dark:text-emerald-400 flex items-center space-x-1">
-                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
-                <span>LIVE MODE</span>
-              </span>
+              <div className="flex items-center space-x-2">
+                <span className="font-bold text-emerald-600 dark:text-emerald-400 flex items-center space-x-1">
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                  <span>LIVE MODE</span>
+                </span>
+                {!isDemoIdentity && (
+                  <button
+                    type="button"
+                    onClick={() => handleToggleDemoMode(true)}
+                    className="text-[10px] px-2 py-0.5 rounded bg-slate-100 hover:bg-slate-200 dark:bg-[#19202B] dark:hover:bg-[#283244] text-[#5C6B7E] dark:text-[#98C1D9] border border-[#98C1D9]/40 dark:border-[#3D4A5E] font-medium transition-colors cursor-pointer"
+                    title="Switch to Demo & Simulation Mode"
+                  >
+                    Try Demo Mode
+                  </button>
+                )}
+              </div>
             ) : (
-              <span className="font-bold text-amber-700 dark:text-amber-300 px-2 py-0.5 rounded bg-amber-500/10 border border-dashed border-amber-500/30 uppercase tracking-wider text-[11px]">
-                SIMULATION MODE
-              </span>
+              <div className="flex items-center space-x-2">
+                <span className="font-bold text-amber-700 dark:text-amber-300 px-2 py-0.5 rounded bg-amber-500/10 border border-dashed border-amber-500/30 uppercase tracking-wider text-[11px]">
+                  SIMULATION MODE
+                </span>
+                {!isDemoIdentity && (
+                  <button
+                    type="button"
+                    onClick={() => handleToggleDemoMode(false)}
+                    className="text-[10px] px-2 py-0.5 rounded bg-emerald-50 hover:bg-emerald-100 dark:bg-emerald-950/30 dark:hover:bg-emerald-900/40 text-emerald-700 dark:text-emerald-300 border border-emerald-500/30 font-medium transition-colors cursor-pointer"
+                    title="Exit Demo Mode and return to Live Mode"
+                  >
+                    Return to Live Mode
+                  </button>
+                )}
+              </div>
             )}
           </div>
 
@@ -1511,23 +1728,27 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
           <div className="flex items-center gap-1 p-0.5 bg-slate-100 dark:bg-[#19202B] rounded-lg border border-[#98C1D9]/30 dark:border-[#3D4A5E]">
             <button
               type="button"
+              disabled={isSimulationMode || user?.isSandbox}
               onClick={() => handleSelectBroker('zerodha')}
-              className={`px-2.5 py-1 text-xs font-semibold rounded-md transition-colors cursor-pointer ${
+              className={`px-2.5 py-1 text-xs font-semibold rounded-md transition-colors ${
                 selectedBroker === 'zerodha'
                   ? 'bg-white dark:bg-[#283244] text-[#293241] dark:text-[#E0FBFC] shadow-2xs'
-                  : 'text-[#5C6B7E] dark:text-[#98C1D9] hover:text-slate-900 dark:hover:text-white'
-              }`}
+                  : 'text-[#5C6B7E] dark:text-[#98C1D9]'
+              } ${(isSimulationMode || user?.isSandbox) ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer hover:text-slate-900 dark:hover:text-white'}`}
+              title={(isSimulationMode || user?.isSandbox) ? 'Broker selection disabled in Demo Mode' : 'Switch to Zerodha'}
             >
               Zerodha
             </button>
             <button
               type="button"
+              disabled={isSimulationMode || user?.isSandbox}
               onClick={() => handleSelectBroker('angelone')}
-              className={`px-2.5 py-1 text-xs font-semibold rounded-md transition-colors cursor-pointer ${
+              className={`px-2.5 py-1 text-xs font-semibold rounded-md transition-colors ${
                 selectedBroker === 'angelone'
                   ? 'bg-white dark:bg-[#283244] text-[#293241] dark:text-[#E0FBFC] shadow-2xs'
-                  : 'text-[#5C6B7E] dark:text-[#98C1D9] hover:text-slate-900 dark:hover:text-white'
-              }`}
+                  : 'text-[#5C6B7E] dark:text-[#98C1D9]'
+              } ${(isSimulationMode || user?.isSandbox) ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer hover:text-slate-900 dark:hover:text-white'}`}
+              title={(isSimulationMode || user?.isSandbox) ? 'Broker selection disabled in Demo Mode' : 'Switch to Angel One'}
             >
               Angel One
             </button>
@@ -1536,7 +1757,11 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
           <span className="text-slate-300 dark:text-[#3D4A5E] hidden sm:inline">|</span>
 
           {/* Broker Connection & Actions */}
-          {selectedBroker === 'zerodha' ? (
+          {(isSimulationMode || user?.isSandbox) ? (
+            <div className="flex items-center space-x-2 text-slate-500 font-mono text-[11px] italic">
+              <span>Broker connections disabled in Demo Mode</span>
+            </div>
+          ) : selectedBroker === 'zerodha' ? (
             <div className="flex items-center space-x-2">
               <span
                 className={`w-2 h-2 rounded-full ${
@@ -1684,33 +1909,38 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
                 </div>
               )}
 
-              <div className="flex flex-wrap items-center gap-2 pt-1">
-                <button
-                  onClick={() => handleSimulatePnl(effectivePnl + 2000, '+₹2,000')}
-                  disabled={evaluatingDemo}
-                  className="px-3 py-1.5 bg-white dark:bg-[#1F2633] hover:bg-emerald-50 dark:hover:bg-emerald-950/20 text-emerald-700 dark:text-emerald-300 border border-emerald-500/30 rounded-xl text-xs font-mono font-bold cursor-pointer disabled:opacity-50 transition-colors shadow-2xs"
-                  title="Simulate profit increase of ₹2,000"
-                >
-                  +₹2,000
-                </button>
+              {(() => {
+                const simulatedBasePnl = (session.isSimulated || pnlResult?.isSimulated)
+                  ? (session.simulatedPnl ?? session.currentPnl ?? pnlResult?.totalPnl ?? 0)
+                  : 0;
+                return (
+                  <div className="flex flex-wrap items-center gap-2 pt-1">
+                    <button
+                      onClick={() => handleSimulatePnl(simulatedBasePnl + 2000, '+₹2,000')}
+                      disabled={evaluatingDemo}
+                      className="px-3 py-1.5 bg-white dark:bg-[#1F2633] hover:bg-emerald-50 dark:hover:bg-emerald-950/20 text-emerald-700 dark:text-emerald-300 border border-emerald-500/30 rounded-xl text-xs font-mono font-bold cursor-pointer disabled:opacity-50 transition-colors shadow-2xs"
+                      title="Simulate profit increase of ₹2,000"
+                    >
+                      +₹2,000
+                    </button>
 
-                <button
-                  onClick={() => handleSimulatePnl(effectivePnl - 2000, '-₹2,000')}
-                  disabled={evaluatingDemo}
-                  className="px-3 py-1.5 bg-white dark:bg-[#1F2633] hover:bg-amber-50 dark:hover:bg-amber-950/20 text-amber-700 dark:text-amber-300 border border-amber-500/30 rounded-xl text-xs font-mono font-bold cursor-pointer disabled:opacity-50 transition-colors shadow-2xs"
-                  title="Simulate loss increase of ₹2,000"
-                >
-                  -₹2,000
-                </button>
+                    <button
+                      onClick={() => handleSimulatePnl(simulatedBasePnl - 2000, '-₹2,000')}
+                      disabled={evaluatingDemo}
+                      className="px-3 py-1.5 bg-white dark:bg-[#1F2633] hover:bg-amber-50 dark:hover:bg-amber-950/20 text-amber-700 dark:text-amber-300 border border-amber-500/30 rounded-xl text-xs font-mono font-bold cursor-pointer disabled:opacity-50 transition-colors shadow-2xs"
+                      title="Simulate loss increase of ₹2,000"
+                    >
+                      -₹2,000
+                    </button>
 
-                <button
-                  onClick={() => handleSimulatePnl(effectivePnl - 5000, '-₹5,000')}
-                  disabled={evaluatingDemo}
-                  className="px-3 py-1.5 bg-white dark:bg-[#1F2633] hover:bg-rose-50 dark:hover:bg-rose-950/20 text-rose-700 dark:text-rose-300 border border-rose-500/30 rounded-xl text-xs font-mono font-bold cursor-pointer disabled:opacity-50 transition-colors shadow-2xs"
-                  title="Simulate loss increase of ₹5,000"
-                >
-                  -₹5,000
-                </button>
+                    <button
+                      onClick={() => handleSimulatePnl(simulatedBasePnl - 5000, '-₹5,000')}
+                      disabled={evaluatingDemo}
+                      className="px-3 py-1.5 bg-white dark:bg-[#1F2633] hover:bg-rose-50 dark:hover:bg-rose-950/20 text-rose-700 dark:text-rose-300 border border-rose-500/30 rounded-xl text-xs font-mono font-bold cursor-pointer disabled:opacity-50 transition-colors shadow-2xs"
+                      title="Simulate loss increase of ₹5,000"
+                    >
+                      -₹5,000
+                    </button>
 
                 <button
                   onClick={() => handleSimulatePnl(-(activeConfig.dailyLossLimit + 500), 'Loss Limit Breach')}
@@ -1730,26 +1960,32 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
                   {evaluatingDemo ? 'Processing...' : 'Reset Demo'}
                 </button>
               </div>
-            </div>
+            );
+          })()}
+        </div>
           )}
         </div>
       )}
 
-      {/* BROKER ACCOUNT CAPITAL & MARGINS CARD (Phase 5B) */}
-      <AccountCapitalCard
-        selectedBroker={selectedBroker}
-        capital={capital}
-        loading={loadingCapital}
-        onRefresh={() => loadAccountCapital(selectedBroker)}
-      />
+      {/* BROKER ACCOUNT CAPITAL & MARGINS CARD (Hidden in Simulation Mode) */}
+      {!isSimulationMode && (
+        <AccountCapitalCard
+          selectedBroker={selectedBroker}
+          capital={capital}
+          loading={loadingCapital}
+          onRefresh={() => loadAccountCapital(selectedBroker)}
+        />
+      )}
 
-      {/* OPERATIONAL RISK EVENTS & ACTIVITY PANEL (Phase 9C) */}
-      <RiskEventsPanel
-        selectedAccountId={selectedAccountId}
-        selectedBroker={selectedBroker}
-        userUid={user?.uid}
-        onRefreshTriggered={loadPositionsAndPnl}
-      />
+      {/* OPERATIONAL RISK EVENTS & ACTIVITY PANEL (Hidden in Simulation Mode) */}
+      {!isSimulationMode && (
+        <RiskEventsPanel
+          selectedAccountId={selectedAccountId}
+          selectedBroker={selectedBroker}
+          userUid={user?.uid}
+          onRefreshTriggered={loadPositionsAndPnl}
+        />
+      )}
 
       {/* 4. POSITIONS TABLE (Hides zero-quantity positions by default, clear mode context) */}
       <div className="bg-white dark:bg-[#1F2633] rounded-2xl border border-[#98C1D9]/40 dark:border-[#3D4A5E] overflow-hidden shadow-xs transition-colors">

@@ -126,7 +126,7 @@ export const AuthGate: React.FC = () => {
           <div className="relative flex py-1.5 items-center">
             <div className="flex-grow border-t border-[#98C1D9]/40 dark:border-[#3D4A5E]"></div>
             <span className="flex-shrink mx-3 text-[10px] text-[#3D5A80] dark:text-[#98C1D9] uppercase tracking-widest font-mono">
-              or sandbox
+              or demo mode
             </span>
             <div className="flex-grow border-t border-[#98C1D9]/40 dark:border-[#3D4A5E]"></div>
           </div>
@@ -136,7 +136,7 @@ export const AuthGate: React.FC = () => {
             className="w-full flex items-center justify-center space-x-2 bg-white dark:bg-[#283244] hover:bg-[#E0FBFC]/30 dark:hover:bg-[#3D4A5E]/40 text-[#293241] dark:text-[#E0FBFC] border border-[#98C1D9]/50 dark:border-[#3D4A5E] font-medium py-2.5 px-4 rounded-xl transition-colors text-xs cursor-pointer shadow-2xs"
           >
             <PlayCircle className="w-4 h-4 text-[#EE6C4D]" />
-            <span>Enter Sandbox Demo Mode</span>
+            <span>Enter Demo Mode</span>
           </button>
 
           <p className="text-center text-[10px] text-[#5C6B7E] dark:text-[#98C1D9] font-sans pt-1">

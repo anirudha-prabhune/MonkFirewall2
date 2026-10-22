@@ -42,6 +42,16 @@ function sendJson(res: Response | any, data: any, status = 200) {
   res.end(JSON.stringify(data));
 }
 
+function isDemoUser(userId: string, req?: Request): boolean {
+  if (userId === 'mock-trader-sandbox' || userId.startsWith('mock-')) {
+    return true;
+  }
+  if (req?.headers['x-demo-mode'] === 'true' || req?.query?.demo === 'true') {
+    return true;
+  }
+  return false;
+}
+
 // Health Check
 apiRouter.get('/health', (req: Request, res: Response) => {
   sendJson(res, {
@@ -125,15 +135,26 @@ apiRouter.get('/positions/fno', async (req: Request, res: Response) => {
           const fnoPositions = normalized.filter((p) => p.isFno === true && !p.unknownInstrument);
           return sendJson(res, {
             dataSource: 'ANGELONE_LIVE',
+            connectionStatus: connStatus.status,
             count: fnoPositions.length,
             positions: fnoPositions,
           });
         } catch (err: any) {
           console.info('[AngelOne] Positions unavailable for session:', err?.message || err);
+          const updatedStatus = await liveAngelOneAdapter.getConnectionStatus(userId, { connectionId: accountId });
+          return sendJson(res, {
+            dataSource: 'ANGELONE_LIVE',
+            connectionStatus: updatedStatus.status,
+            diagnosticNote: err instanceof Error ? err.message : String(err),
+            count: 0,
+            positions: [],
+          });
         }
       }
       return sendJson(res, {
         dataSource: 'ANGELONE_LIVE',
+        connectionStatus: connStatus.status,
+        diagnosticNote: connStatus.message || 'Angel One session not authenticated',
         count: 0,
         positions: [],
       });
@@ -509,7 +530,8 @@ apiRouter.get('/broker/angelone/live/positions', async (req: Request, res: Respo
         dataSource: 'ANGELONE_LIVE',
         positionCount: 0,
         fnoPositionCount: 0,
-        positions: [],
+        positions: null,
+        isUnavailable: true,
         timestamp: new Date().toISOString(),
         diagnosticNote: 'Angel One not authenticated',
       });
@@ -540,10 +562,13 @@ apiRouter.get('/broker/angelone/live/positions', async (req: Request, res: Respo
         dataSource: 'ANGELONE_LIVE',
         positionCount: 0,
         fnoPositionCount: 0,
-        positions: [],
+        positions: null,
+        isStale: true,
+        isUnavailable: true,
+        error: posErr instanceof Error ? posErr.message : 'Failed to fetch Angel One positions',
         timestamp: new Date().toISOString(),
         diagnosticNote: posErr instanceof Error ? posErr.message : 'Failed to fetch Angel One positions',
-      });
+      }, 502);
     }
   } catch (err) {
     sendJson(res, { error: err instanceof Error ? err.message : 'Failed to fetch Angel One positions' }, 500);
@@ -648,6 +673,10 @@ const handleSaveCredentials = async (req: Request, res: Response) => {
   try {
     const userId = (req as any).userId || await authenticateRequest(req, res);
     if (!userId) return;
+
+    if (isDemoUser(userId, req)) {
+      return sendJson(res, { success: false, error: 'DEMO_MODE_RESTRICTION', message: 'Broker connections and credentials cannot be modified in Demo Mode.' }, 403);
+    }
 
     const paramBroker = (req.params.broker || req.body?.broker || '').toLowerCase();
     const accountId = (req.body?.accountId as string) || (req.body?.connectionId as string) || (req.query?.accountId as string) || (req.headers['x-account-id'] as string) || undefined;
@@ -832,6 +861,10 @@ const handleReconnectBroker = async (req: Request, res: Response) => {
     const userId = (req as any).userId || await authenticateRequest(req, res);
     if (!userId) return;
 
+    if (isDemoUser(userId, req)) {
+      return sendJson(res, { success: false, error: 'DEMO_MODE_RESTRICTION', message: 'Broker connections and credentials cannot be modified in Demo Mode.' }, 403);
+    }
+
     const paramBroker = (req.params.broker || req.body?.broker || '').toLowerCase();
     const accountId = (req.body?.accountId as string) || (req.query?.accountId as string) || (req.headers['x-account-id'] as string) || undefined;
 
@@ -928,6 +961,41 @@ apiRouter.get('/pnl', async (req: Request, res: Response) => {
 
     const accountId = (req.query?.accountId as string) || (req.headers['x-account-id'] as string) || undefined;
     const config = await ServerRiskStore.getConfig(userId, accountId);
+
+    // Isolated Simulation Check: Serve active simulation session if active
+    const simSession = await ServerRiskStore.getSimulatedSession(userId, accountId);
+    if (simSession && simSession.isSimulated === true) {
+      const simPnl = simSession.simulatedPnl ?? simSession.currentPnl ?? 0;
+      const simLoss = simSession.lossAmount ?? (simPnl < 0 ? Math.abs(simPnl) : 0);
+      return sendJson(res, {
+        tradingDate: simSession.tradingDate,
+        realisedPnl: simSession.realisedPnl ?? simPnl,
+        unrealisedPnl: simSession.unrealisedPnl ?? 0,
+        totalPnl: simPnl,
+        grossTradingPnl: simPnl,
+        dailyRealisedPnl: simSession.realisedPnl ?? simPnl,
+        dailyUnrealisedPnl: simSession.unrealisedPnl ?? 0,
+        fnoPositionCount: 0,
+        totalPositionCount: 0,
+        positions: [],
+        source: 'SYNTHETIC_SIMULATION' as const,
+        dataSource: 'SYNTHETIC_SIMULATION' as const,
+        calculatedAt: new Date().toISOString(),
+        riskSession: simSession,
+        shadowSession: simSession,
+        state: simSession.state,
+        currentPnl: simPnl,
+        lossAmount: simLoss,
+        dailyLossLimit: config.dailyLossLimit,
+        executionMode: config.executionMode || 'ENFORCE',
+        lossUtilizedPercent: Math.min(100, Math.round((simLoss / config.dailyLossLimit) * 100)),
+        warningThreshold1: config.warningThreshold1,
+        warningThreshold2: config.warningThreshold2,
+        isBreached: simSession.isBreached,
+        isSimulated: true,
+      });
+    }
+
     const isAngelOne = (accountId && (accountId === 'acc_mt_angelone_default' || accountId.includes('angelone'))) || req.query?.broker === 'angelone' || req.headers['x-broker'] === 'angelone';
 
     if (isAngelOne) {
@@ -975,17 +1043,19 @@ apiRouter.get('/pnl', async (req: Request, res: Response) => {
         }
       }
 
-      // Angel One is not connected or not authenticated - return explicit disconnected state without Zerodha leakage
+      // Angel One is not connected or positions unavailable - return stale state preserving riskSession
       const latestConnStatus = await liveAngelOneAdapter.getConnectionStatus(userId, { connectionId: accountId });
       const accountSession = await ServerRiskStore.getSession(userId, undefined, accountId);
+      const preservedPnl = accountSession?.currentPnl ?? accountSession?.realisedPnl ?? 0;
+      const preservedLoss = accountSession?.lossAmount ?? (preservedPnl < 0 ? Math.abs(preservedPnl) : 0);
       return sendJson(res, {
         tradingDate: getTradingDateKolkata(),
-        realisedPnl: 0,
-        unrealisedPnl: 0,
-        totalPnl: 0,
-        grossTradingPnl: 0,
-        dailyRealisedPnl: 0,
-        dailyUnrealisedPnl: 0,
+        realisedPnl: accountSession?.realisedPnl ?? preservedPnl,
+        unrealisedPnl: accountSession?.unrealisedPnl ?? 0,
+        totalPnl: preservedPnl,
+        grossTradingPnl: preservedPnl,
+        dailyRealisedPnl: accountSession?.realisedPnl ?? preservedPnl,
+        dailyUnrealisedPnl: accountSession?.unrealisedPnl ?? 0,
         fnoPositionCount: 0,
         totalPositionCount: 0,
         positions: [],
@@ -995,12 +1065,15 @@ apiRouter.get('/pnl', async (req: Request, res: Response) => {
         riskSession: accountSession,
         shadowSession: accountSession,
         state: accountSession?.state || 'ALLOW',
-        currentPnl: 0,
-        lossAmount: accountSession?.lossAmount ?? 0,
+        currentPnl: preservedPnl,
+        lossAmount: preservedLoss,
         dailyLossLimit: config.dailyLossLimit,
         executionMode: config.executionMode || 'ENFORCE',
         broker: 'angelone',
         connectionStatus: latestConnStatus.status,
+        isStale: true,
+        isUnavailable: true,
+        error: 'Angel One positions unavailable',
       });
     }
 
@@ -1307,6 +1380,13 @@ apiRouter.get('/risk', async (req: Request, res: Response) => {
     const userId = (req as any).userId || await authenticateRequest(req, res);
     if (!userId) return;
     const accountId = (req.query?.accountId as string) || (req.headers['x-account-id'] as string) || undefined;
+
+    // Isolated Simulation Check: Serve active simulation session if active
+    const simSession = await ServerRiskStore.getSimulatedSession(userId, accountId);
+    if (simSession && simSession.isSimulated === true) {
+      return sendJson(res, simSession);
+    }
+
     if (!(await getLiveRiskStateRecordingEnabled(userId))) {
       const liveAdapter = BrokerService.getLiveAdapter();
       const connStatus = await liveAdapter.getConnectionStatus(userId);
@@ -1400,25 +1480,30 @@ apiRouter.put('/risk/config', async (req: Request, res: Response) => {
   }
 });
 
-// GET /api/lock/status - Authoritative Lock State
-apiRouter.get('/lock/status', async (req: Request, res: Response) => {
+// GET /api/lock/status & /api/risk/lock-status - Authoritative Lock State
+const getLockStatusHandler = async (req: Request, res: Response) => {
   try {
     const userId = (req as any).userId || await authenticateRequest(req, res);
     if (!userId) return;
-    const accountId = (req.query?.accountId as string) || (req.headers['x-account-id'] as string) || undefined;
+    const rawAccountId = (req.query?.accountId as string) || (req.headers['x-account-id'] as string) || undefined;
+    const accountId = typeof rawAccountId === 'string' && rawAccountId.trim().length > 0 ? rawAccountId.trim() : undefined;
     const status = await ServerRiskStore.getLockStatus(userId, accountId);
     sendJson(res, { ...status, authority: 'server' });
   } catch (err) {
     sendJson(res, { error: err instanceof Error ? err.message : 'Failed to fetch lock status' }, 500);
   }
-});
+};
+apiRouter.get('/lock/status', getLockStatusHandler);
+apiRouter.get('/risk/lock-status', getLockStatusHandler);
 
 // GET /api/enforcement/status - Phase 6 Authoritative Enforcement State
 apiRouter.get('/enforcement/status', async (req: Request, res: Response) => {
   try {
     const userId = (req as any).userId || await authenticateRequest(req, res);
     if (!userId) return;
-    const state = await EnforcementService.getEnforcementState(userId);
+    const rawAccountId = (req.query?.accountId as string) || (req.headers['x-account-id'] as string) || undefined;
+    const accountId = typeof rawAccountId === 'string' && rawAccountId.trim().length > 0 ? rawAccountId.trim() : undefined;
+    const state = await EnforcementService.getEnforcementState(userId, undefined, accountId);
     sendJson(res, state);
   } catch (err) {
     sendJson(res, { error: err instanceof Error ? err.message : 'Failed to retrieve enforcement state' }, 500);
@@ -1485,14 +1570,7 @@ apiRouter.post('/risk/evaluate', async (req: Request, res: Response) => {
 
     // If demo reset is requested:
     if (req.body?.reset === true) {
-      if (!isSandboxUser && !isTestEnvironment) {
-        return sendJson(
-          res,
-          { error: 'FORBIDDEN_IN_PRODUCTION', message: 'Demo state reset is restricted to sandbox mode.' },
-          403
-        );
-      }
-      const resetSession = await ServerRiskStore.resetSession(userId, accountId);
+      const resetSession = await ServerRiskStore.resetSimulatedSession(userId, accountId);
       return sendJson(res, {
         success: true,
         state: resetSession.state,
@@ -1504,17 +1582,10 @@ apiRouter.post('/risk/evaluate', async (req: Request, res: Response) => {
 
     // If developer testing panel passes simulated pnl input:
     if (req.body?.pnl !== undefined) {
-      if (!isSandboxUser && !isTestEnvironment) {
-        return sendJson(
-          res,
-          { error: 'FORBIDDEN_IN_PRODUCTION', message: 'Synthetic P&L evaluation is restricted to sandbox/test mode.' },
-          403
-        );
-      }
       if (typeof req.body.pnl !== 'number' || isNaN(req.body.pnl)) {
         return sendJson(res, { error: 'Valid numeric pnl is required for simulation' }, 400);
       }
-      const result = await ServerRiskStore.evaluatePnl(userId, req.body.pnl, evalDate, accountId);
+      const result = await ServerRiskStore.evaluateSimulatedPnl(userId, req.body.pnl, evalDate, accountId);
       return sendJson(res, result);
     }
 

@@ -54,10 +54,12 @@ export async function requireTradingAccess(
   res: Response,
   next: NextFunction
 ): Promise<void> {
-  const userId = (req as any).userId || await authenticateRequest(req, res);
-  if (!userId) return;
-
-  const decision = await EnforcementService.checkTradingAccess(userId);
+  const userId = (req as any).userId || (await authenticateRequest(req, res));
+  if (!userId) {
+    return;
+  }
+  const accountId = (req.query?.accountId as string) || (req.headers['x-account-id'] as string) || undefined;
+  const decision = await EnforcementService.checkTradingAccess(userId, undefined, accountId);
 
   if (!decision.allowed) {
     res.status(decision.statusCode).json({

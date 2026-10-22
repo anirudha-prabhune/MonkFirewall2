@@ -32,6 +32,7 @@ export interface EnforcementState {
   evaluatedAt: string;
   reason: string;
   authority: 'server';
+  accountId?: string;
 }
 
 export interface EnforcementDecision {

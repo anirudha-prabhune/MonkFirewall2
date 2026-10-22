@@ -71,4 +71,5 @@ export interface PnlResult {
   shadowRisk?: any;
   liveRiskStateRecordingEnabled?: boolean;
   recordingStatus?: string;
+  isSimulated?: boolean;
 }

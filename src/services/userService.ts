@@ -15,7 +15,7 @@ export async function syncUserProfile(user: AppUser | { uid: string; email?: str
     return {
       uid: user.uid,
       email: user.email || 'anirudha.prabhune@gmail.com',
-      displayName: user.displayName || 'Sandbox Trader',
+      displayName: user.displayName || 'Demo Trader',
       photoURL: user.photoURL || '',
       createdAt: now,
       lastLoginAt: now,
@@ -101,7 +101,7 @@ export async function getUserProfile(userId: string): Promise<UserProfile | null
     return {
       uid: userId,
       email: 'anirudha.prabhune@gmail.com',
-      displayName: 'Sandbox Trader',
+      displayName: 'Demo Trader',
       createdAt: new Date().toISOString(),
       lastLoginAt: new Date().toISOString(),
       isSandbox: true,

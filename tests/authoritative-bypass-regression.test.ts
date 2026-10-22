@@ -139,6 +139,7 @@ async function runAuthoritativeBypassRegressionTests() {
         serverBody = JSON.parse(init.body);
         return {
           ok: true,
+          headers: { get: (name: string) => (name.toLowerCase() === 'content-type' ? 'application/json' : null) },
           json: async () => ({
             success: true,
             config: { ...DEFAULT_RISK_CONFIG, ...serverBody },
@@ -275,6 +276,9 @@ async function runAuthoritativeBypassRegressionTests() {
         failedClosed = true;
       }
     } finally {
+      if (ServerRiskStore.getIsPersistenceDegraded()) {
+        failedClosed = true;
+      }
       setAdminFirestoreForTesting(null);
       enableMockStoreForTesting(true);
     }

@@ -247,7 +247,7 @@ export const SystemHealth: React.FC = () => {
             <div className="flex justify-between py-1 border-b border-slate-100 dark:border-[#3D4A5E] dark:border-[#3D4A5E]">
               <span className="text-[#3D5A80] dark:text-[#98C1D9] font-sans">Session Mode</span>
               <span className={user?.isSandbox ? "text-[#EE6C4D] dark:text-[#98C1D9] font-bold" : "text-emerald-600 dark:text-emerald-400 font-bold"}>
-                {user?.isSandbox ? 'SANDBOX / DEV MODE' : 'FIREBASE AUTH (GOOGLE SSO)'}
+                {user?.isSandbox ? 'DEMO / SIMULATION MODE' : 'FIREBASE AUTH (GOOGLE SSO)'}
               </span>
             </div>
             <div className="flex justify-between py-1 border-b border-slate-100 dark:border-[#3D4A5E] dark:border-[#3D4A5E]">

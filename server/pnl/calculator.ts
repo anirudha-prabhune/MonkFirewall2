@@ -81,8 +81,11 @@ export function calculatePositionPnl(pos: NormalizedPosition): PositionPnl {
   if (overnightQty === 0) {
     if (qty === 0) {
       // Fully closed intraday position
-      if (daySellQty > 0 && dayBuyQty > 0) {
+      if (daySellQty > 0 && dayBuyQty > 0 && daySellVal > 0 && dayBuyVal > 0) {
         dailyRealisedDec = new Decimal(daySellVal).minus(new Decimal(dayBuyVal)).times(multDec);
+        if (dailyRealisedDec.isZero() && pos.realisedPnl !== 0) {
+          dailyRealisedDec = new Decimal(pos.realisedPnl).times(multDec);
+        }
       } else {
         dailyRealisedDec = new Decimal(pos.realisedPnl).times(multDec);
       }

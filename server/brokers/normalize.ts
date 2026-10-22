@@ -88,35 +88,36 @@ export function normalizePosition(
   // An unknown or unresolved instrument MUST NEVER become isFno=true.
   // REMOVE all fallback logic that derives F&O classification from exchange guesses,
   // tradingsymbol suffixes, inferred segment values, or symbol heuristics.
-  let instrument = instrumentMap?.get(token);
-  if (!instrument && instrumentMap && raw.tradingsymbol) {
-    const rawSym = raw.tradingsymbol.trim().toUpperCase();
-    for (const inst of instrumentMap.values()) {
-      if (inst.tradingsymbol.toUpperCase() === rawSym) {
-        instrument = inst;
-        break;
-      }
-    }
-  }
-  const isUnknown = !instrument;
+  const instrument = instrumentMap?.get(token);
+  const upperExch = (raw.exchange || '').toUpperCase().trim();
+  const isDerivativeExchange = upperExch === 'NFO' || upperExch === 'BFO' || upperExch.startsWith('NFO-') || upperExch.startsWith('BFO-');
 
+  let isUnknown = !instrument;
   let classification: InstrumentClassification;
-  if (!instrument) {
-    // Unknown instrument metadata:
-    // Strictly DO NOT infer segment from raw exchange, tradingsymbol, or heuristics.
-    // Strictly assign segment = 'UNKNOWN', isFno = false, category = 'OTHER', type = 'OTHER'.
+
+  if (instrument) {
+    classification = classifyInstrument({
+      segment: instrument.segment,
+      instrumentType: instrument.instrumentType,
+    });
+  } else if (isDerivativeExchange) {
+    const sym = (raw.tradingsymbol || '').toUpperCase();
+    const rawProd = (raw.product || '').toUpperCase();
+    const isOption = sym.endsWith('CE') || sym.endsWith('PE') || rawProd.includes('OPT');
+    const instType = isOption ? 'OPT' : 'FUT';
+    const seg = upperExch.startsWith('NFO') ? 'NFO' : upperExch.startsWith('BFO') ? 'BFO' : upperExch;
+    classification = classifyInstrument({
+      segment: seg,
+      instrumentType: instType,
+    });
+    isUnknown = false;
+  } else {
     classification = {
       isFno: false,
       category: 'OTHER',
       type: 'OTHER',
       segment: 'UNKNOWN',
     };
-  } else {
-    // Authoritative instrument metadata found: classify strictly by metadata
-    classification = classifyInstrument({
-      segment: instrument.segment,
-      instrumentType: instrument.instrumentType,
-    });
   }
 
   return {

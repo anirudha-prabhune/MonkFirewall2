@@ -37,7 +37,7 @@ export const Header: React.FC<HeaderProps> = ({ activeTab, setActiveTab }) => {
                 </span>
               </div>
               <p className="text-[11px] text-[#3D5A80] dark:text-[#98C1D9] hidden sm:block font-sans">
-                Zerodha F&O Real-Time Risk Control & Loss Protection
+                F&O Real-Time Risk Control & Loss Protection
               </p>
             </div>
           </div>
@@ -147,7 +147,7 @@ export const Header: React.FC<HeaderProps> = ({ activeTab, setActiveTab }) => {
                     </p>
                     <p className="text-[10px] text-[#3D5A80] dark:text-[#98C1D9] font-mono">
                       {user.isSandbox ? (
-                        <span className="text-[#EE6C4D] font-medium">Sandbox Mode</span>
+                        <span className="text-[#EE6C4D] font-medium">Demo Mode</span>
                       ) : (
                         'Verified'
                       )}

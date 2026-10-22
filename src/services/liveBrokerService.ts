@@ -130,6 +130,9 @@ export async function fetchAngelOneStatus(userId?: string, accountId?: string): 
     if (res.ok) {
       return await res.json();
     }
+    if (res.status >= 500) {
+      console.warn(`[AngelOne] Unexpected status error HTTP ${res.status}`);
+    }
   } catch (err) {
     console.warn('Failed to fetch Angel One status:', err);
   }
@@ -147,6 +150,9 @@ export async function fetchAngelOnePositions(userId?: string, accountId?: string
     if (res.ok) {
       return await res.json();
     }
+    if (res.status >= 500) {
+      console.warn(`[AngelOne] Unexpected positions error HTTP ${res.status}`);
+    }
   } catch (err) {
     console.warn('Failed to fetch Angel One positions:', err);
   }
@@ -163,6 +169,9 @@ export async function fetchAngelOneCapital(userId?: string, accountId?: string):
     const res = await fetch(`/api/broker/angelone/live/capital${query}`, { headers });
     if (res.ok) {
       return await res.json();
+    }
+    if (res.status >= 500) {
+      console.warn(`[AngelOne] Unexpected capital error HTTP ${res.status}`);
     }
   } catch (err) {
     console.warn('Failed to fetch Angel One capital:', err);

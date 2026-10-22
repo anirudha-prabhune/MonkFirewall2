@@ -19,9 +19,9 @@ async function runPhase8CTests() {
 
   // TEST 1: Default OBSERVE_ONLY & Explicit ENFORCE Activation
   try {
-    // 1. Initial default configuration for Angel One is OBSERVE_ONLY
+    // 1. Authoritative configuration for Angel One is ENFORCE
     const initialConfig = await ServerRiskStore.getConfig(userId, DEFAULT_ANGELONE_ACCOUNT_ID);
-    assert.equal(initialConfig.executionMode, 'OBSERVE_ONLY', 'Angel One defaults to OBSERVE_ONLY');
+    assert.equal(initialConfig.executionMode, 'ENFORCE', 'Angel One defaults to ENFORCE');
 
     // 2. Explicit authorized account-scoped activation of ENFORCE mode
     const saveRes = await ServerRiskStore.saveConfig(userId, {

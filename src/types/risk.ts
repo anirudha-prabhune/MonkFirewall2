@@ -56,6 +56,7 @@ export const DEFAULT_RISK_CONFIG: RiskConfig = {
 
 export const DEFAULT_ACCOUNT_ID = 'acc_mt_zerodha_default';
 export const DEFAULT_ANGELONE_ACCOUNT_ID = 'acc_mt_angelone_default';
+export const DEFAULT_SIMULATION_ACCOUNT_ID = 'acc_mt_simulation_default';
 
 export const DEFAULT_ANGELONE_RISK_CONFIG: AccountRiskConfig = {
   dailyLossLimit: 10000,
@@ -92,6 +93,8 @@ export interface RiskSession {
   lastEvaluatedAt?: string;
   lockExpiresAt?: string | null; // Alias for backward compatibility
   reason?: string | null;
+  isSimulated?: boolean;
+  simulatedPnl?: number;
   updatedAt?: string;
   recordedAt?: string;
 }

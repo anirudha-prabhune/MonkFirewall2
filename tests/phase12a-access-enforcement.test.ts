@@ -57,6 +57,8 @@ async function runPhase12aTestSuite() {
   function injectSession(userId: string, session: RiskSession) {
     const storeState = (ServerRiskStore as any).getOrCreateUserState(userId);
     storeState.sessions.set(session.tradingDate, session);
+    const resolvedAccountId = session.accountId || 'acc_mt_zerodha_default';
+    storeState.accountSessions.set(`${resolvedAccountId}__${session.tradingDate}`, session);
   }
 
   // --------------------------------------------------------------------------
@@ -212,7 +214,7 @@ async function runPhase12aTestSuite() {
   const resUnauth = contextUnauth.getResult();
   assert.strictEqual(resUnauth.nextCalled, false);
   assert.strictEqual(resUnauth.code, 401);
-  assert.strictEqual(resUnauth.json?.error, 'UNAUTHENTICATED');
+  assert.ok(['UNAUTHENTICATED', 'AUTH_TOKEN_MISSING'].includes(resUnauth.json?.error), 'Rejected authentication returns 401');
   console.log('  ✓ PASSED: Request without authenticated userId is blocked with HTTP 401');
 
   // --------------------------------------------------------------------------

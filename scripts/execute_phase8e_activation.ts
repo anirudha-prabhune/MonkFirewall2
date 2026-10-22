@@ -1,6 +1,6 @@
 import { ServerRiskStore, DEFAULT_ACCOUNT_ID, DEFAULT_ANGELONE_ACCOUNT_ID } from '../server/risk/store';
 import { liveAngelOneAdapter } from '../server/brokers/angelone/liveAdapter';
-import { enableMockStoreForTesting, setAdminFirestoreForTesting } from '../server/brokers/zerodha/sessionStore';
+import { enableMockStoreForTesting, setAdminFirestoreForTesting, getAdminFirestore } from '../server/brokers/zerodha/sessionStore';
 import { DEFAULT_ANGELONE_RISK_CONFIG, DEFAULT_RISK_CONFIG } from '../src/types/risk';
 
 async function executeControlledActivation() {
@@ -8,7 +8,16 @@ async function executeControlledActivation() {
   console.log('MONKTRADES PHASE 8E: CONTROLLED ANGEL ONE ENFORCEMENT ACTIVATION');
   console.log('================================================================');
 
-  const operatorUserId = 'anirudha.prabhune@gmail.com';
+  const operatorEmail = 'anirudha.prabhune@gmail.com';
+  let operatorUserId = operatorEmail;
+  const adminDb = getAdminFirestore();
+  if (adminDb) {
+    const userSnap = await adminDb.collection('users').where('email', '==', operatorEmail).get();
+    if (!userSnap.empty) {
+      operatorUserId = userSnap.docs[0].id;
+      console.log(`Resolved operator ${operatorEmail} -> UID: ${operatorUserId}`);
+    }
+  }
 
   // 1. PRECONDITION 1: Verify Pre-Activation Configuration for Angel One
   console.log('Step 1: Reading pre-activation risk configuration for Angel One...');
@@ -29,7 +38,7 @@ async function executeControlledActivation() {
     warningThreshold1: initialAngelConfig.warningThreshold1 || 70,
     warningThreshold2: initialAngelConfig.warningThreshold2 || 90,
     lockDurationMinutes: initialAngelConfig.lockDurationMinutes || 720,
-    lockDurationType: initialAngelConfig.lockDurationType || 'DURATION',
+    lockDurationType: initialAngelConfig.lockDurationType || 'FIXED',
     executionMode: 'ENFORCE',
     broker: 'angelone',
     accountId: DEFAULT_ANGELONE_ACCOUNT_ID,

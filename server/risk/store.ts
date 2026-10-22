@@ -4,6 +4,7 @@ import {
   DEFAULT_RISK_CONFIG,
   DEFAULT_ACCOUNT_ID,
   DEFAULT_ANGELONE_ACCOUNT_ID,
+  DEFAULT_SIMULATION_ACCOUNT_ID,
   DEFAULT_ANGELONE_RISK_CONFIG,
   AccountRiskConfig,
 } from '../../src/types/risk';
@@ -17,6 +18,7 @@ import {
   RiskEvaluationResult,
   getTradingDateKolkata,
   isNseMarketClosed,
+  setNseMarketClosedOverride,
 } from './engine';
 import { validateRiskConfig } from './validation';
 import { PnlResult } from '../pnl/types';
@@ -34,11 +36,11 @@ import { ShadowRiskService } from './shadowRiskService';
  * - Thread-safe atomic evaluation preventing concurrent lock creation race conditions
  * - Preserves existing active lock when configuration is modified or disabled
  * - Account-scoped isolation: Zerodha & Angel One accounts operate on isolated configs & sessions
- * - Angel One defaults to OBSERVE_ONLY execution mode with zero cross-broker lock leakage
+ * - Angel One operates in ENFORCE execution mode with zero cross-broker lock leakage
  * - Preserves legacy Zerodha dual-write for 100% backward compatibility
  */
 
-export { DEFAULT_ACCOUNT_ID, DEFAULT_ANGELONE_ACCOUNT_ID };
+export { DEFAULT_ACCOUNT_ID, DEFAULT_ANGELONE_ACCOUNT_ID, DEFAULT_SIMULATION_ACCOUNT_ID };
 
 interface UserRiskState {
   config: RiskConfig;
@@ -52,6 +54,7 @@ interface UserRiskState {
 
 export class ServerRiskStore {
   private static userStates = new Map<string, UserRiskState>();
+  private static simulationSessions = new Map<string, RiskSession>();
   private static isPersistenceDegraded: boolean = false;
   private static bufferedEvents: { userId: string; event: RiskEvent }[] = [];
 
@@ -596,6 +599,148 @@ export class ServerRiskStore {
   }
 
   /**
+   * Retrieves an active isolated simulation session for a user account, if present.
+   */
+  public static async getSimulatedSession(
+    userId: string,
+    accountId?: string
+  ): Promise<RiskSession | null> {
+    const resolvedAccountId = await this.resolveAccountId(userId, accountId);
+    const isDemoIdentity = userId === 'mock-trader-sandbox' || userId.startsWith('mock-') || userId.startsWith('sim_');
+    const isSimAccount = resolvedAccountId === DEFAULT_SIMULATION_ACCOUNT_ID || resolvedAccountId.includes('simulation');
+
+    // Only return simulation session if querying a simulation account OR if the user is a dedicated demo identity
+    if (!isSimAccount && !isDemoIdentity) {
+      return null;
+    }
+
+    const simKey = `${userId}__${DEFAULT_SIMULATION_ACCOUNT_ID}`;
+    let simSession = this.simulationSessions.get(simKey) || null;
+
+    if (!simSession) {
+      const adminDb = getAdminFirestore();
+      if (adminDb) {
+        try {
+          const snap = await adminDb.doc(`users/${userId}/simulationSessions/${DEFAULT_SIMULATION_ACCOUNT_ID}`).get();
+          if (snap.exists) {
+            simSession = snap.data() as RiskSession;
+            this.simulationSessions.set(simKey, simSession);
+          }
+        } catch {}
+      }
+    }
+
+    return simSession;
+  }
+
+  /**
+   * Isolated Simulation Pipeline:
+   * Evaluates synthetic P&L input on an isolated simulation session with a deterministic clock.
+   * NEVER mutates live broker sessions, real risk sessions, or production risk configurations.
+   */
+  public static async evaluateSimulatedPnl(
+    userId: string,
+    pnl: number,
+    evaluationTime: Date = new Date(),
+    accountId?: string
+  ): Promise<RiskEvaluationResult> {
+    const resolvedAccountId = await this.resolveAccountId(userId, accountId);
+    const config = await this.getConfig(userId, resolvedAccountId);
+    const simKey = `${userId}__${resolvedAccountId}`;
+    const tradingDate = getTradingDateKolkata(evaluationTime);
+
+    // Context from existing simulation session (or clean baseline)
+    let prevSimSession = await this.getSimulatedSession(userId, resolvedAccountId);
+    if (!prevSimSession) {
+      prevSimSession = {
+        tradingDate,
+        userId,
+        accountId: resolvedAccountId,
+        state: 'ALLOW',
+        isBreached: false,
+        lockedAt: null,
+        lockUntil: null,
+        currentPnl: 0,
+        realisedPnl: 0,
+        unrealisedPnl: 0,
+        lossLimit: config.dailyLossLimit,
+        warningThreshold1: config.warningThreshold1,
+        warningThreshold2: config.warningThreshold2,
+        lastEvaluatedAt: evaluationTime.toISOString(),
+        reason: null,
+        isSimulated: true,
+        simulatedPnl: 0,
+      };
+    }
+
+    const syntheticPnlResult: PnlResult = {
+      tradingDate,
+      realisedPnl: pnl,
+      unrealisedPnl: 0,
+      totalPnl: pnl,
+      includedRealisedPnl: config.includeRealisedPnl ? pnl : 0,
+      includedUnrealisedPnl: 0,
+      grossTradingPnl: config.includeRealisedPnl ? pnl : 0,
+      fnoPositionCount: 1,
+      totalPositionCount: 1,
+      positions: [],
+      source: 'SYNTHETIC_SIMULATION',
+      calculatedAt: evaluationTime.toISOString(),
+    };
+
+    const evalResult = RiskEngine.evaluate({
+      userId,
+      config,
+      pnlResult: syntheticPnlResult,
+      currentSession: prevSimSession,
+      evaluationTime,
+      isSimulated: true,
+    });
+
+    // Mark session as simulated
+    evalResult.session.isSimulated = true;
+    evalResult.session.simulatedPnl = pnl;
+    evalResult.session.accountId = resolvedAccountId;
+
+    this.simulationSessions.set(simKey, evalResult.session);
+
+    // Persist simulation session independently in Firestore
+    const adminDb = getAdminFirestore();
+    if (adminDb) {
+      try {
+        await adminDb.doc(`users/${userId}/simulationSessions/${resolvedAccountId}`).set(evalResult.session, { merge: true });
+      } catch (err) {
+        console.warn(`[RiskStore] Failed to persist simulation session:`, err);
+      }
+    }
+
+    return evalResult;
+  }
+
+  /**
+   * Resets simulation session for an account back to live baseline.
+   */
+  public static async resetSimulatedSession(
+    userId: string,
+    accountId?: string
+  ): Promise<RiskSession> {
+    const resolvedAccountId = await this.resolveAccountId(userId, accountId);
+    const simKey = `${userId}__${resolvedAccountId}`;
+    this.simulationSessions.delete(simKey);
+
+    const adminDb = getAdminFirestore();
+    if (adminDb) {
+      try {
+        await adminDb.doc(`users/${userId}/simulationSessions/${resolvedAccountId}`).delete();
+      } catch (err) {
+        console.warn(`[RiskStore] Failed to delete simulation session doc:`, err);
+      }
+    }
+
+    return await this.getSession(userId, undefined, resolvedAccountId);
+  }
+
+  /**
    * Backward-compatible evaluation endpoint for numeric P&L (used by Phase 1/2 tests & simulated inputs).
    */
   public static async evaluatePnl(
@@ -629,9 +774,40 @@ export class ServerRiskStore {
     tradingDate?: string,
     accountId?: string
   ): Promise<RiskSession> {
+    const resolvedAccountId = await this.resolveAccountId(userId, accountId);
+
+    // Check if an active simulation session exists for this account context
+    const simSession = await this.getSimulatedSession(userId, resolvedAccountId);
+    if (simSession) {
+      return { ...simSession };
+    }
+
+    if (resolvedAccountId === DEFAULT_SIMULATION_ACCOUNT_ID) {
+      const config = await this.getConfig(userId, DEFAULT_SIMULATION_ACCOUNT_ID);
+      const today = tradingDate || getTradingDateKolkata(new Date());
+      return {
+        tradingDate: today,
+        userId,
+        accountId: DEFAULT_SIMULATION_ACCOUNT_ID,
+        state: 'ALLOW',
+        isBreached: false,
+        lockedAt: null,
+        lockUntil: null,
+        currentPnl: 0,
+        realisedPnl: 0,
+        unrealisedPnl: 0,
+        lossLimit: config.dailyLossLimit,
+        warningThreshold1: config.warningThreshold1,
+        warningThreshold2: config.warningThreshold2,
+        lastEvaluatedAt: new Date().toISOString(),
+        reason: 'Simulation baseline session',
+        isSimulated: true,
+        simulatedPnl: 0,
+      };
+    }
+
     const userState = this.getOrCreateUserState(userId);
     const date = tradingDate || getTradingDateKolkata(new Date());
-    const resolvedAccountId = await this.resolveAccountId(userId, accountId);
     const accountSessionKey = `${resolvedAccountId}__${date}`;
 
     let session = userState.accountSessions.get(accountSessionKey) || (resolvedAccountId === DEFAULT_ACCOUNT_ID ? userState.sessions.get(date) : undefined);

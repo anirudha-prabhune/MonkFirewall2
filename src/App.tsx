@@ -187,7 +187,7 @@ function MainApp() {
       <footer className="border-t border-[#98C1D9]/50 dark:border-[#3D4A5E] bg-white dark:bg-[#1A202C] text-[#3D5A80] dark:text-[#98C1D9] text-xs py-4 px-4 transition-colors duration-200">
         <div className="max-w-7xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-2 text-[11px]">
           <div>
-            <span className="font-bold tracking-wider text-[#293241] dark:text-[#E0FBFC]">TRADING FIREWALL</span> · Zerodha F&O Risk Control System
+            <span className="font-bold tracking-wider text-[#293241] dark:text-[#E0FBFC]">TRADING FIREWALL</span> · F&O Risk Control System
           </div>
           <div className="flex items-center space-x-3 text-[#3D5A80] dark:text-[#98C1D9] font-mono text-[10px]">
             <span>Asia/Kolkata</span>

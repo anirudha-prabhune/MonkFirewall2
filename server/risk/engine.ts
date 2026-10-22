@@ -92,6 +92,8 @@ export interface RiskSession {
   warningThreshold2: number;
   lastEvaluatedAt: string;
   reason: string | null;
+  isSimulated?: boolean;
+  simulatedPnl?: number;
   updatedAt?: string;
 }
 
@@ -124,6 +126,7 @@ export interface RiskEvaluationInput {
   includeUnrealised?: boolean;
   currentSession?: any;
   evaluationTime?: Date;
+  isSimulated?: boolean;
 }
 
 export interface RiskEvaluationResult {
@@ -260,7 +263,7 @@ export class RiskEngine {
     }
 
     // Check if NSE market is closed
-    const marketClosed = isNseMarketClosed(evaluationTime);
+    const marketClosed = !input.isSimulated && isNseMarketClosed(evaluationTime);
 
     // -------------------------------------------------------------
     // CASE 0: MARKET CLOSED

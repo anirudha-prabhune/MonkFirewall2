@@ -143,6 +143,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       setError(null);
       setNotice(null);
       localStorage.removeItem(SANDBOX_STORAGE_KEY);
+      localStorage.removeItem('trading_firewall_explicit_demo');
       if (user?.isSandbox) {
         setUser(null);
         setProfile(null);

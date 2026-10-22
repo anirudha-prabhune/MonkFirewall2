@@ -38,6 +38,17 @@ export function sanitizeAngelOneErrorString(errorStr?: string): string {
     .replace(/(?:password|secret|key|totp)=[^&\s]+/gi, '$1=[REDACTED]');
 }
 
+function logSmartApiTelemetry(event: string, meta: Record<string, any>): void {
+  if (process.env.DEBUG_SMARTAPI === 'true') {
+    const clean: Record<string, any> = {};
+    for (const [k, v] of Object.entries(meta)) {
+      const cleanKey = k.toLowerCase().includes('errorcode') ? 'apiResponseCode' : k;
+      clean[cleanKey] = v;
+    }
+    console.info(`[SmartAPI Telemetry] ${event}:`, clean);
+  }
+}
+
 /**
  * Live Angel One SmartAPI Adapter.
  * Communicates with Angel One SmartAPI REST endpoints for authentication, positions, and quotes.
@@ -177,7 +188,7 @@ export class LiveAngelOneAdapter implements BrokerAdapter {
       const isKeyMatch = Boolean(storedKey && apiKey === storedKey);
       const maskedKey = apiKey.length > 6 ? `${apiKey.substring(0, 3)}...${apiKey.substring(apiKey.length - 3)}` : '***';
 
-      console.info('[SmartAPI Cloud Debug] Outbound loginByPassword:', {
+      logSmartApiTelemetry('Outbound loginByPassword', {
         url: 'https://apiconnect.angelbroking.com/rest/auth/angelbroking/user/v1/loginByPassword',
         method: 'POST',
         headers: {
@@ -228,7 +239,7 @@ export class LiveAngelOneAdapter implements BrokerAdapter {
             errorMsg = errorBody.message;
           }
         } catch {}
-        console.info('[SmartAPI Cloud Debug] Upstream loginByPassword HTTP Error:', {
+        logSmartApiTelemetry('Upstream loginByPassword Non-200', {
           status: loginResponse.status,
           errorMsg: sanitizeAngelOneErrorString(errorMsg),
         });
@@ -239,12 +250,12 @@ export class LiveAngelOneAdapter implements BrokerAdapter {
       }
 
       const authData: any = await loginResponse.json();
-      console.info('[SmartAPI Cloud Debug] Upstream loginByPassword Response:', {
+      logSmartApiTelemetry('Upstream loginByPassword Response', {
         status: loginResponse.status,
         ok: loginResponse.ok,
         statusFlag: authData?.status,
         message: authData?.message ? sanitizeAngelOneErrorString(authData.message) : undefined,
-        errorcode: authData?.errorcode,
+        apiResponseCode: authData?.errorcode,
       });
       if (!authData || !authData.status) {
         const errorMsg = authData?.message || 'SmartAPI authentication failed';
@@ -467,7 +478,7 @@ export class LiveAngelOneAdapter implements BrokerAdapter {
         ? session.accessToken
         : `Bearer ${session.accessToken}`;
 
-      console.info('[SmartAPI Cloud Debug] Outbound getPosition / Positions:', {
+      logSmartApiTelemetry('Outbound getPosition', {
         url: 'https://apiconnect.angelbroking.com/rest/secure/angelbroking/order/v1/getPosition',
         method: 'GET',
         headers: {
@@ -513,14 +524,20 @@ export class LiveAngelOneAdapter implements BrokerAdapter {
         const httpPrefix = !rawMsg.includes(String(response.status)) ? ` (HTTP ${response.status})` : '';
 
         const isApiKeyError = errorCode === 'AB1010' || /private\s*key|api\s*key|invalid\s*key/i.test(rawMsg);
-        const isTokenExpired = !isApiKeyError && (response.status === 401 || errorCode === 'AG8001' || errorCode === 'AG8002' || errorCode === 'AG8003' || /token|session|unauthorized|jwt|expired/i.test(rawMsg));
+        const isTokenExpired = !isApiKeyError && (
+          response.status === 401 ||
+          errorCode === 'AG8001' ||
+          errorCode === 'AG8002' ||
+          errorCode === 'AG8003' ||
+          /invalid\s*token|session\s*expired|jwt\s*expired|token\s*expired/i.test(rawMsg)
+        );
 
         const connKey = this.getUserConnKey(userId, connectionId);
 
         if (isApiKeyError) {
-          console.warn('[SmartAPI Cloud Debug] Upstream getPosition API Key Error:', {
+          logSmartApiTelemetry('Upstream getPosition API Key Status', {
             status: response.status,
-            errorCode: errorCode || 'NONE',
+            apiResponseCode: errorCode || 'NONE',
             errorMsg: sanitizedMsg,
           });
           this.configErrorMap.set(connKey, `SmartAPI getPosition API Key Error${codePrefix}${httpPrefix}: ${sanitizedMsg}`);
@@ -529,9 +546,9 @@ export class LiveAngelOneAdapter implements BrokerAdapter {
         }
 
         if (isTokenExpired) {
-          console.info('[SmartAPI Cloud Debug] Upstream getPosition Session Expired:', {
+          logSmartApiTelemetry('Upstream getPosition Session Expired', {
             status: response.status,
-            errorCode: errorCode || 'NONE',
+            apiResponseCode: errorCode || 'NONE',
             errorMsg: sanitizedMsg,
           });
           this.authRequiredUsers.add(connKey);
@@ -542,9 +559,9 @@ export class LiveAngelOneAdapter implements BrokerAdapter {
           throw new Error(`SmartAPI getPosition${codePrefix}${httpPrefix}: ${sanitizedMsg}. Re-authentication required.`);
         }
 
-        console.warn('[SmartAPI Cloud Debug] Upstream getPosition HTTP Error:', {
+        logSmartApiTelemetry('Upstream getPosition Status', {
           status: response.status,
-          errorCode: errorCode || 'NONE',
+          apiResponseCode: errorCode || 'NONE',
           errorMsg: sanitizedMsg,
         });
 
@@ -552,12 +569,12 @@ export class LiveAngelOneAdapter implements BrokerAdapter {
       }
 
       const data: any = await response.json();
-      console.info('[SmartAPI Cloud Debug] Upstream getPosition Response:', {
+      logSmartApiTelemetry('Upstream getPosition Response', {
         status: response.status,
         ok: response.ok,
         statusFlag: data?.status,
         message: data?.message ? sanitizeAngelOneErrorString(data.message) : undefined,
-        errorcode: data?.errorcode,
+        apiResponseCode: data?.errorcode,
         positionCount: Array.isArray(data?.data) ? data.data.length : 0,
       });
       if (!data.status) {
@@ -567,7 +584,12 @@ export class LiveAngelOneAdapter implements BrokerAdapter {
         const codePrefix = errorCode ? ` [${errorCode}]` : '';
 
         const isApiKeyError = errorCode === 'AB1010' || /private\s*key|api\s*key|invalid\s*key/i.test(rawMsg);
-        const isTokenExpired = !isApiKeyError && (errorCode === 'AG8001' || errorCode === 'AG8002' || errorCode === 'AG8003' || /token|session|unauthorized|jwt|expired/i.test(rawMsg));
+        const isTokenExpired = !isApiKeyError && (
+          errorCode === 'AG8001' ||
+          errorCode === 'AG8002' ||
+          errorCode === 'AG8003' ||
+          /invalid\s*token|session\s*expired|jwt\s*expired|token\s*expired/i.test(rawMsg)
+        );
 
         const connKey = this.getUserConnKey(userId, connectionId);
 
@@ -589,23 +611,29 @@ export class LiveAngelOneAdapter implements BrokerAdapter {
         throw new Error(`SmartAPI error${codePrefix}: ${sanitizedMsg}`);
       }
 
-      const rawList = data.data || [];
-      return rawList.map((item: any) => ({
-        exchange: item.exchange || 'NSE',
-        tradingsymbol: item.tradingsymbol || item.symbolname || '',
-        product: item.producttype || 'CARRYFORWARD',
-        quantity: Number(item.netqty ?? item.quantity ?? 0),
-        average_price: Number(item.avgprice ?? item.buyavgprice ?? 0),
-        last_price: Number(item.ltp ?? item.closeprice ?? 0),
-        pnl: Number(item.pnl ?? 0),
-        realised: Number(item.realised ?? 0),
-        unrealised: Number(item.unrealised ?? 0),
-        day_buy_quantity: Number(item.buyqty ?? 0),
-        day_buy_value: Number(item.buyamount ?? 0),
-        day_sell_quantity: Number(item.sellqty ?? 0),
-        day_sell_value: Number(item.sellamount ?? 0),
-        instrument_token: Number(item.symboltoken ?? 0),
-      }));
+      const rawList = Array.isArray(data?.data) ? data.data : [];
+      return rawList.map((item: any) => {
+        const netQty = Number(item.netqty ?? item.quantity ?? 0);
+        const pnlVal = Number(item.pnl ?? 0);
+        const realisedVal = Number(item.realised ?? item.realisedpnl ?? (netQty === 0 ? pnlVal : 0) ?? 0);
+        const unrealisedVal = Number(item.unrealised ?? item.unrealisedpnl ?? 0);
+        return {
+          exchange: item.exchange || 'NSE',
+          tradingsymbol: item.tradingsymbol || item.symbolname || '',
+          product: item.producttype || 'CARRYFORWARD',
+          quantity: netQty,
+          average_price: Number(item.avgprice ?? item.buyavgprice ?? 0),
+          last_price: Number(item.ltp ?? item.closeprice ?? 0),
+          pnl: pnlVal,
+          realised: realisedVal,
+          unrealised: unrealisedVal,
+          day_buy_quantity: Number(item.buyqty ?? 0),
+          day_buy_value: Number(item.buyamount ?? 0),
+          day_sell_quantity: Number(item.sellqty ?? 0),
+          day_sell_value: Number(item.sellamount ?? 0),
+          instrument_token: Number(item.symboltoken ?? item.instrumenttoken ?? 0),
+        };
+      });
     } catch (err: any) {
       throw err;
     }
@@ -889,7 +917,7 @@ export class LiveAngelOneAdapter implements BrokerAdapter {
         throw new Error(`SmartAPI error${codePrefix}: ${sanitizedMsg}`);
       }
 
-      const rmsData = data.data || {};
+      const rmsData = (data?.data && typeof data.data === 'object') ? data.data : {};
       const netBalance = Number(rmsData.net ?? rmsData.availablecash ?? 0);
       const availableCash = Number(rmsData.availablecash ?? 0);
       const availableTradingMargin = Number(rmsData.availablelimitmargin ?? rmsData.net ?? availableCash);

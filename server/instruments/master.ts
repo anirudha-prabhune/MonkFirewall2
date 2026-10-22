@@ -105,7 +105,7 @@ export const MOCK_INSTRUMENT_MASTER: BrokerInstrument[] = [
     expiry: '2026-10-29',
     strike: null,
     tickSize: 0.05,
-    lotSize: 25,
+    lotSize: 65,
   },
   // 2. NIFTY CALL OPTION
   {
@@ -118,7 +118,7 @@ export const MOCK_INSTRUMENT_MASTER: BrokerInstrument[] = [
     expiry: '2026-10-29',
     strike: 25500,
     tickSize: 0.05,
-    lotSize: 25,
+    lotSize: 65,
   },
   // 3. NIFTY PUT OPTION
   {
@@ -131,7 +131,7 @@ export const MOCK_INSTRUMENT_MASTER: BrokerInstrument[] = [
     expiry: '2026-10-29',
     strike: 24500,
     tickSize: 0.05,
-    lotSize: 25,
+    lotSize: 65,
   },
   // 4. BANKNIFTY FUT
   {
@@ -144,7 +144,7 @@ export const MOCK_INSTRUMENT_MASTER: BrokerInstrument[] = [
     expiry: '2026-10-29',
     strike: null,
     tickSize: 0.05,
-    lotSize: 15,
+    lotSize: 25,
   },
   // 5. BANKNIFTY CALL OPTION
   {
@@ -157,7 +157,7 @@ export const MOCK_INSTRUMENT_MASTER: BrokerInstrument[] = [
     expiry: '2026-10-29',
     strike: 52500,
     tickSize: 0.05,
-    lotSize: 15,
+    lotSize: 25,
   },
   // 6. BANKNIFTY PUT OPTION
   {
@@ -170,7 +170,7 @@ export const MOCK_INSTRUMENT_MASTER: BrokerInstrument[] = [
     expiry: '2026-10-29',
     strike: 51500,
     tickSize: 0.05,
-    lotSize: 15,
+    lotSize: 25,
   },
   // 7. BFO FUT (SENSEX)
   {

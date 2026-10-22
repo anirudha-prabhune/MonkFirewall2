@@ -19,14 +19,15 @@ export class EnforcementService {
    */
   public static async getEnforcementState(
     userId: string,
-    currentTime: Date = new Date()
+    currentTime: Date = new Date(),
+    accountId?: string
   ): Promise<EnforcementState> {
     if (!userId || typeof userId !== 'string' || userId.trim().length === 0) {
       throw new Error('[EnforcementService] Valid userId is required');
     }
 
     const tradingDate = getTradingDateKolkata(currentTime);
-    const session: RiskSession = await ServerRiskStore.getSession(userId, tradingDate);
+    const session: RiskSession = await ServerRiskStore.getSession(userId, tradingDate, accountId);
 
     if (!session || typeof session !== 'object') {
       throw new Error('[EnforcementService] Failed to retrieve authoritative RiskSession');
@@ -87,6 +88,7 @@ export class EnforcementService {
       evaluatedAt,
       reason,
       authority: 'server',
+      accountId: session.accountId || accountId,
     };
   }
 
@@ -96,7 +98,8 @@ export class EnforcementService {
    */
   public static async checkTradingAccess(
     userId?: string,
-    currentTime: Date = new Date()
+    currentTime: Date = new Date(),
+    accountId?: string
   ): Promise<EnforcementDecision> {
     // 1. Authentication check
     if (!userId || typeof userId !== 'string' || userId.trim().length === 0) {
@@ -111,7 +114,7 @@ export class EnforcementService {
 
     // 2. Fetch authoritative enforcement state
     try {
-      const state = await this.getEnforcementState(userId, currentTime);
+      const state = await this.getEnforcementState(userId, currentTime, accountId);
 
       if (state.isLocked) {
         return {

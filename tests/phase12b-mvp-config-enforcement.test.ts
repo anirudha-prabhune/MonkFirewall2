@@ -2,7 +2,7 @@ import { strict as assert } from 'assert';
 import { ServerRiskStore } from '../server/risk/store';
 import { EnforcementService } from '../server/enforcement/service';
 import { DEFAULT_RISK_CONFIG } from '../src/types/risk';
-import { getTradingDateKolkata, RiskSession } from '../server/risk/engine';
+import { getTradingDateKolkata, RiskSession, setNseMarketClosedOverride } from '../server/risk/engine';
 import { apiRouter } from '../server/api';
 import { enableMockStoreForTesting } from '../server/brokers/zerodha/sessionStore';
 
@@ -30,6 +30,8 @@ async function runPhase12bTestSuite() {
   function injectSession(userId: string, session: RiskSession) {
     const storeState = (ServerRiskStore as any).getOrCreateUserState(userId);
     storeState.sessions.set(session.tradingDate, session);
+    const resolvedAccountId = session.accountId || 'acc_mt_zerodha_default';
+    storeState.accountSessions.set(`${resolvedAccountId}__${session.tradingDate}`, session);
   }
 
   // --------------------------------------------------------------------------
@@ -130,6 +132,7 @@ async function runPhase12bTestSuite() {
   // TEST 5 — MARKET_CLOSED -> Dashboard Remains Fully Accessible
   // --------------------------------------------------------------------------
   console.log('[Test 5] MARKET_CLOSED State -> Dashboard Remains Fully Accessible');
+  setNseMarketClosedOverride(true);
   const closedSession: RiskSession = {
     ...lockedSession,
     state: 'MARKET_CLOSED',
@@ -138,6 +141,7 @@ async function runPhase12bTestSuite() {
 
   const dashboardClosedSession = await ServerRiskStore.getSession(testUser, tradingDate);
   assert.strictEqual(dashboardClosedSession.state, 'MARKET_CLOSED');
+  setNseMarketClosedOverride(null);
   console.log('  ✓ PASSED: Dashboard remains fully readable under MARKET_CLOSED');
 
   // --------------------------------------------------------------------------
@@ -161,9 +165,11 @@ async function runPhase12bTestSuite() {
   assert.strictEqual(contractAllow.enforcementStatus, 'RELEASED', 'ALLOW state maps to RELEASED');
 
   // MARKET_CLOSED -> Maps to INACTIVE
+  setNseMarketClosedOverride(true);
   injectSession(testUser, closedSession);
   const contractClosed = await EnforcementService.getBrokerEnforcementContract(testUser);
   assert.ok(contractClosed.enforcementStatus === 'INACTIVE' || contractClosed.enforcementStatus === 'NOT_IMPLEMENTED', 'MARKET_CLOSED state maps to INACTIVE/non-blocking');
+  setNseMarketClosedOverride(null);
   console.log('  ✓ PASSED: Authoritative Broker Enforcement Contract maps status distinctly and safely');
 
   // --------------------------------------------------------------------------
