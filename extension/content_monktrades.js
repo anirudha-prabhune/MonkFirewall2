@@ -1,4 +1,4 @@
-// Content script injected into MonkTrades pages (Manifest V3)
+// Content script injected into ArthaKavach pages (Manifest V3)
 (function() {
   let hasPaired = false;
   let lastPairedUserId = null;
@@ -28,7 +28,7 @@
         serverUrl,
         pairingState: 'PAIRED'
       }, function() {
-        console.log('[MonkTrades Extension] Explicitly paired with credentials and server URL:', {
+        console.log('[ArthaKavach Extension] Explicitly paired with credentials and server URL:', {
           userId: userId.trim(),
           serverUrl
         });
@@ -63,14 +63,25 @@
     }
   }
 
+  function findSyncNode() {
+    if (typeof document.getElementById === 'function') {
+      const node = document.getElementById('arthakavach-extension-sync') || document.getElementById('monktrades-extension-sync');
+      if (node) return node;
+    }
+    if (typeof document.querySelector === 'function') {
+      return document.querySelector('[data-arthakavach-sync]');
+    }
+    return null;
+  }
+
   // Check if sync node is already present in DOM
-  const existingNode = document.getElementById('monktrades-extension-sync');
+  const existingNode = findSyncNode();
   if (existingNode) {
     observeSyncNode(existingNode);
   } else {
     // Sync node not present yet: observe document until the sync node appears
     documentObserver = new MutationObserver(function() {
-      const node = document.getElementById('monktrades-extension-sync');
+      const node = findSyncNode();
       if (node) {
         if (documentObserver) {
           documentObserver.disconnect();

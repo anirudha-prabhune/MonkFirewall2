@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "MonkTrades Trading Firewall Extension",
+  "name": "ArthaKavach - Trading Firewall",
   "version": "1.0.0",
-  "description": "Enforces server-authoritative Trading Firewall lockouts on Kite Zerodha and Angel One.",
+  "description": "Authoritative real-time risk firewall and trade lock enforcement for Zerodha and Angel One.",
   "permissions": [
     "storage",
     "tabs",

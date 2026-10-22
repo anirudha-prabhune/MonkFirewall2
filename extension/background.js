@@ -1,4 +1,4 @@
-// MonkTrades Chrome Extension Background Service Worker (Manifest V3)
+// ArthaKavach Chrome Extension Background Service Worker (Manifest V3)
 // Enforces server-authoritative Trading Firewall lockouts on Kite Zerodha and Angel One.
 
 const ALARM_NAME = 'trading_firewall_poll';

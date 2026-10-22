@@ -946,7 +946,8 @@ async function runPhase12cExtensionE2ETestSuite() {
         `lock-time must show IST time string, got: ${lockTime.innerText}`
       );
       assert.ok(
-        description.innerText?.includes('Trading access in MonkTrades is restricted until') &&
+        (description.innerText?.includes('Trading access in ArthaKavach is restricted until') ||
+         description.innerText?.includes('Trading access in MonkTrades is restricted until')) &&
           description.innerText?.includes('IST'),
         `description must show IST time string, got: ${description.innerText}`
       );
@@ -960,7 +961,11 @@ async function runPhase12cExtensionE2ETestSuite() {
         serverUrl: '',
       });
       assert.equal(mockElements.get('btn-back')!.href, 'http://localhost:3000');
-      assert.equal(mockElements.get('lock-time')!.innerText, 'Lock Active (Please log in to MonkTrades)');
+      assert.ok(
+        mockElements.get('lock-time')!.innerText === 'Lock Active (Please log in to ArthaKavach)' ||
+        mockElements.get('lock-time')!.innerText === 'Lock Active (Please log in to MonkTrades)',
+        `lock-time must show active lock message, got: ${mockElements.get('lock-time')!.innerText}`
+      );
 
       // 5. Test offline fallback
       await storageGetCallback({

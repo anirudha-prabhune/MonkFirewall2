@@ -35,7 +35,7 @@
     }
 
     if (!userId || !serverUrl) {
-      document.getElementById('lock-time').innerText = 'Lock Active (Please log in to MonkTrades)';
+      document.getElementById('lock-time').innerText = 'Lock Active (Please log in to ArthaKavach)';
       return;
     }
 
@@ -64,7 +64,7 @@
           }) + ' IST';
           
           document.getElementById('lock-time').innerText = 'Restricted until ' + timeString;
-          document.getElementById('description').innerText = 'Trading access in MonkTrades is restricted until ' + timeString + '.';
+          document.getElementById('description').innerText = 'Trading access in ArthaKavach is restricted until ' + timeString + '.';
         } else {
           document.getElementById('lock-time').innerText = 'Active Lock (Time unavailable)';
         }

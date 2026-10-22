@@ -1,6 +1,6 @@
 {
-  "name": "Trading Firewall",
-  "description": "Personal trading risk-management and daily loss control system for Zerodha F&O traders.",
+  "name": "ArthaKavach - Trading Firewall",
+  "description": "Authoritative trading risk management and daily loss firewall for Zerodha & Angel One retail traders.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

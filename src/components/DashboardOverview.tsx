@@ -1363,9 +1363,9 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
           </div>
 
           <div className="text-xs text-rose-800 dark:text-rose-200 leading-relaxed pt-1 space-y-1">
-            <span className="font-bold block">Trading Firewall is locked.</span>
+            <span className="font-bold block">ArthaKavach is locked.</span>
             <span className="block">
-              Trading access in MonkTrades is restricted until{' '}
+              Trading access in ArthaKavach is restricted until{' '}
               {session.lockUntil
                 ? new Date(session.lockUntil).toLocaleTimeString('en-IN', {
                     timeZone: 'Asia/Kolkata',

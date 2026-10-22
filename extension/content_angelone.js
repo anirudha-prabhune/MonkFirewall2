@@ -1,4 +1,4 @@
-// MonkTrades Chrome Extension — Dedicated Content Script for Angel One (Manifest V3)
+// ArthaKavach Chrome Extension — Dedicated Content Script for Angel One (Manifest V3)
 // Scoped strictly to acc_mt_angelone_default with server-authoritative lock enforcement.
 
 (function() {
@@ -97,7 +97,7 @@
         window.location.href = blockedUrl;
       }
     } catch (err) {
-      console.warn('[MonkTrades AngelOne] Redirection failed:', err);
+      console.warn('[ArthaKavach AngelOne] Redirection failed:', err);
     }
   }
 

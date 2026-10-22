@@ -115,8 +115,8 @@ function MainApp() {
         <div className="p-4 rounded-2xl bg-[#3D5A80]/10 border border-[#3D5A80]/30 text-[#3D5A80] dark:text-[#98C1D9] mb-4 shadow-sm animate-pulse">
           <Shield className="w-10 h-10" />
         </div>
-        <h2 className="text-sm font-semibold tracking-widest uppercase text-[#293241] dark:text-[#E0FBFC]">
-          Trading Firewall
+        <h2 className="text-sm font-semibold tracking-widest text-[#293241] dark:text-[#E0FBFC]">
+          ArthaKavach
         </h2>
         <p className="text-xs text-[#3D5A80] dark:text-[#98C1D9] mt-2 flex items-center space-x-2 font-mono">
           <RefreshCw className="w-3.5 h-3.5 animate-spin text-[#EE6C4D]" />
@@ -133,6 +133,8 @@ function MainApp() {
       {user && (
         <div
           id="monktrades-extension-sync"
+          data-testid="arthakavach-extension-sync"
+          data-arthakavach-sync="true"
           style={{ display: 'none' }}
           data-user-id={user.uid}
           data-extension-token={extensionToken}
@@ -187,7 +189,7 @@ function MainApp() {
       <footer className="border-t border-[#98C1D9]/50 dark:border-[#3D4A5E] bg-white dark:bg-[#1A202C] text-[#3D5A80] dark:text-[#98C1D9] text-xs py-4 px-4 transition-colors duration-200">
         <div className="max-w-7xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-2 text-[11px]">
           <div>
-            <span className="font-bold tracking-wider text-[#293241] dark:text-[#E0FBFC]">TRADING FIREWALL</span> · F&O Risk Control System
+            <span className="font-bold tracking-wider text-[#293241] dark:text-[#E0FBFC]">ArthaKavach</span> · F&O Risk Control System
           </div>
           <div className="flex items-center space-x-3 text-[#3D5A80] dark:text-[#98C1D9] font-mono text-[10px]">
             <span>Asia/Kolkata</span>
