@@ -1534,7 +1534,18 @@ apiRouter.get('/enforcement/broker', async (req: Request, res: Response) => {
       return sendJson(res, { error: 'UNAUTHORIZED_EXTENSION', message: 'Invalid or missing extension token' }, 401);
     }
 
-    const contract = await EnforcementService.getBrokerEnforcementContract(userId);
+    const queryBroker = (req.query?.broker as string)?.toLowerCase();
+    const headerBroker = (req.headers['x-broker'] as string)?.toLowerCase();
+    const rawAccountId = (req.query?.accountId as string) || (req.headers['x-account-id'] as string);
+
+    let targetAccountId = typeof rawAccountId === 'string' && rawAccountId.trim().length > 0 ? rawAccountId.trim() : undefined;
+    if (!targetAccountId) {
+      if (queryBroker === 'angelone' || headerBroker === 'angelone') {
+        targetAccountId = DEFAULT_ANGELONE_ACCOUNT_ID;
+      }
+    }
+
+    const contract = await EnforcementService.getBrokerEnforcementContract(userId, undefined, targetAccountId);
     sendJson(res, contract);
   } catch (err) {
     sendJson(res, { error: err instanceof Error ? err.message : 'Failed to retrieve broker enforcement contract' }, 500);

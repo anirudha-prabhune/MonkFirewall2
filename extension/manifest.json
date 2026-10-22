@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "MonkTrades Trading Firewall Extension",
   "version": "1.0.0",
-  "description": "Enforces server-authoritative Trading Firewall lockouts on Kite Zerodha.",
+  "description": "Enforces server-authoritative Trading Firewall lockouts on Kite Zerodha and Angel One.",
   "permissions": [
     "storage",
     "tabs",
@@ -11,6 +11,9 @@
   ],
   "host_permissions": [
     "https://kite.zerodha.com/*",
+    "https://angelone.in/*",
+    "https://www.angelone.in/*",
+    "https://trade.angelone.in/*",
     "http://localhost:3000/*",
     "http://127.0.0.1:3000/*",
     "http://localhost/*",
@@ -39,6 +42,15 @@
         "https://kite.zerodha.com/*"
       ],
       "js": ["content_kite.js"],
+      "run_at": "document_start"
+    },
+    {
+      "matches": [
+        "https://angelone.in/*",
+        "https://www.angelone.in/*",
+        "https://trade.angelone.in/*"
+      ],
+      "js": ["content_angelone.js"],
       "run_at": "document_start"
     }
   ],

@@ -33,7 +33,7 @@ export const Header: React.FC<HeaderProps> = ({ activeTab, setActiveTab }) => {
             <div>
               <div className="flex items-center space-x-2.5">
                 <span className="font-bold text-base tracking-widest text-[#293241] dark:text-[#E0FBFC] uppercase font-sans">
-                  Trading Firewall
+                  Monk Firewall
                 </span>
               </div>
               <p className="text-[11px] text-[#3D5A80] dark:text-[#98C1D9] hidden sm:block font-sans">

@@ -810,7 +810,21 @@ export class ServerRiskStore {
     const date = tradingDate || getTradingDateKolkata(new Date());
     const accountSessionKey = `${resolvedAccountId}__${date}`;
 
-    let session = userState.accountSessions.get(accountSessionKey) || (resolvedAccountId === DEFAULT_ACCOUNT_ID ? userState.sessions.get(date) : undefined);
+    let session = userState.accountSessions.get(accountSessionKey);
+    const legacySession = resolvedAccountId === DEFAULT_ACCOUNT_ID ? userState.sessions.get(date) : undefined;
+    if (legacySession) {
+      if (!session) {
+        session = legacySession;
+        userState.accountSessions.set(accountSessionKey, session);
+      } else {
+        const sessionTime = new Date(session.lastEvaluatedAt || 0).getTime();
+        const legacyTime = new Date(legacySession.lastEvaluatedAt || 0).getTime();
+        if (legacyTime >= sessionTime) {
+          session = legacySession;
+          userState.accountSessions.set(accountSessionKey, session);
+        }
+      }
+    }
 
     if (!session) {
       // 1. Try to load from Firestore via Firebase Admin SDK

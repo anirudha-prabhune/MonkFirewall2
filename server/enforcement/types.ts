@@ -16,10 +16,11 @@ export type BrokerEnforcementStatus = 'INACTIVE' | 'READY' | 'ACTIVE' | 'RELEASE
 
 export interface BrokerEnforcementContract {
   userId: string;
-  broker: 'ZERODHA';
+  broker: 'ZERODHA' | 'ANGELONE';
   riskState: RiskState;
   lockUntil: string | null;
   enforcementStatus: BrokerEnforcementStatus;
+  accountId?: string;
 }
 
 export interface EnforcementState {

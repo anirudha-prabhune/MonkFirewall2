@@ -1,4 +1,4 @@
-import { ServerRiskStore } from '../risk/store';
+import { ServerRiskStore, DEFAULT_ACCOUNT_ID, DEFAULT_ANGELONE_ACCOUNT_ID } from '../risk/store';
 import { EnforcementState, EnforcementDecision, BrokerEnforcementContract, BrokerEnforcementStatus } from './types';
 import { RiskSession, getTradingDateKolkata } from '../risk/engine';
 
@@ -150,9 +150,12 @@ export class EnforcementService {
    */
   public static async getBrokerEnforcementContract(
     userId: string,
-    currentTime: Date = new Date()
+    currentTime: Date = new Date(),
+    accountId?: string
   ): Promise<BrokerEnforcementContract> {
-    const state = await this.getEnforcementState(userId, currentTime);
+    const isAngel = accountId === DEFAULT_ANGELONE_ACCOUNT_ID || Boolean(accountId?.includes('angelone'));
+    const effectiveAccountId = isAngel ? DEFAULT_ANGELONE_ACCOUNT_ID : (accountId || DEFAULT_ACCOUNT_ID);
+    const state = await this.getEnforcementState(userId, currentTime, effectiveAccountId);
 
     // Conflation protection:
     // RiskSession state LOCKED maps to Broker Enforcement status 'READY' (active trading lock).
@@ -170,10 +173,11 @@ export class EnforcementService {
 
     return {
       userId,
-      broker: 'ZERODHA',
+      broker: isAngel ? 'ANGELONE' : 'ZERODHA',
       riskState: state.riskState,
       lockUntil: state.lockUntil,
       enforcementStatus,
+      accountId: effectiveAccountId,
     };
   }
 }
