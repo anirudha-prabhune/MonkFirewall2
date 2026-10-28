@@ -52,14 +52,39 @@ interface UserRiskState {
   loadedFromFirestore?: boolean;
 }
 
+export function isQuotaExhaustedError(err: unknown): boolean {
+  if (!err) return false;
+  if (typeof err === 'object') {
+    const errorObj = err as any;
+    if (errorObj.code === 8 || errorObj.code === 'RESOURCE_EXHAUSTED' || errorObj.code === '8' || errorObj.code === 429) {
+      return true;
+    }
+    const msg = String(errorObj.message || errorObj.details || '');
+    if (/RESOURCE_EXHAUSTED|quota exceeded|exceeded quota|resource exhausted/i.test(msg)) {
+      return true;
+    }
+  }
+  const str = String(err);
+  return /RESOURCE_EXHAUSTED|quota exceeded|exceeded quota|resource exhausted/i.test(str);
+}
+
 export class ServerRiskStore {
   private static userStates = new Map<string, UserRiskState>();
   private static simulationSessions = new Map<string, RiskSession>();
   private static isPersistenceDegraded: boolean = false;
   private static bufferedEvents: { userId: string; event: RiskEvent }[] = [];
+  private static firestoreQuotaCooldownUntil: number = 0;
+  private static firestoreQuotaWarningLoggedAt: number = 0;
+  private static lastEventsFetchTime = new Map<string, number>();
+  private static readonly EVENTS_CACHE_TTL_MS = 30000;
+  private static readonly QUOTA_BACKOFF_MS = 60000;
 
   public static getIsPersistenceDegraded(): boolean {
     return this.isPersistenceDegraded;
+  }
+
+  public static isQuotaCoolingDown(): boolean {
+    return Date.now() < this.firestoreQuotaCooldownUntil;
   }
 
   public static getBufferedEventsCount(): number {
@@ -69,6 +94,8 @@ export class ServerRiskStore {
   public static clearBufferedEventsForTesting(): void {
     this.bufferedEvents = [];
     this.isPersistenceDegraded = false;
+    this.firestoreQuotaCooldownUntil = 0;
+    this.lastEventsFetchTime.clear();
   }
 
   /**
@@ -82,6 +109,9 @@ export class ServerRiskStore {
     if (accountId && typeof accountId === 'string' && accountId.trim().length > 0) {
       return accountId.trim();
     }
+    if (Date.now() < this.firestoreQuotaCooldownUntil) {
+      return DEFAULT_ACCOUNT_ID;
+    }
     const adminDb = getAdminFirestore();
     if (adminDb) {
       try {
@@ -93,7 +123,16 @@ export class ServerRiskStore {
           }
         }
       } catch (err) {
-        console.warn(`[RiskStore] Failed to resolve migrationState for user ${userId}, falling back to default:`, err);
+        if (isQuotaExhaustedError(err)) {
+          this.firestoreQuotaCooldownUntil = Date.now() + this.QUOTA_BACKOFF_MS;
+          this.isPersistenceDegraded = true;
+          if (Date.now() - this.firestoreQuotaWarningLoggedAt > this.QUOTA_BACKOFF_MS) {
+            console.warn(`[RiskStore] Firestore quota exceeded in resolveAccountId for user ${userId}; falling back to default account.`);
+            this.firestoreQuotaWarningLoggedAt = Date.now();
+          }
+        } else {
+          console.warn(`[RiskStore] Failed to resolve migrationState for user ${userId}, falling back to default:`, err instanceof Error ? err.message : String(err));
+        }
       }
     }
     return DEFAULT_ACCOUNT_ID;
@@ -131,11 +170,11 @@ export class ServerRiskStore {
       const isProduction = process.env.NODE_ENV === 'production';
       const isMock = isMockStoreEnabled();
 
-      if (isProduction && !adminDb && !isMock) {
+      if (Date.now() < this.firestoreQuotaCooldownUntil) {
+        userState.loadedFromFirestore = true;
+      } else if (isProduction && !adminDb && !isMock) {
         throw new Error(`FIRESTORE_READ_FAILURE: Authoritative Firestore is unavailable in production for user ${userId}.`);
-      }
-
-      if (adminDb) {
+      } else if (adminDb) {
         try {
           // Read account config first, fallback to legacy config path
           const accountDocRef = adminDb.doc(`users/${userId}/accountRiskConfigs/${resolvedAccountId}`);
@@ -164,12 +203,22 @@ export class ServerRiskStore {
           }
           userState.loadedFromFirestore = true;
         } catch (err) {
-          console.error(`[RiskStore] getConfig from Firestore failed for user ${userId}:`, err);
-          throw new Error(
-            `FIRESTORE_READ_FAILURE: Failed to read riskConfig from Firestore for user ${userId}: ${
-              err instanceof Error ? err.message : String(err)
-            }`
-          );
+          if (isQuotaExhaustedError(err)) {
+            this.firestoreQuotaCooldownUntil = Date.now() + this.QUOTA_BACKOFF_MS;
+            this.isPersistenceDegraded = true;
+            if (Date.now() - this.firestoreQuotaWarningLoggedAt > this.QUOTA_BACKOFF_MS) {
+              console.warn(`[RiskStore] Firestore quota exceeded in getConfig for user ${userId}; falling back to in-memory config.`);
+              this.firestoreQuotaWarningLoggedAt = Date.now();
+            }
+            userState.loadedFromFirestore = true;
+          } else {
+            console.error(`[RiskStore] getConfig from Firestore failed for user ${userId}:`, err);
+            throw new Error(
+              `FIRESTORE_READ_FAILURE: Failed to read riskConfig from Firestore for user ${userId}: ${
+                err instanceof Error ? err.message : String(err)
+              }`
+            );
+          }
         }
       } else {
         userState.loadedFromFirestore = true;
@@ -346,7 +395,7 @@ export class ServerRiskStore {
       throw new Error(`FIRESTORE_PERSISTENCE_FAILURE: Authoritative Firestore is unavailable in production for user ${userId}.`);
     }
 
-    if (adminDb) {
+    if (adminDb && Date.now() >= this.firestoreQuotaCooldownUntil) {
       try {
         const batch = adminDb.batch();
         const accountConfigDocRef = adminDb.doc(`users/${userId}/accountRiskConfigs/${resolvedAccountId}`);
@@ -359,12 +408,21 @@ export class ServerRiskStore {
 
         await batch.commit();
       } catch (err) {
-        console.error(`[RiskStore] saveConfig dual-write to Firestore failed:`, err);
-        throw new Error(
-          `FIRESTORE_PERSISTENCE_FAILURE: Failed to persist riskConfig to Firestore: ${
-            err instanceof Error ? err.message : String(err)
-          }`
-        );
+        if (isQuotaExhaustedError(err)) {
+          this.firestoreQuotaCooldownUntil = Date.now() + this.QUOTA_BACKOFF_MS;
+          this.isPersistenceDegraded = true;
+          if (Date.now() - this.firestoreQuotaWarningLoggedAt > this.QUOTA_BACKOFF_MS) {
+            console.warn(`[RiskStore] saveConfig Firestore dual-write quota exceeded (RESOURCE_EXHAUSTED) for user ${userId}.`);
+            this.firestoreQuotaWarningLoggedAt = Date.now();
+          }
+        } else {
+          console.error(`[RiskStore] saveConfig dual-write to Firestore failed:`, err instanceof Error ? err.message : String(err));
+          throw new Error(
+            `FIRESTORE_PERSISTENCE_FAILURE: Failed to persist riskConfig to Firestore: ${
+              err instanceof Error ? err.message : String(err)
+            }`
+          );
+        }
       }
     }
 
@@ -427,7 +485,7 @@ export class ServerRiskStore {
       throw new Error('FIRESTORE_PERSISTENCE_FAILURE: Authoritative Firestore is unavailable in production.');
     }
 
-    if (adminDb) {
+    if (adminDb && Date.now() >= this.firestoreQuotaCooldownUntil) {
       const sessionDocRef = adminDb.doc(`users/${userId}/riskSessions/${tradingDate}`);
       const accountSessionDocRef = adminDb.doc(`users/${userId}/accountRiskSessions/${accountSessionKey}`);
       const configDocRef = adminDb.doc(`users/${userId}/riskConfig/config`);
@@ -508,7 +566,15 @@ export class ServerRiskStore {
         }
         return txResult;
       } catch (err) {
-        console.error('[RiskStore] evaluatePnlResult Admin transaction failed:', err instanceof Error ? err.message : String(err));
+        if (isQuotaExhaustedError(err)) {
+          this.firestoreQuotaCooldownUntil = Date.now() + this.QUOTA_BACKOFF_MS;
+          if (Date.now() - this.firestoreQuotaWarningLoggedAt > this.QUOTA_BACKOFF_MS) {
+            console.warn('[RiskStore] evaluatePnlResult Admin transaction quota exceeded (RESOURCE_EXHAUSTED). Falling back to in-memory evaluation and buffering events.');
+            this.firestoreQuotaWarningLoggedAt = Date.now();
+          }
+        } else {
+          console.error('[RiskStore] evaluatePnlResult Admin transaction failed:', err instanceof Error ? err.message : String(err));
+        }
         
         // Audit-event/persistence failure MUST NEVER prevent RiskEngine from creating or preserving a lock!
         this.isPersistenceDegraded = true;
@@ -832,11 +898,11 @@ export class ServerRiskStore {
       const isProduction = process.env.NODE_ENV === 'production';
       const isMock = isMockStoreEnabled();
 
-      if (isProduction && !adminDb && !isMock) {
+      if (Date.now() < this.firestoreQuotaCooldownUntil) {
+        // Cooldown active, use in-memory state or evaluate fresh
+      } else if (isProduction && !adminDb && !isMock) {
         throw new Error(`FIRESTORE_READ_FAILURE: Authoritative Firestore is unavailable in production for user ${userId}.`);
-      }
-
-      if (adminDb) {
+      } else if (adminDb) {
         try {
           const accountDocRef = adminDb.doc(`users/${userId}/accountRiskSessions/${accountSessionKey}`);
           const legacyDocRef = adminDb.doc(`users/${userId}/riskSessions/${date}`);
@@ -857,12 +923,21 @@ export class ServerRiskStore {
             userState.accountSessions.set(accountSessionKey, session);
           }
         } catch (err) {
-          console.error(`[RiskStore] getSession from Firestore failed for user ${userId}:`, err);
-          throw new Error(
-            `FIRESTORE_READ_FAILURE: Failed to read riskSession from Firestore for user ${userId}: ${
-              err instanceof Error ? err.message : String(err)
-            }`
-          );
+          if (isQuotaExhaustedError(err)) {
+            this.firestoreQuotaCooldownUntil = Date.now() + this.QUOTA_BACKOFF_MS;
+            this.isPersistenceDegraded = true;
+            if (Date.now() - this.firestoreQuotaWarningLoggedAt > this.QUOTA_BACKOFF_MS) {
+              console.warn(`[RiskStore] Firestore quota exceeded in getSession for user ${userId}; falling back to memory evaluation.`);
+              this.firestoreQuotaWarningLoggedAt = Date.now();
+            }
+          } else {
+            console.error(`[RiskStore] getSession from Firestore failed for user ${userId}:`, err);
+            throw new Error(
+              `FIRESTORE_READ_FAILURE: Failed to read riskSession from Firestore for user ${userId}: ${
+                err instanceof Error ? err.message : String(err)
+              }`
+            );
+          }
         }
       }
     }
@@ -919,7 +994,7 @@ export class ServerRiskStore {
 
   public static async reconcileBufferedEvents(targetUserId?: string): Promise<{ reconciled: number; failed: number }> {
     const adminDb = getAdminFirestore();
-    if (!adminDb) {
+    if (!adminDb || Date.now() < this.firestoreQuotaCooldownUntil) {
       return { reconciled: 0, failed: this.bufferedEvents.length };
     }
 
@@ -927,7 +1002,8 @@ export class ServerRiskStore {
     let failed = 0;
     const remainingBuffer: { userId: string; event: RiskEvent }[] = [];
 
-    for (const item of this.bufferedEvents) {
+    for (let i = 0; i < this.bufferedEvents.length; i++) {
+      const item = this.bufferedEvents[i];
       if (targetUserId && item.userId !== targetUserId) {
         remainingBuffer.push(item);
         continue;
@@ -947,11 +1023,25 @@ export class ServerRiskStore {
 
         reconciled++;
       } catch (err) {
-        console.error(`[RiskStore] Reconcile event failed for ${item.event.idempotencyKey}:`, err instanceof Error ? err.message : String(err));
         item.event.persisted = false;
         item.event.persistenceStatus = 'buffered';
         remainingBuffer.push(item);
         failed++;
+
+        if (isQuotaExhaustedError(err)) {
+          this.firestoreQuotaCooldownUntil = Date.now() + this.QUOTA_BACKOFF_MS;
+          if (Date.now() - this.firestoreQuotaWarningLoggedAt > this.QUOTA_BACKOFF_MS) {
+            console.warn(`[RiskStore] Firestore quota exceeded during reconcile. Activating ${this.QUOTA_BACKOFF_MS / 1000}s backoff.`);
+            this.firestoreQuotaWarningLoggedAt = Date.now();
+          }
+          for (let j = i + 1; j < this.bufferedEvents.length; j++) {
+            remainingBuffer.push(this.bufferedEvents[j]);
+            failed++;
+          }
+          break;
+        }
+
+        console.error(`[RiskStore] Reconcile event failed for ${item.event.idempotencyKey}:`, err instanceof Error ? err.message : String(err));
       }
     }
 
@@ -972,7 +1062,12 @@ export class ServerRiskStore {
     const resolvedAccountId = accountId ? await this.resolveAccountId(userId, accountId) : undefined;
     const adminDb = getAdminFirestore();
 
-    if (adminDb) {
+    const now = Date.now();
+    const isQuotaCoolingDown = now < this.firestoreQuotaCooldownUntil;
+    const lastFetch = this.lastEventsFetchTime.get(userId) || 0;
+    const isCacheFresh = (now - lastFetch) < this.EVENTS_CACHE_TTL_MS && userState.events.length > 0;
+
+    if (adminDb && !isQuotaCoolingDown && !isCacheFresh) {
       try {
         const collRef = adminDb.collection(`users/${userId}/riskEvents`);
         const fetchLimit = Math.min(100, Math.max(1, limit * 2));
@@ -998,9 +1093,20 @@ export class ServerRiskStore {
             }
           }
         }
+        this.lastEventsFetchTime.set(userId, now);
+        this.isPersistenceDegraded = false;
       } catch (err) {
-        console.error(`[RiskStore] getAuditEvents from Firestore failed:`, err instanceof Error ? err.message : String(err));
-        this.isPersistenceDegraded = true;
+        if (isQuotaExhaustedError(err)) {
+          this.firestoreQuotaCooldownUntil = Date.now() + this.QUOTA_BACKOFF_MS;
+          this.isPersistenceDegraded = true;
+          if (Date.now() - this.firestoreQuotaWarningLoggedAt > this.QUOTA_BACKOFF_MS) {
+            console.warn(`[RiskStore] Firestore quota exceeded (RESOURCE_EXHAUSTED). Activating ${this.QUOTA_BACKOFF_MS / 1000}s backoff and serving in-memory cached audit events.`);
+            this.firestoreQuotaWarningLoggedAt = Date.now();
+          }
+        } else {
+          console.error(`[RiskStore] getAuditEvents from Firestore failed:`, err instanceof Error ? err.message : String(err));
+          this.isPersistenceDegraded = true;
+        }
       }
     }
 
@@ -1095,22 +1201,38 @@ export class ServerRiskStore {
     userState.events.push(event);
 
     if (adminDb) {
-      const sanitizedDocId = idempotencyKey.replace(/[^a-zA-Z0-9_\-]/g, '_').slice(0, 120);
-      adminDb
-        .collection(`users/${userId}/riskEvents`)
-        .doc(sanitizedDocId)
-        .set(event, { merge: true })
-        .then(() => {
-          event.persisted = true;
-          event.persistenceStatus = 'durable';
-        })
-        .catch((err) => {
-          console.error(`[RiskStore] recordEvent to Firestore failed for ${idempotencyKey}:`, err instanceof Error ? err.message : String(err));
-          event.persisted = false;
-          event.persistenceStatus = 'buffered';
-          this.isPersistenceDegraded = true;
-          this.bufferedEvents.push({ userId, event });
-        });
+      if (Date.now() < this.firestoreQuotaCooldownUntil) {
+        event.persisted = false;
+        event.persistenceStatus = 'buffered';
+        this.isPersistenceDegraded = true;
+        this.bufferedEvents.push({ userId, event });
+      } else {
+        const sanitizedDocId = idempotencyKey.replace(/[^a-zA-Z0-9_\-]/g, '_').slice(0, 120);
+        adminDb
+          .collection(`users/${userId}/riskEvents`)
+          .doc(sanitizedDocId)
+          .set(event, { merge: true })
+          .then(() => {
+            event.persisted = true;
+            event.persistenceStatus = 'durable';
+          })
+          .catch((err) => {
+            if (isQuotaExhaustedError(err)) {
+              this.firestoreQuotaCooldownUntil = Date.now() + this.QUOTA_BACKOFF_MS;
+              this.isPersistenceDegraded = true;
+              if (Date.now() - this.firestoreQuotaWarningLoggedAt > this.QUOTA_BACKOFF_MS) {
+                console.warn(`[RiskStore] Firestore quota exceeded (RESOURCE_EXHAUSTED) on recordEvent. Buffering in-memory.`);
+                this.firestoreQuotaWarningLoggedAt = Date.now();
+              }
+            } else {
+              console.error(`[RiskStore] recordEvent to Firestore failed for ${idempotencyKey}:`, err instanceof Error ? err.message : String(err));
+            }
+            event.persisted = false;
+            event.persistenceStatus = 'buffered';
+            this.isPersistenceDegraded = true;
+            this.bufferedEvents.push({ userId, event });
+          });
+      }
     } else {
       event.persisted = false;
       event.persistenceStatus = 'buffered';

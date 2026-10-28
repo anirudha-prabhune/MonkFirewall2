@@ -1,5 +1,5 @@
 import express, { Request, Response } from 'express';
-import { ServerRiskStore } from './risk/store';
+import { ServerRiskStore, isQuotaExhaustedError } from './risk/store';
 import { BrokerService } from './brokers/service';
 import { MOCK_INSTRUMENT_MASTER } from './instruments/master';
 import { PnlEngine } from './pnl/engine';
@@ -28,6 +28,7 @@ import {
 } from './risk/liveRiskRecorder';
 import { getTradingDateKolkata } from './risk/engine';
 import { ActivationGuardService } from './risk/activationGuard';
+import { CryptoService } from './security/crypto';
 
 export const apiRouter = express.Router();
 
@@ -759,6 +760,7 @@ const handleGetCredentials = async (req: Request, res: Response) => {
 
       return sendJson(res, {
         userId,
+        crypto: CryptoService.getDiagnostic(),
         zerodha: {
           configured: Boolean(zerodhaCreds || process.env.ZERODHA_API_KEY),
           connectionStatus: zerodhaStatus.status,
@@ -1610,18 +1612,34 @@ apiRouter.post('/risk/evaluate', async (req: Request, res: Response) => {
 
 // GET /api/risk/events - Transition Audit Trail & Activity Events
 apiRouter.get('/risk/events', async (req: Request, res: Response) => {
-  try {
-    const userId = (req as any).userId || await authenticateRequest(req, res);
-    if (!userId) return;
+  let userId: string | null = null;
+  const accountId = (req.query?.accountId as string) || (req.headers['x-account-id'] as string) || undefined;
+  const limit = Math.min(100, Math.max(1, parseInt(req.query?.limit as string || '50', 10) || 50));
 
-    const accountId = (req.query?.accountId as string) || (req.headers['x-account-id'] as string) || undefined;
-    const limit = Math.min(100, Math.max(1, parseInt(req.query?.limit as string || '50', 10) || 50));
+  try {
+    userId = (req as any).userId || await authenticateRequest(req, res);
+    if (!userId) return;
 
     const events = await ServerRiskStore.getAuditEvents(userId, accountId, limit);
     const persistenceDegraded = ServerRiskStore.getIsPersistenceDegraded();
     const bufferedCount = ServerRiskStore.getBufferedEventsCount();
     sendJson(res, { events, count: events.length, accountId, persistenceDegraded, bufferedCount });
   } catch (err) {
+    if (isQuotaExhaustedError(err)) {
+      console.warn('[RiskEvents] Firestore quota exceeded on events route; serving fallback in-memory events.');
+      const fallbackEvents = userId
+        ? await ServerRiskStore.getAuditEvents(userId, accountId, limit).catch(() => [])
+        : [];
+      sendJson(res, {
+        events: fallbackEvents,
+        count: fallbackEvents.length,
+        accountId,
+        persistenceDegraded: true,
+        quotaExceeded: true,
+        bufferedCount: ServerRiskStore.getBufferedEventsCount(),
+      });
+      return;
+    }
     console.error('[RiskEvents] Fetch route error:', err);
     sendJson(res, { error: err instanceof Error ? err.message : 'Failed to fetch risk events' }, 500);
   }

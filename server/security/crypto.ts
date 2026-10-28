@@ -227,4 +227,16 @@ export class CryptoService {
       );
     }
   }
+
+  /**
+   * Safe diagnostic reporting key availability and active key version.
+   * NEVER returns actual key value, hashes, lengths, or secret strings.
+   */
+  public static getDiagnostic(): { configured: boolean; keyVersion: number } {
+    const key = this.getKeyForVersion(CURRENT_KEY_VERSION);
+    return {
+      configured: key !== null && key.length === 32,
+      keyVersion: CURRENT_KEY_VERSION,
+    };
+  }
 }
